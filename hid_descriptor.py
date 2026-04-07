@@ -325,6 +325,8 @@ def get_usage_name(usage_page: int, usage: int) -> str:
     name = _USAGE_NAME.get((usage_page, usage))
     if name:
         return name
+    if usage_page == 0x09:
+        return f"Button{usage}"
     if usage_page >= 0xFF00:
         return f"V{usage:02X}"
     return f"UP{usage_page:02X}_U{usage:02X}"

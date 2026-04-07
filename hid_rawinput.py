@@ -65,12 +65,14 @@ class RAWHID(ctypes.Structure):
     ]
 
 
+# On 64-bit Windows, LRESULT/WPARAM/LPARAM are pointer-sized (8 bytes).
+# ctypes.wintypes.LPARAM is c_long (4 bytes on Windows), so use c_ssize_t instead.
 WNDPROCTYPE = ctypes.WINFUNCTYPE(
-    ctypes.c_long,
+    ctypes.c_ssize_t,   # LRESULT
     ctypes.wintypes.HWND,
     ctypes.c_uint,
-    ctypes.wintypes.WPARAM,
-    ctypes.wintypes.LPARAM,
+    ctypes.c_size_t,    # WPARAM
+    ctypes.c_ssize_t,   # LPARAM
 )
 
 # ---------------------------------------------------------------------------
@@ -119,6 +121,15 @@ class RawInputThread(threading.Thread):
         user32   = ctypes.windll.user32
         kernel32 = ctypes.windll.kernel32
         hInstance = kernel32.GetModuleHandleW(None)
+
+        # Declare DefWindowProcW with pointer-sized types to avoid 64-bit overflow
+        user32.DefWindowProcW.restype  = ctypes.c_ssize_t
+        user32.DefWindowProcW.argtypes = [
+            ctypes.wintypes.HWND,
+            ctypes.c_uint,
+            ctypes.c_size_t,    # WPARAM
+            ctypes.c_ssize_t,   # LPARAM
+        ]
 
         def wnd_proc(hwnd, msg, wparam, lparam):
             if msg == WM_INPUT:

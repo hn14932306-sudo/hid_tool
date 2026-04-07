@@ -181,8 +181,6 @@ class HIDToolApp(tk.Tk):
         hsb.pack(side=tk.BOTTOM, fill=tk.X)
         self._table.pack(fill=tk.BOTH, expand=True)
 
-        self._table.tag_configure("vendor_row", background="#3a2800")
-        self._table.tag_configure("normal_row", background="")
 
     def _build_send_tab(self, parent):
         pad = {"padx": 8, "pady": 4}
@@ -318,6 +316,11 @@ class HIDToolApp(tk.Tk):
     # Monitor: Table columns
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _is_byte_expanded_field(hf: HIDField) -> bool:
+        """UP=0x09 且 bit_size >= 8 的欄位按 byte 展開顯示（排除 1-bit button）。"""
+        return hf.usage_page == 0x09 and hf.bit_size >= 8
+
     def _rebuild_table_columns(self):
         path_str = self._get_dev_path_str(self._selected_dev) if self._selected_dev else ""
         self._setup_table_columns(self._descriptors.get(path_str, []))
@@ -328,8 +331,9 @@ class HIDToolApp(tk.Tk):
 
         input_fields = [
             f for f in fields
-            if f.report_type == REPORT_TYPE_INPUT and not f.is_const
+            if f.report_type == REPORT_TYPE_INPUT
             and (target_rid is None or f.report_id == target_rid)
+            and (not f.is_const or (f.usage_page == 0x09 and f.bit_size >= 8))
         ]
 
         col_defs: List[dict] = [
@@ -342,14 +346,15 @@ class HIDToolApp(tk.Tk):
 
         usage_total: Dict[Tuple[int, int], int] = {}
         for hf in input_fields:
-            if not hf.is_vendor:
+            if not hf.is_vendor and not self._is_byte_expanded_field(hf):
                 for i in range(hf.report_count):
                     u = hf.usages[i] if i < len(hf.usages) else (hf.usages[-1] if hf.usages else 0)
                     k = (hf.usage_page, u)
                     usage_total[k] = usage_total.get(k, 0) + 1
 
         usage_seen:      Dict[Tuple[int, int], int] = {}
-        vendor_byte_idx: int                         = 0
+        vendor_byte_idx: int = 0
+        byte_field_idx:  int = 0
 
         for hf in input_fields:
             if hf.is_vendor:
@@ -363,6 +368,19 @@ class HIDToolApp(tk.Tk):
                         "byte_index":  b,
                     })
                     vendor_byte_idx += 1
+            elif self._is_byte_expanded_field(hf):
+                # UP=0x09 U=0xC5: 展開成 bit_size/8 個 byte 欄位
+                n_bytes = max(1, hf.bit_size // 8)
+                for b in range(n_bytes):
+                    col_defs.append({
+                        "col_id":      f"byf_{id(hf)}_{b}",
+                        "label":       f"B{byte_field_idx}",
+                        "width":       40,
+                        "field_ref":   hf,
+                        "value_index": -1,
+                        "byte_index":  b,
+                    })
+                    byte_field_idx += 1
             else:
                 for i in range(hf.report_count):
                     u   = hf.usages[i] if i < len(hf.usages) else (hf.usages[-1] if hf.usages else 0)
@@ -382,6 +400,7 @@ class HIDToolApp(tk.Tk):
 
         self._col_defs  = col_defs
         self._table_rid = target_rid if target_rid is not None else -1
+
 
         self._last_pkt_rx_time = 0.0
         self._last_scan_time   = -1
@@ -526,7 +545,6 @@ class HIDToolApp(tk.Tk):
             return field_cache[key]
 
         row = []
-        has_vendor_data = False
         for col in self._col_defs:
             cid = col["col_id"]
             if cid == "__rid__":
@@ -538,16 +556,13 @@ class HIDToolApp(tk.Tk):
                 byte_pos = (hf.bit_offset // 8) + col["byte_index"]
                 val      = payload[byte_pos] if byte_pos < len(payload) else 0
                 row.append(f"{val:02X}")
-                if val:
-                    has_vendor_data = True
             else:
                 hf   = col["field_ref"]
                 idx  = col["value_index"]
                 vals = get_vals(hf)
                 row.append(vals[idx] if idx < len(vals) else "")
 
-        tag = "vendor_row" if has_vendor_data else "normal_row"
-        self._table.insert("", 0, values=row, tags=(tag,))
+        self._table.insert("", 0, values=row)
 
         children = self._table.get_children()
         if len(children) > self._MAX_ROWS:
