@@ -70,6 +70,8 @@ class HIDToolApp(tk.Tk):
         self._hybrid_groups:    List[dict]               = []
         self._hybrid_common:    Dict[str, Tuple[HIDField, int]] = {}
         self._frame_seq:        int                      = 0
+        self._dev_tooltip:      Optional[tk.Toplevel]    = None
+        self._dev_tooltip_label: Optional[tk.Label]      = None
 
         # Error-detection state
         self._scan_time_delta:  int                      = 0   # delta of last scan time change
@@ -91,9 +93,13 @@ class HIDToolApp(tk.Tk):
 
         tk.Label(top, text="裝置:").pack(side=tk.LEFT)
         self._dev_var = tk.StringVar()
-        self._dev_combo = ttk.Combobox(top, textvariable=self._dev_var, width=72, state="readonly")
-        self._dev_combo.pack(side=tk.LEFT, padx=(2, 8))
+        self._dev_combo = ttk.Combobox(top, textvariable=self._dev_var, width=120, state="readonly")
+        self._dev_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 8))
         self._dev_combo.bind("<<ComboboxSelected>>", self._on_device_selected)
+        self._dev_combo.bind("<Enter>", self._show_dev_tooltip)
+        self._dev_combo.bind("<Motion>", self._move_dev_tooltip)
+        self._dev_combo.bind("<Leave>", self._hide_dev_tooltip)
+        self._dev_combo.bind("<ButtonPress-1>", self._hide_dev_tooltip)
 
         tk.Button(top, text="重新整理", command=self._refresh_devices).pack(side=tk.LEFT, padx=2)
 
@@ -290,6 +296,7 @@ class HIDToolApp(tk.Tk):
         self._hidapi_devices = enumerate_hid_devices()
         labels = [format_device_label(d) for d in self._hidapi_devices]
         self._dev_combo["values"] = labels
+        self._hide_dev_tooltip()
         if labels:
             self._dev_combo.current(0)
             self._on_device_selected(None)
@@ -300,7 +307,57 @@ class HIDToolApp(tk.Tk):
         if idx < 0 or idx >= len(self._hidapi_devices):
             return
         self._selected_dev = self._hidapi_devices[idx]
+        self._hide_dev_tooltip()
         self._load_descriptor(self._selected_dev)
+
+    def _get_selected_device_label(self) -> str:
+        idx = self._dev_combo.current()
+        if 0 <= idx < len(self._hidapi_devices):
+            return format_device_label(self._hidapi_devices[idx])
+        return self._dev_var.get().strip()
+
+    def _show_dev_tooltip(self, event=None):
+        text = self._get_selected_device_label()
+        if not text:
+            return
+        if self._dev_tooltip is None or not self._dev_tooltip.winfo_exists():
+            self._dev_tooltip = tk.Toplevel(self)
+            self._dev_tooltip.wm_overrideredirect(True)
+            self._dev_tooltip.attributes("-topmost", True)
+            self._dev_tooltip_label = tk.Label(
+                self._dev_tooltip,
+                text=text,
+                justify=tk.LEFT,
+                anchor="w",
+                bg="#fff8dc",
+                fg="black",
+                relief=tk.SOLID,
+                borderwidth=1,
+                padx=8,
+                pady=4,
+                font=("Consolas", 9),
+            )
+            self._dev_tooltip_label.pack()
+        else:
+            self._dev_tooltip_label.config(text=text)
+        self._move_dev_tooltip(event)
+
+    def _move_dev_tooltip(self, event=None):
+        if not self._dev_tooltip or not self._dev_tooltip.winfo_exists():
+            return
+        if event is not None:
+            x = event.x_root + 16
+            y = event.y_root + 20
+        else:
+            x = self._dev_combo.winfo_rootx() + 16
+            y = self._dev_combo.winfo_rooty() + self._dev_combo.winfo_height() + 4
+        self._dev_tooltip.geometry(f"+{x}+{y}")
+
+    def _hide_dev_tooltip(self, event=None):
+        if self._dev_tooltip and self._dev_tooltip.winfo_exists():
+            self._dev_tooltip.destroy()
+        self._dev_tooltip = None
+        self._dev_tooltip_label = None
 
     def _get_dev_path_str(self, dev: dict) -> str:
         path = dev.get("path", b"")
@@ -1492,6 +1549,7 @@ class HIDToolApp(tk.Tk):
     # ------------------------------------------------------------------
 
     def destroy(self):
+        self._hide_dev_tooltip()
         self._stop_listen()
         super().destroy()
 
