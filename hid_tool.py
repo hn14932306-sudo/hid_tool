@@ -4,12 +4,16 @@ Imports backend modules: hid_descriptor, hid_rawinput, hid_device
 """
 
 import collections
+import datetime
+import os
 import queue
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk, scrolledtext
+import zipfile
+from tkinter import filedialog, messagebox, ttk, scrolledtext
 from typing import Dict, List, Optional, Tuple
+from xml.sax.saxutils import escape
 
 from hid_descriptor import (
     HIDField,
@@ -44,9 +48,10 @@ class HIDToolApp(tk.Tk):
         self.minsize(1000, 620)
 
         # Shared state
-        self._hidapi_devices: List[dict]                = []
-        self._selected_dev:   Optional[dict]            = None
-        self._descriptors:    Dict[str, List[HIDField]] = {}
+        self._hidapi_devices:    List[dict]                = []
+        self._selected_dev:      Optional[dict]            = None
+        self._descriptors:       Dict[str, List[HIDField]] = {}
+        self._raw_descriptors:   Dict[str, bytes]          = {}  # path_str -> raw descriptor bytes
 
         # Monitor state
         self._raw_thread:       Optional[RawInputThread] = None
@@ -55,13 +60,22 @@ class HIDToolApp(tk.Tk):
         self._col_defs:         List[dict]               = []
         self._table_rid:        int                      = -1
         self._frame_deque:      collections.deque        = collections.deque()
+        self._monitor_log_rows: List[dict]               = []
         self._last_pkt_rx_time: float                    = 0.0
         self._last_scan_time:   int                      = -1
         self._scan_time_field:  Optional[HIDField]       = None
+        self._hybrid_groups:    List[dict]               = []
+        self._hybrid_common:    Dict[str, Tuple[HIDField, int]] = {}
+        self._frame_seq:        int                      = 0
+
+        # Error-detection state
+        self._scan_time_delta:  int                      = 0   # delta of last scan time change
+        self._error_count:      int                      = 0
 
         self._build_ui()
         self._refresh_devices()
         self.after(20, self._poll_queue)
+        self.after(50, self._toggle_desc_panel)   # start collapsed
 
     # ------------------------------------------------------------------
     # UI Construction
@@ -89,10 +103,31 @@ class HIDToolApp(tk.Tk):
         # ---- Main PanedWindow ----
         paned = tk.PanedWindow(self, orient=tk.HORIZONTAL, sashrelief=tk.RAISED, sashwidth=5)
         paned.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        self._paned = paned
+        self._desc_panel_width = 300   # remembered width when expanded
 
-        # -- Left panel: descriptor tree --
-        left_frame = tk.LabelFrame(paned, text="Report Descriptor 欄位", padx=2, pady=2)
-        paned.add(left_frame, minsize=300)
+        # -- Left panel: collapsible descriptor panel --
+        left_outer = tk.Frame(paned)
+        paned.add(left_outer, minsize=0)
+
+        # Toggle button row
+        toggle_row = tk.Frame(left_outer)
+        toggle_row.pack(side=tk.TOP, fill=tk.X)
+        self._desc_collapsed = False
+        self._desc_toggle_btn = tk.Button(
+            toggle_row, text="◀ Report Descriptor 欄位",
+            anchor=tk.W, relief=tk.FLAT, bg="#dde3ea",
+            font=("Arial", 9, "bold"),
+            command=self._toggle_desc_panel,
+        )
+        self._desc_toggle_btn.pack(fill=tk.X)
+
+        # Inner content (tree + raw button) — hidden when collapsed
+        self._desc_inner = tk.Frame(left_outer)
+        self._desc_inner.pack(fill=tk.BOTH, expand=True)
+
+        left_frame = tk.Frame(self._desc_inner, padx=2, pady=2)
+        left_frame.pack(fill=tk.BOTH, expand=True)
 
         self._desc_tree = ttk.Treeview(
             left_frame,
@@ -114,6 +149,9 @@ class HIDToolApp(tk.Tk):
         self._desc_tree.tag_configure("vendor", foreground="darkorange", font=("Consolas", 9, "bold"))
         self._desc_tree.tag_configure("touch",  foreground="darkgreen")
         self._desc_tree.tag_configure("const",  foreground="gray")
+
+        tk.Button(left_frame, text="顯示原始 Descriptor Bytes",
+                  command=self._show_raw_descriptor).pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
 
         # -- Right panel: Notebook --
         right_frame = tk.Frame(paned)
@@ -142,12 +180,17 @@ class HIDToolApp(tk.Tk):
         tk.Label(sb_frame, textvariable=self._rate_var, anchor=tk.E,
                  font=("Consolas", 9, "bold"), width=14).pack(side=tk.RIGHT)
 
+        self._error_var = tk.StringVar(value="")
+        tk.Label(sb_frame, textvariable=self._error_var, anchor=tk.E,
+                 font=("Consolas", 11, "bold"), fg="red", width=34).pack(side=tk.RIGHT, padx=(8, 4))
+
     def _build_monitor_tab(self, parent):
         ctrl_row = tk.Frame(parent)
         ctrl_row.pack(side=tk.TOP, fill=tk.X, padx=2, pady=2)
 
         self._only_vendor = tk.BooleanVar(value=False)
         self._show_raw    = tk.BooleanVar(value=False)
+        self._view_mode   = tk.StringVar(value="Hybrid")
 
         tk.Label(ctrl_row, text="Report ID:").pack(side=tk.LEFT)
         self._rid_filter_var = tk.StringVar(value="全部")
@@ -163,12 +206,26 @@ class HIDToolApp(tk.Tk):
         tk.Spinbox(ctrl_row, from_=1, to=50, textvariable=self._gap_ms_var,
                    width=4).pack(side=tk.LEFT, padx=(2, 8))
 
+        tk.Label(ctrl_row, text="View:").pack(side=tk.LEFT, padx=(8, 0))
+        self._view_combo = ttk.Combobox(ctrl_row, textvariable=self._view_mode,
+                                        width=10, state="readonly",
+                                        values=("Hybrid", "Parallel"))
+        self._view_combo.pack(side=tk.LEFT, padx=(2, 8))
+        self._view_combo.bind("<<ComboboxSelected>>", lambda _: self._rebuild_table_columns())
+
+        tk.Label(ctrl_row, text="最大 scan Δ:").pack(side=tk.LEFT, padx=(8, 0))
+        self._max_scan_delta_var = tk.StringVar(value="200")
+        tk.Spinbox(ctrl_row, from_=0, to=9999, textvariable=self._max_scan_delta_var,
+                   width=5).pack(side=tk.LEFT, padx=(2, 8))
+
         tk.Checkbutton(ctrl_row, text="只顯示含 Vendor 資料",
                        variable=self._only_vendor).pack(side=tk.LEFT)
         tk.Checkbutton(ctrl_row, text="顯示 RAW 欄位",
                        variable=self._show_raw,
                        command=self._rebuild_table_columns).pack(side=tk.LEFT, padx=8)
         tk.Button(ctrl_row, text="清除", command=self._clear_log).pack(side=tk.RIGHT, padx=4)
+
+        tk.Button(ctrl_row, text="Export Excel", command=self._export_monitor_to_excel).pack(side=tk.RIGHT, padx=4)
 
         tbl_frame = tk.Frame(parent)
         tbl_frame.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
@@ -180,6 +237,7 @@ class HIDToolApp(tk.Tk):
         vsb.pack(side=tk.RIGHT,  fill=tk.Y)
         hsb.pack(side=tk.BOTTOM, fill=tk.X)
         self._table.pack(fill=tk.BOTH, expand=True)
+        self._table.tag_configure("scan_error", background="#ffd6d6")
 
 
     def _build_send_tab(self, parent):
@@ -258,6 +316,7 @@ class HIDToolApp(tk.Tk):
         def worker():
             raw = read_descriptor_via_hidapi(dev.get("path", b""))
             if raw:
+                self._raw_descriptors[path_str] = raw
                 try:
                     fields = parse_report_descriptor(raw)
                 except Exception as e:
@@ -266,6 +325,7 @@ class HIDToolApp(tk.Tk):
                 self._descriptors[path_str] = fields
                 self.after(0, lambda: self._populate_desc_tree(path_str))
             else:
+                self._raw_descriptors[path_str] = b""
                 self._descriptors[path_str] = []
                 self.after(0, lambda: self._status_var.set("無法讀取 Descriptor（可能需要管理員權限）"))
 
@@ -313,6 +373,208 @@ class HIDToolApp(tk.Tk):
         self._rebuild_table_columns()
 
     # ------------------------------------------------------------------
+    # Raw Descriptor viewer
+    # ------------------------------------------------------------------
+
+    def _toggle_desc_panel(self):
+        if self._desc_collapsed:
+            # Expand: restore saved width
+            self._desc_inner.pack(fill=tk.BOTH, expand=True)
+            self._paned.paneconfig(self._desc_inner.master, minsize=0)
+            self._paned.sash_place(0, self._desc_panel_width, 0)
+            self._desc_toggle_btn.config(text="◀ Report Descriptor 欄位")
+            self._desc_collapsed = False
+        else:
+            # Collapse: remember current width then shrink to button only
+            try:
+                self._desc_panel_width = self._paned.sash_coord(0)[0]
+            except Exception:
+                pass
+            self._desc_inner.pack_forget()
+            self._paned.sash_place(0, 24, 0)
+            self._desc_toggle_btn.config(text="▶")
+            self._desc_collapsed = True
+
+    def _show_raw_descriptor(self):
+        path_str = self._get_dev_path_str(self._selected_dev) if self._selected_dev else ""
+        raw = self._raw_descriptors.get(path_str)
+
+        if raw is None:
+            messagebox.showinfo("原始 Descriptor", "請先選擇裝置並等待 Descriptor 載入完成。")
+            return
+        if not raw:
+            messagebox.showinfo("原始 Descriptor", "無法讀取 Descriptor（可能需要管理員權限）。")
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Report Descriptor Bytes")
+        win.geometry("820x560")
+        win.minsize(600, 400)
+
+        # Toolbar
+        tb = tk.Frame(win)
+        tb.pack(side=tk.TOP, fill=tk.X, padx=4, pady=4)
+        tk.Label(tb, text=f"共 {len(raw)} bytes", font=("Arial", 9)).pack(side=tk.LEFT)
+        tk.Button(tb, text="複製 Hex", command=lambda: self._copy_to_clipboard(
+            win, " ".join(f"{b:02X}" for b in raw)
+        )).pack(side=tk.RIGHT, padx=4)
+        tk.Button(tb, text="複製 C Array", command=lambda: self._copy_to_clipboard(
+            win, "{\n" + "".join(
+                ("    " if i % 16 == 0 else "") +
+                f"0x{b:02X}," +
+                ("\n" if i % 16 == 15 else " ")
+                for i, b in enumerate(raw)
+            ).rstrip() + "\n}"
+        )).pack(side=tk.RIGHT, padx=4)
+
+        # Notebook with two views
+        nb = ttk.Notebook(win)
+        nb.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        # --- Hex view ---
+        hex_frame = tk.Frame(nb)
+        nb.add(hex_frame, text="  Hex 檢視  ")
+
+        hex_text = scrolledtext.ScrolledText(
+            hex_frame, font=("Consolas", 10), wrap=tk.NONE,
+            state=tk.NORMAL, relief=tk.FLAT,
+        )
+        hex_text.pack(fill=tk.BOTH, expand=True)
+
+        # 16 bytes per line: offset | hex | ascii
+        lines = []
+        for offset in range(0, len(raw), 16):
+            chunk = raw[offset:offset + 16]
+            hex_part = " ".join(f"{b:02X}" for b in chunk)
+            asc_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+            lines.append(f"{offset:04X}:  {hex_part:<47}  {asc_part}")
+        hex_text.insert(tk.END, "\n".join(lines))
+        hex_text.config(state=tk.DISABLED)
+
+        # --- Parsed view ---
+        parsed_frame = tk.Frame(nb)
+        nb.add(parsed_frame, text="  解析檢視  ")
+
+        parsed_text = scrolledtext.ScrolledText(
+            parsed_frame, font=("Consolas", 10), wrap=tk.NONE,
+            state=tk.NORMAL, relief=tk.FLAT,
+        )
+        parsed_text.pack(fill=tk.BOTH, expand=True)
+        parsed_text.tag_configure("offset", foreground="gray")
+        parsed_text.tag_configure("main",   foreground="#0055cc", font=("Consolas", 10, "bold"))
+        parsed_text.tag_configure("global", foreground="#007700")
+        parsed_text.tag_configure("local",  foreground="#cc6600")
+        parsed_text.tag_configure("unknown",foreground="red")
+
+        self._populate_parsed_descriptor(parsed_text, raw)
+        parsed_text.config(state=tk.DISABLED)
+
+    @staticmethod
+    def _copy_to_clipboard(win: tk.Toplevel, text: str):
+        win.clipboard_clear()
+        win.clipboard_append(text)
+
+    @staticmethod
+    def _populate_parsed_descriptor(text_widget, raw: bytes):
+        """Parse and pretty-print a HID report descriptor into a Text widget."""
+        _USAGE_PAGES = {
+            0x01: "Generic Desktop", 0x02: "Simulation", 0x03: "VR",
+            0x07: "Keyboard", 0x08: "LED", 0x09: "Button",
+            0x0C: "Consumer", 0x0D: "Digitizer", 0x0F: "PID",
+        }
+        _MAIN_TAGS = {
+            0x08: "Input", 0x09: "Output", 0x0A: "Collection",
+            0x0B: "Feature", 0x0C: "End Collection",
+        }
+        _GLOBAL_TAGS = {
+            0x00: "Usage Page", 0x01: "Logical Minimum", 0x02: "Logical Maximum",
+            0x03: "Physical Minimum", 0x04: "Physical Maximum",
+            0x05: "Unit Exponent", 0x06: "Unit",
+            0x07: "Report Size", 0x08: "Report ID", 0x09: "Report Count",
+            0x0A: "Push", 0x0B: "Pop",
+        }
+        _LOCAL_TAGS = {
+            0x00: "Usage", 0x01: "Usage Minimum", 0x02: "Usage Maximum",
+            0x03: "Designator Index", 0x04: "Designator Minimum",
+            0x05: "Designator Maximum", 0x07: "String Index",
+            0x08: "String Minimum", 0x09: "String Maximum", 0x0A: "Delimiter",
+        }
+        _COLLECTION_TYPES = {0: "Physical", 1: "Application", 2: "Logical", 3: "Report",
+                             4: "Named Array", 5: "Usage Switch", 6: "Usage Modifier"}
+
+        indent = 0
+        i = 0
+        while i < len(raw):
+            b = raw[i]
+            btype = (b >> 2) & 0x03
+            btag  = (b >> 4) & 0x0F
+            bsize = b & 0x03
+            if bsize == 3:
+                bsize = 4
+
+            offset = i
+            i += 1
+            val_bytes = raw[i:i + bsize]
+            i += bsize
+
+            # Decode value
+            if bsize == 0:
+                val = 0
+            elif bsize == 1:
+                val = val_bytes[0]
+            elif bsize == 2:
+                val = int.from_bytes(val_bytes, "little")
+            else:
+                val = int.from_bytes(val_bytes, "little")
+
+            hex_bytes = " ".join(f"{x:02X}" for x in [b] + list(val_bytes))
+            offset_str = f"{offset:04X}: "
+
+            if btype == 0:   # Main
+                # End Collection de-dents before printing
+                if btag == 0x0C:
+                    indent = max(0, indent - 2)
+                tag_name = _MAIN_TAGS.get(btag, f"Main({btag:#04x})")
+                if btag == 0x0A:   # Collection
+                    desc = f"{tag_name} ({_COLLECTION_TYPES.get(val, f'{val:#04x}')})"
+                elif btag in (0x08, 0x09, 0x0B):  # Input/Output/Feature
+                    flags = []
+                    if val & 0x01: flags.append("Const")
+                    else:          flags.append("Data")
+                    if val & 0x02: flags.append("Variable")
+                    else:          flags.append("Array")
+                    if val & 0x04: flags.append("Relative")
+                    desc = f"{tag_name} ({', '.join(flags)})"
+                else:
+                    desc = tag_name
+                pad = " " * indent
+                text_widget.insert(tk.END, offset_str, "offset")
+                text_widget.insert(tk.END, f"{hex_bytes:<12}  {pad}{desc}\n", "main")
+                if btag == 0x0A:   # Collection — indent after
+                    indent += 2
+            elif btype == 1:  # Global
+                tag_name = _GLOBAL_TAGS.get(btag, f"Global({btag:#04x})")
+                if btag == 0x00:   # Usage Page
+                    up_name = _USAGE_PAGES.get(val)
+                    desc = f"{tag_name}: {val:#06x}" + (f" ({up_name})" if up_name else
+                                                         " (Vendor)" if val >= 0xFF00 else "")
+                else:
+                    sval = val if val < 0x8000 else val - 0x10000
+                    desc = f"{tag_name}: {sval}"
+                pad = " " * indent
+                text_widget.insert(tk.END, offset_str, "offset")
+                text_widget.insert(tk.END, f"{hex_bytes:<12}  {pad}{desc}\n", "global")
+            elif btype == 2:  # Local
+                tag_name = _LOCAL_TAGS.get(btag, f"Local({btag:#04x})")
+                desc = f"{tag_name}: {val:#06x}"
+                pad = " " * indent
+                text_widget.insert(tk.END, offset_str, "offset")
+                text_widget.insert(tk.END, f"{hex_bytes:<12}  {pad}{desc}\n", "local")
+            else:
+                text_widget.insert(tk.END, offset_str, "offset")
+                text_widget.insert(tk.END, f"{hex_bytes:<12}  (Long item / unknown)\n", "unknown")
+
+    # ------------------------------------------------------------------
     # Monitor: Table columns
     # ------------------------------------------------------------------
 
@@ -320,6 +582,137 @@ class HIDToolApp(tk.Tk):
     def _is_byte_expanded_field(hf: HIDField) -> bool:
         """UP=0x09 且 bit_size >= 8 的欄位按 byte 展開顯示（排除 1-bit button）。"""
         return hf.usage_page == 0x09 and hf.bit_size >= 8
+
+    @staticmethod
+    def _is_combined_value_field(hf: HIDField) -> bool:
+        if hf.is_vendor or hf.report_count <= 1 or hf.per_bit_size <= 0:
+            return False
+        if hf.usage_page == 0x09 or not hf.usages:
+            return False
+        return all(u == hf.usages[0] for u in hf.usages[:hf.report_count])
+
+    @staticmethod
+    def _combine_field_parts(vals: List[int], per_bit_size: int, logical_min: int) -> int:
+        total_bits = per_bit_size * len(vals)
+        value = 0
+        for idx, part in enumerate(vals):
+            value |= (part & ((1 << per_bit_size) - 1)) << (idx * per_bit_size)
+        if logical_min < 0 and total_bits > 0:
+            sign_bit = 1 << (total_bits - 1)
+            if value & sign_bit:
+                value -= 1 << total_bits
+        return value
+
+    def _build_touch_usage_entries(
+        self, input_fields: List[HIDField]
+    ) -> Dict[str, List[Tuple[HIDField, int]]]:
+        usage_keys = {
+            "TipSwitch": (0x0D, 0x42),
+            "ContactID": (0x0D, 0x51),
+            "X": (0x01, 0x30),
+            "Y": (0x01, 0x31),
+            "Width": (0x0D, 0x48),
+            "Height": (0x0D, 0x49),
+        }
+        entries: Dict[str, List[Tuple[HIDField, int]]] = {name: [] for name in usage_keys}
+        for hf in input_fields:
+            if hf.is_vendor or self._is_byte_expanded_field(hf):
+                continue
+            if self._is_combined_value_field(hf):
+                usage = hf.usages[0]
+                for name, key in usage_keys.items():
+                    if (hf.usage_page, usage) == key:
+                        entries[name].append((hf, 0))
+                        break
+                continue
+            for idx in range(hf.report_count):
+                usage = hf.usages[idx] if idx < len(hf.usages) else (hf.usages[-1] if hf.usages else 0)
+                for name, key in usage_keys.items():
+                    if (hf.usage_page, usage) == key:
+                        entries[name].append((hf, idx))
+                        break
+        return entries
+
+    def _setup_hybrid_columns(self, input_fields: List[HIDField]) -> bool:
+        usage_entries = self._build_touch_usage_entries(input_fields)
+        if not usage_entries["ContactID"] or not (usage_entries["X"] and usage_entries["Y"]):
+            self._hybrid_groups = []
+            self._hybrid_common = {}
+            return False
+
+        group_count = max(
+            len(usage_entries["ContactID"]),
+            len(usage_entries["X"]),
+            len(usage_entries["Y"]),
+            len(usage_entries["TipSwitch"]),
+        )
+        if group_count <= 1:
+            self._hybrid_groups = []
+            self._hybrid_common = {}
+            return False
+
+        def pick(name: str, index: int) -> Optional[Tuple[HIDField, int]]:
+            items = usage_entries[name]
+            return items[index] if index < len(items) else None
+
+        self._hybrid_groups = []
+        for idx in range(group_count):
+            self._hybrid_groups.append({
+                "slot": idx,
+                "TipSwitch": pick("TipSwitch", idx),
+                "ContactID": pick("ContactID", idx),
+                "X": pick("X", idx),
+                "Y": pick("Y", idx),
+                "Width": pick("Width", idx),
+                "Height": pick("Height", idx),
+            })
+
+        common_defs: Dict[str, Tuple[int, int]] = {
+            "ScanTime": (0x0D, 0x56),
+            "ContactCount": (0x0D, 0x54),
+        }
+        self._hybrid_common = {}
+        for name, key in common_defs.items():
+            for hf in input_fields:
+                if hf.is_vendor or self._is_byte_expanded_field(hf):
+                    continue
+                usages = hf.usages[:hf.report_count] if hf.usages else []
+                if self._is_combined_value_field(hf):
+                    usages = [hf.usages[0]]
+                for idx, usage in enumerate(usages):
+                    if (hf.usage_page, usage) == key:
+                        self._hybrid_common[name] = (hf, 0 if self._is_combined_value_field(hf) else idx)
+                        break
+                if name in self._hybrid_common:
+                    break
+
+        col_defs: List[dict] = [
+            {"col_id": "__frame__", "label": "Frame", "width": 60, "kind": "meta"},
+            {"col_id": "__rid__", "label": "RID", "width": 50, "kind": "meta"},
+            {"col_id": "__slot__", "label": "Slot", "width": 50, "kind": "meta"},
+            {"col_id": "TipSwitch", "label": "Tip", "width": 55, "kind": "group"},
+            {"col_id": "ContactID", "label": "ContactID", "width": 80, "kind": "group"},
+            {"col_id": "X", "label": "X", "width": 80, "kind": "group"},
+            {"col_id": "Y", "label": "Y", "width": 80, "kind": "group"},
+            {"col_id": "Width", "label": "Width", "width": 70, "kind": "group"},
+            {"col_id": "Height", "label": "Height", "width": 70, "kind": "group"},
+        ]
+        if "ContactCount" in self._hybrid_common:
+            col_defs.append({"col_id": "ContactCount", "label": "Count", "width": 60, "kind": "common"})
+        if "ScanTime" in self._hybrid_common:
+            col_defs.append({"col_id": "ScanTime", "label": "ScanTime", "width": 85, "kind": "common"})
+        if self._show_raw.get():
+            col_defs.append({"col_id": "__raw__", "label": "RAW", "width": 220, "kind": "meta"})
+
+        self._col_defs = col_defs
+        return True
+
+    def _get_field_display_value(self, payload: bytes, hf: HIDField, idx: int) -> object:
+        vals = extract_field_value(payload, hf.bit_offset, hf.per_bit_size, hf.report_count, hf.logical_min) \
+            if hf.per_bit_size > 0 else []
+        if self._is_combined_value_field(hf):
+            return self._combine_field_parts(vals, hf.per_bit_size, hf.logical_min) if vals else ""
+        return vals[idx] if idx < len(vals) else ""
 
     def _rebuild_table_columns(self):
         path_str = self._get_dev_path_str(self._selected_dev) if self._selected_dev else ""
@@ -336,21 +729,48 @@ class HIDToolApp(tk.Tk):
             and (not f.is_const or (f.usage_page == 0x09 and f.bit_size >= 8))
         ]
 
+        self._table_rid = target_rid if target_rid is not None else -1
+        self._last_pkt_rx_time = 0.0
+        self._last_scan_time   = -1
+        self._scan_time_delta  = 0
+        self._scan_time_field  = next(
+            (hf for hf in input_fields if not hf.is_vendor
+             and any((hf.usage_page, u) == (0x0D, 0x56) for u in hf.usages)), None
+        )
+        self._frame_seq = 0
+        self._error_count = 0
+        self._error_var.set("")
+
+        if self._view_mode.get() == "Hybrid" and self._setup_hybrid_columns(input_fields):
+            ids = [c["col_id"] for c in self._col_defs]
+            self._table["columns"] = ids
+            self._table["show"] = "headings"
+            for c in self._col_defs:
+                self._table.heading(c["col_id"], text=c["label"])
+                self._table.column(c["col_id"], width=c["width"],
+                                   stretch=(c["col_id"] == "__raw__"), anchor="center")
+            return
+
         col_defs: List[dict] = [
             {"col_id": "__rid__", "label": "RID", "width": 50,
-             "field_ref": None, "value_index": -1, "byte_index": -1},
+             "field_ref": None, "value_index": -1, "byte_index": -1, "combine_parts": False},
         ]
         if self._show_raw.get():
             col_defs.append({"col_id": "__raw__", "label": "RAW", "width": 220,
-                             "field_ref": None, "value_index": -1, "byte_index": -1})
+                             "field_ref": None, "value_index": -1, "byte_index": -1, "combine_parts": False})
 
         usage_total: Dict[Tuple[int, int], int] = {}
         for hf in input_fields:
             if not hf.is_vendor and not self._is_byte_expanded_field(hf):
-                for i in range(hf.report_count):
-                    u = hf.usages[i] if i < len(hf.usages) else (hf.usages[-1] if hf.usages else 0)
+                if self._is_combined_value_field(hf):
+                    u = hf.usages[0]
                     k = (hf.usage_page, u)
                     usage_total[k] = usage_total.get(k, 0) + 1
+                else:
+                    for i in range(hf.report_count):
+                        u = hf.usages[i] if i < len(hf.usages) else (hf.usages[-1] if hf.usages else 0)
+                        k = (hf.usage_page, u)
+                        usage_total[k] = usage_total.get(k, 0) + 1
 
         usage_seen:      Dict[Tuple[int, int], int] = {}
         vendor_byte_idx: int = 0
@@ -366,6 +786,7 @@ class HIDToolApp(tk.Tk):
                         "field_ref":   hf,
                         "value_index": -1,
                         "byte_index":  b,
+                        "combine_parts": False,
                     })
                     vendor_byte_idx += 1
             elif self._is_byte_expanded_field(hf):
@@ -379,8 +800,25 @@ class HIDToolApp(tk.Tk):
                         "field_ref":   hf,
                         "value_index": -1,
                         "byte_index":  b,
+                        "combine_parts": False,
                     })
                     byte_field_idx += 1
+            elif self._is_combined_value_field(hf):
+                u   = hf.usages[0]
+                k   = (hf.usage_page, u)
+                occ = usage_seen.get(k, 0)
+                usage_seen[k] = occ + 1
+                base  = get_usage_name(hf.usage_page, u)
+                label = f"{base}[{occ}]" if usage_total.get(k, 1) > 1 else base
+                col_defs.append({
+                    "col_id":      f"fld_{id(hf)}_combined",
+                    "label":       label,
+                    "width":       80,
+                    "field_ref":   hf,
+                    "value_index": 0,
+                    "byte_index":  -1,
+                    "combine_parts": True,
+                })
             else:
                 for i in range(hf.report_count):
                     u   = hf.usages[i] if i < len(hf.usages) else (hf.usages[-1] if hf.usages else 0)
@@ -396,18 +834,10 @@ class HIDToolApp(tk.Tk):
                         "field_ref":   hf,
                         "value_index": i,
                         "byte_index":  -1,
+                        "combine_parts": False,
                     })
 
         self._col_defs  = col_defs
-        self._table_rid = target_rid if target_rid is not None else -1
-
-
-        self._last_pkt_rx_time = 0.0
-        self._last_scan_time   = -1
-        self._scan_time_field  = next(
-            (hf for hf in input_fields if not hf.is_vendor
-             and any((hf.usage_page, u) == (0x0D, 0x56) for u in hf.usages)), None
-        )
 
         ids = [c["col_id"] for c in col_defs]
         self._table["columns"] = ids
@@ -467,6 +897,11 @@ class HIDToolApp(tk.Tk):
                 if vals:
                     st = vals[0]
                     if st != self._last_scan_time:
+                        if self._last_scan_time >= 0:
+                            # Scan time wraps at 65536 (16-bit)
+                            self._scan_time_delta = (st - self._last_scan_time) & 0xFFFF
+                        else:
+                            self._scan_time_delta = 0
                         self._last_scan_time = st
                         return True
                     return False
@@ -488,10 +923,11 @@ class HIDToolApp(tk.Tk):
 
             for pkt in pkts:
                 rx_time = pkt.get("rx_time", time.monotonic())
-                if self._is_new_frame(pkt, rx_time, gap_threshold):
+                is_new_frame = self._is_new_frame(pkt, rx_time, gap_threshold)
+                if is_new_frame:
                     self._frame_deque.append(rx_time)
                 self._last_pkt_rx_time = rx_time
-                self._handle_packet(pkt)
+                self._handle_packet(pkt, is_new_frame=is_new_frame)
 
             now    = time.monotonic()
             cutoff = now - 1.0
@@ -503,7 +939,160 @@ class HIDToolApp(tk.Tk):
 
     _MAX_ROWS = 300
 
-    def _handle_packet(self, pkt: dict):
+    @staticmethod
+    def _excel_col_name(index: int) -> str:
+        name = ""
+        while index > 0:
+            index, rem = divmod(index - 1, 26)
+            name = chr(65 + rem) + name
+        return name or "A"
+
+    def _write_simple_xlsx(self, path: str, headers: List[str], rows: List[List[object]]):
+        def cell_xml(value: object) -> str:
+            if value is None:
+                return '<c t="inlineStr"><is><t></t></is></c>'
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return f"<c><v>{value}</v></c>"
+            return f'<c t="inlineStr"><is><t>{escape(str(value))}</t></is></c>'
+
+        all_rows = [headers] + rows
+        sheet_rows: List[str] = []
+        for row_idx, row in enumerate(all_rows, start=1):
+            cells: List[str] = []
+            for col_idx, value in enumerate(row, start=1):
+                ref = f"{self._excel_col_name(col_idx)}{row_idx}"
+                xml = cell_xml(value)
+                cells.append(f'<c r="{ref}"{xml[2:]}')
+            sheet_rows.append(f'<row r="{row_idx}">{"".join(cells)}</row>')
+
+        last_col = self._excel_col_name(max(1, len(headers)))
+        dimension = f"A1:{last_col}{max(1, len(all_rows))}"
+        sheet_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            f'<dimension ref="{dimension}"/>'
+            '<sheetViews><sheetView workbookViewId="0"/></sheetViews>'
+            '<sheetFormatPr defaultRowHeight="15"/>'
+            f'<sheetData>{"".join(sheet_rows)}</sheetData>'
+            '</worksheet>'
+        )
+
+        content_types_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>
+  <Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>
+</Types>"""
+        rels_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>
+  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>
+</Relationships>"""
+        workbook_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+ xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets>
+    <sheet name="MonitorLog" sheetId="1" r:id="rId1"/>
+  </sheets>
+</workbook>"""
+        workbook_rels_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>"""
+        created_at = (
+            datetime.datetime.now(datetime.timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        core_xml = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
+ xmlns:dc="http://purl.org/dc/elements/1.1/"
+ xmlns:dcterms="http://purl.org/dc/terms/"
+ xmlns:dcmitype="http://purl.org/dc/dcmitype/"
+ xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <dc:creator>HID Tool</dc:creator>
+  <cp:lastModifiedBy>HID Tool</cp:lastModifiedBy>
+  <dcterms:created xsi:type="dcterms:W3CDTF">{created_at}</dcterms:created>
+  <dcterms:modified xsi:type="dcterms:W3CDTF">{created_at}</dcterms:modified>
+</cp:coreProperties>"""
+        app_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"
+ xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">
+  <Application>HID Tool</Application>
+</Properties>"""
+
+        with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("[Content_Types].xml", content_types_xml)
+            zf.writestr("_rels/.rels", rels_xml)
+            zf.writestr("docProps/app.xml", app_xml)
+            zf.writestr("docProps/core.xml", core_xml)
+            zf.writestr("xl/workbook.xml", workbook_xml)
+            zf.writestr("xl/_rels/workbook.xml.rels", workbook_rels_xml)
+            zf.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+
+    def _export_monitor_to_excel(self):
+        if not self._monitor_log_rows:
+            messagebox.showinfo("Export Excel", "目前沒有可匯出的監聽資料。")
+            return
+
+        default_name = f"hid_monitor_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        file_path = filedialog.asksaveasfilename(
+            title="匯出監聽資料",
+            defaultextension=".xlsx",
+            initialfile=default_name,
+            filetypes=[("Excel Workbook", "*.xlsx")],
+        )
+        if not file_path:
+            return
+
+        dynamic_headers: List[str] = []
+        for item in self._monitor_log_rows:
+            for header in item["headers"]:
+                if header not in dynamic_headers:
+                    dynamic_headers.append(header)
+
+        headers = ["Timestamp", "Device"] + dynamic_headers
+        rows: List[List[object]] = []
+        for item in self._monitor_log_rows:
+            row = [item["timestamp"], item["device_name"]]
+            row.extend(item["data"].get(header, "") for header in dynamic_headers)
+            rows.append(row)
+
+        try:
+            self._write_simple_xlsx(file_path, headers, rows)
+        except Exception as exc:
+            messagebox.showerror("匯出失敗", f"無法匯出 Excel:\n{exc}")
+            return
+
+        self._status_var.set(f"已匯出 {len(rows)} 筆監聽資料到 {os.path.basename(file_path)}")
+        messagebox.showinfo("Export Excel", f"已成功匯出 {len(rows)} 筆資料。")
+
+    def _append_monitor_row(self, pkt: dict, headers: List[str], row: List[object],
+                            row_tags: Tuple[str, ...], error_reasons: List[str]):
+        self._monitor_log_rows.append({
+            "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+            "device_name": pkt.get("device_name", ""),
+            "headers": headers,
+            "data": dict(zip(headers, row)),
+            "errors": list(error_reasons),
+        })
+        self._table.insert("", 0, values=row, tags=row_tags)
+
+        if error_reasons:
+            self._error_count += 1
+            self._error_var.set(f"ERR:{self._error_count} | {error_reasons[0]}")
+
+        children = self._table.get_children()
+        if len(children) > self._MAX_ROWS:
+            for iid in children[self._MAX_ROWS:]:
+                self._table.delete(iid)
+
+    def _handle_packet(self, pkt: dict, is_new_frame: bool = False):
         data: bytes = pkt.get("data", b"")
         if not data:
             return
@@ -544,6 +1133,72 @@ class HIDToolApp(tk.Tk):
                 )
             return field_cache[key]
 
+        if is_new_frame:
+            self._frame_seq += 1
+
+        error_reasons: List[str] = []
+        row_tags: Tuple[str, ...] = ()
+        try:
+            max_delta = int(self._max_scan_delta_var.get())
+        except ValueError:
+            max_delta = 0
+        if is_new_frame and max_delta > 0 and self._scan_time_delta > max_delta:
+            error_reasons.append(f"ScanΔ={self._scan_time_delta}>{max_delta}")
+            row_tags = ("scan_error",)
+        if is_new_frame:
+            self._scan_time_delta = 0
+
+        if self._view_mode.get() == "Hybrid" and self._hybrid_groups:
+            headers = [col["label"] for col in self._col_defs]
+            raw_hex = " ".join(f"{b:02X}" for b in data)
+
+            def read_entry(entry: Optional[Tuple[HIDField, int]]) -> object:
+                if not entry:
+                    return ""
+                hf, idx = entry
+                return self._get_field_display_value(payload, hf, idx)
+
+            common_values = {name: read_entry(entry) for name, entry in self._hybrid_common.items()}
+            appended = False
+            for group in self._hybrid_groups:
+                tip = read_entry(group.get("TipSwitch"))
+                cid_val = read_entry(group.get("ContactID"))
+                x = read_entry(group.get("X"))
+                y = read_entry(group.get("Y"))
+                width = read_entry(group.get("Width"))
+                height = read_entry(group.get("Height"))
+                if not any(v != "" for v in (tip, cid_val, x, y, width, height)):
+                    continue
+
+                row_map = {
+                    "__frame__": self._frame_seq,
+                    "__rid__": f"0x{report_id:02X}",
+                    "__slot__": group["slot"],
+                    "TipSwitch": tip,
+                    "ContactID": cid_val,
+                    "X": x,
+                    "Y": y,
+                    "Width": width,
+                    "Height": height,
+                    "__raw__": raw_hex,
+                }
+                row_map.update(common_values)
+                row = [row_map.get(col["col_id"], "") for col in self._col_defs]
+                self._append_monitor_row(pkt, headers, row, row_tags, error_reasons)
+                appended = True
+
+            if not appended:
+                row_map = {
+                    "__frame__": self._frame_seq,
+                    "__rid__": f"0x{report_id:02X}",
+                    "__slot__": "",
+                    "__raw__": raw_hex,
+                }
+                row_map.update(common_values)
+                row = [row_map.get(col["col_id"], "") for col in self._col_defs]
+                self._append_monitor_row(pkt, headers, row, row_tags, error_reasons)
+            return
+
         row = []
         for col in self._col_defs:
             cid = col["col_id"]
@@ -560,18 +1215,21 @@ class HIDToolApp(tk.Tk):
                 hf   = col["field_ref"]
                 idx  = col["value_index"]
                 vals = get_vals(hf)
-                row.append(vals[idx] if idx < len(vals) else "")
+                if col.get("combine_parts"):
+                    row.append(self._combine_field_parts(vals, hf.per_bit_size, hf.logical_min) if vals else "")
+                else:
+                    row.append(vals[idx] if idx < len(vals) else "")
 
-        self._table.insert("", 0, values=row)
-
-        children = self._table.get_children()
-        if len(children) > self._MAX_ROWS:
-            for iid in children[self._MAX_ROWS:]:
-                self._table.delete(iid)
+        headers = [col["label"] for col in self._col_defs]
+        self._append_monitor_row(pkt, headers, row, row_tags, error_reasons)
 
     def _clear_log(self):
+        self._monitor_log_rows.clear()
         for iid in self._table.get_children():
             self._table.delete(iid)
+        self._frame_seq = 0
+        self._error_count = 0
+        self._error_var.set("")
 
     # ------------------------------------------------------------------
     # Send tab
