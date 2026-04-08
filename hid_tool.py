@@ -64,6 +64,9 @@ class HIDToolApp(tk.Tk):
         self._last_pkt_rx_time: float                    = 0.0
         self._last_scan_time:   int                      = -1
         self._scan_time_field:  Optional[HIDField]       = None
+        self._contact_count_field: Optional[Tuple[HIDField, int]] = None
+        self._last_contact_count: int                    = -1
+        self._last_touch_active: bool                   = False
         self._hybrid_groups:    List[dict]               = []
         self._hybrid_common:    Dict[str, Tuple[HIDField, int]] = {}
         self._frame_seq:        int                      = 0
@@ -584,6 +587,10 @@ class HIDToolApp(tk.Tk):
         return hf.usage_page == 0x09 and hf.bit_size >= 8
 
     @staticmethod
+    def _is_vendor_usage_byte_expanded_field(hf: HIDField) -> bool:
+        return hf.usage_page == 0xFF01 and hf.bit_size >= 8
+
+    @staticmethod
     def _is_combined_value_field(hf: HIDField) -> bool:
         if hf.is_vendor or hf.report_count <= 1 or hf.per_bit_size <= 0:
             return False
@@ -607,6 +614,7 @@ class HIDToolApp(tk.Tk):
         self, input_fields: List[HIDField]
     ) -> Dict[str, List[Tuple[HIDField, int]]]:
         usage_keys = {
+            "Confidence": (0x0D, 0x47),
             "TipSwitch": (0x0D, 0x42),
             "ContactID": (0x0D, 0x51),
             "X": (0x01, 0x30),
@@ -659,6 +667,7 @@ class HIDToolApp(tk.Tk):
         for idx in range(group_count):
             self._hybrid_groups.append({
                 "slot": idx,
+                "Confidence": pick("Confidence", idx),
                 "TipSwitch": pick("TipSwitch", idx),
                 "ContactID": pick("ContactID", idx),
                 "X": pick("X", idx),
@@ -687,22 +696,39 @@ class HIDToolApp(tk.Tk):
                     break
 
         col_defs: List[dict] = [
-            {"col_id": "__frame__", "label": "Frame", "width": 60, "kind": "meta"},
-            {"col_id": "__rid__", "label": "RID", "width": 50, "kind": "meta"},
-            {"col_id": "__slot__", "label": "Slot", "width": 50, "kind": "meta"},
-            {"col_id": "TipSwitch", "label": "Tip", "width": 55, "kind": "group"},
-            {"col_id": "ContactID", "label": "ContactID", "width": 80, "kind": "group"},
-            {"col_id": "X", "label": "X", "width": 80, "kind": "group"},
-            {"col_id": "Y", "label": "Y", "width": 80, "kind": "group"},
-            {"col_id": "Width", "label": "Width", "width": 70, "kind": "group"},
-            {"col_id": "Height", "label": "Height", "width": 70, "kind": "group"},
+            {"col_id": "__frame__", "label": "Frame", "width": 60, "kind": "meta", "field_ref": None, "value_index": -1, "byte_index": -1},
+            {"col_id": "__rid__", "label": "RID", "width": 50, "kind": "meta", "field_ref": None, "value_index": -1, "byte_index": -1},
+            {"col_id": "__slot__", "label": "Slot", "width": 50, "kind": "meta", "field_ref": None, "value_index": -1, "byte_index": -1},
+            {"col_id": "Confidence", "label": "Confidence", "width": 85, "kind": "group", "field_ref": None, "value_index": -1, "byte_index": -1},
+            {"col_id": "TipSwitch", "label": "Tip", "width": 55, "kind": "group", "field_ref": None, "value_index": -1, "byte_index": -1},
+            {"col_id": "ContactID", "label": "ContactID", "width": 80, "kind": "group", "field_ref": None, "value_index": -1, "byte_index": -1},
+            {"col_id": "X", "label": "X", "width": 80, "kind": "group", "field_ref": None, "value_index": -1, "byte_index": -1},
+            {"col_id": "Y", "label": "Y", "width": 80, "kind": "group", "field_ref": None, "value_index": -1, "byte_index": -1},
+            {"col_id": "Width", "label": "Width", "width": 70, "kind": "group", "field_ref": None, "value_index": -1, "byte_index": -1},
+            {"col_id": "Height", "label": "Height", "width": 70, "kind": "group", "field_ref": None, "value_index": -1, "byte_index": -1},
         ]
         if "ContactCount" in self._hybrid_common:
-            col_defs.append({"col_id": "ContactCount", "label": "Count", "width": 60, "kind": "common"})
+            col_defs.append({"col_id": "ContactCount", "label": "Count", "width": 60, "kind": "common", "field_ref": None, "value_index": -1, "byte_index": -1})
         if "ScanTime" in self._hybrid_common:
-            col_defs.append({"col_id": "ScanTime", "label": "ScanTime", "width": 85, "kind": "common"})
+            col_defs.append({"col_id": "ScanTime", "label": "ScanTime", "width": 85, "kind": "common", "field_ref": None, "value_index": -1, "byte_index": -1})
+
+        for hf in input_fields:
+            if not self._is_vendor_usage_byte_expanded_field(hf):
+                continue
+            usage = hf.usages[0] if hf.usages else 0
+            n_bytes = max(1, (hf.bit_size + 7) // 8)
+            for b in range(n_bytes):
+                col_defs.append({
+                    "col_id": f"vu_{usage:02X}_{id(hf)}_{b}",
+                    "label": f"U{usage:02X}[{b}]",
+                    "width": 58,
+                    "kind": "extra",
+                    "field_ref": hf,
+                    "value_index": -1,
+                    "byte_index": b,
+                })
         if self._show_raw.get():
-            col_defs.append({"col_id": "__raw__", "label": "RAW", "width": 220, "kind": "meta"})
+            col_defs.append({"col_id": "__raw__", "label": "RAW", "width": 220, "kind": "meta", "field_ref": None, "value_index": -1, "byte_index": -1})
 
         self._col_defs = col_defs
         return True
@@ -726,7 +752,11 @@ class HIDToolApp(tk.Tk):
             f for f in fields
             if f.report_type == REPORT_TYPE_INPUT
             and (target_rid is None or f.report_id == target_rid)
-            and (not f.is_const or (f.usage_page == 0x09 and f.bit_size >= 8))
+            and (
+                not f.is_const
+                or self._is_byte_expanded_field(f)
+                or self._is_vendor_usage_byte_expanded_field(f)
+            )
         ]
 
         self._table_rid = target_rid if target_rid is not None else -1
@@ -737,6 +767,21 @@ class HIDToolApp(tk.Tk):
             (hf for hf in input_fields if not hf.is_vendor
              and any((hf.usage_page, u) == (0x0D, 0x56) for u in hf.usages)), None
         )
+        self._contact_count_field = None
+        for hf in input_fields:
+            if hf.is_vendor or self._is_byte_expanded_field(hf):
+                continue
+            usages = hf.usages[:hf.report_count] if hf.usages else []
+            if self._is_combined_value_field(hf):
+                usages = [hf.usages[0]]
+            for idx, usage in enumerate(usages):
+                if (hf.usage_page, usage) == (0x0D, 0x54):
+                    self._contact_count_field = (hf, 0 if self._is_combined_value_field(hf) else idx)
+                    break
+            if self._contact_count_field is not None:
+                break
+        self._last_contact_count = -1
+        self._last_touch_active = False
         self._frame_seq = 0
         self._error_count = 0
         self._error_var.set("")
@@ -777,7 +822,20 @@ class HIDToolApp(tk.Tk):
         byte_field_idx:  int = 0
 
         for hf in input_fields:
-            if hf.is_vendor:
+            if self._is_vendor_usage_byte_expanded_field(hf):
+                usage = hf.usages[0] if hf.usages else 0
+                n_bytes = max(1, (hf.bit_size + 7) // 8)
+                for b in range(n_bytes):
+                    col_defs.append({
+                        "col_id":      f"vu_{usage:02X}_{id(hf)}_{b}",
+                        "label":       f"U{usage:02X}[{b}]",
+                        "width":       58,
+                        "field_ref":   hf,
+                        "value_index": -1,
+                        "byte_index":  b,
+                        "combine_parts": False,
+                    })
+            elif hf.is_vendor:
                 for b in range(max(1, (hf.bit_size + 7) // 8)):
                     col_defs.append({
                         "col_id":      f"vnd_{id(hf)}_{b}",
@@ -898,8 +956,8 @@ class HIDToolApp(tk.Tk):
                     st = vals[0]
                     if st != self._last_scan_time:
                         if self._last_scan_time >= 0:
-                            # Scan time wraps at 65536 (16-bit)
-                            self._scan_time_delta = (st - self._last_scan_time) & 0xFFFF
+                            wrap_base = max(1, hf.logical_max - hf.logical_min + 1)
+                            self._scan_time_delta = (st - self._last_scan_time) % wrap_base
                         else:
                             self._scan_time_delta = 0
                         self._last_scan_time = st
@@ -927,7 +985,10 @@ class HIDToolApp(tk.Tk):
                 if is_new_frame:
                     self._frame_deque.append(rx_time)
                 self._last_pkt_rx_time = rx_time
-                self._handle_packet(pkt, is_new_frame=is_new_frame)
+                self._handle_packet(
+                    pkt,
+                    is_new_frame=is_new_frame,
+                )
 
             now    = time.monotonic()
             cutoff = now - 1.0
@@ -1092,7 +1153,11 @@ class HIDToolApp(tk.Tk):
             for iid in children[self._MAX_ROWS:]:
                 self._table.delete(iid)
 
-    def _handle_packet(self, pkt: dict, is_new_frame: bool = False):
+    def _handle_packet(
+        self,
+        pkt: dict,
+        is_new_frame: bool = False,
+    ):
         data: bytes = pkt.get("data", b"")
         if not data:
             return
@@ -1114,7 +1179,11 @@ class HIDToolApp(tk.Tk):
             if not any(
                 f.is_vendor for f in descriptor_fields
                 if f.report_type == REPORT_TYPE_INPUT
-                and f.report_id == report_id and not f.is_const
+                and f.report_id == report_id
+                and (
+                    not f.is_const
+                    or self._is_vendor_usage_byte_expanded_field(f)
+                )
             ):
                 return
 
@@ -1136,17 +1205,51 @@ class HIDToolApp(tk.Tk):
         if is_new_frame:
             self._frame_seq += 1
 
+        current_contact_count = -1
+        if self._contact_count_field is not None:
+            cc_hf, cc_idx = self._contact_count_field
+            cc_vals = get_vals(cc_hf)
+            if self._is_combined_value_field(cc_hf):
+                current_contact_count = self._combine_field_parts(cc_vals, cc_hf.per_bit_size, cc_hf.logical_min) if cc_vals else -1
+            elif cc_idx < len(cc_vals):
+                current_contact_count = cc_vals[cc_idx]
+
+        current_touch_active = False
+        if self._hybrid_groups:
+            for group in self._hybrid_groups:
+                tip_entry = group.get("TipSwitch")
+                if not tip_entry:
+                    continue
+                tip_hf, tip_idx = tip_entry
+                tip_vals = get_vals(tip_hf)
+                if tip_idx < len(tip_vals) and tip_vals[tip_idx]:
+                    current_touch_active = True
+                    break
+        elif current_contact_count > 0:
+            current_touch_active = True
+
         error_reasons: List[str] = []
         row_tags: Tuple[str, ...] = ()
         try:
             max_delta = int(self._max_scan_delta_var.get())
         except ValueError:
             max_delta = 0
-        if is_new_frame and max_delta > 0 and self._scan_time_delta > max_delta:
+        suppress_scan_error = (
+            is_new_frame
+            and (current_touch_active and not self._last_touch_active)
+        )
+        if is_new_frame and max_delta > 0 and self._scan_time_delta > max_delta and not suppress_scan_error:
             error_reasons.append(f"ScanΔ={self._scan_time_delta}>{max_delta}")
             row_tags = ("scan_error",)
         if is_new_frame:
-            self._scan_time_delta = 0
+            if not current_touch_active:
+                self._last_scan_time = -1
+                self._scan_time_delta = 0
+            else:
+                self._scan_time_delta = 0
+            if current_contact_count >= 0:
+                self._last_contact_count = current_contact_count
+            self._last_touch_active = current_touch_active
 
         if self._view_mode.get() == "Hybrid" and self._hybrid_groups:
             headers = [col["label"] for col in self._col_defs]
@@ -1159,21 +1262,41 @@ class HIDToolApp(tk.Tk):
                 return self._get_field_display_value(payload, hf, idx)
 
             common_values = {name: read_entry(entry) for name, entry in self._hybrid_common.items()}
+            try:
+                active_count = int(common_values.get("ContactCount", ""))
+            except (TypeError, ValueError):
+                active_count = -1
             appended = False
             for group in self._hybrid_groups:
+                confidence = read_entry(group.get("Confidence"))
                 tip = read_entry(group.get("TipSwitch"))
                 cid_val = read_entry(group.get("ContactID"))
                 x = read_entry(group.get("X"))
                 y = read_entry(group.get("Y"))
                 width = read_entry(group.get("Width"))
                 height = read_entry(group.get("Height"))
-                if not any(v != "" for v in (tip, cid_val, x, y, width, height)):
+
+                # In parallel reports, ContactCount tells us how many contacts are valid.
+                # Hide trailing empty slots when switching to the hybrid-style view.
+                if active_count >= 0 and group["slot"] >= active_count:
+                    if tip in ("", 0) and cid_val in ("", 0) and x in ("", 0) and y in ("", 0):
+                        continue
+
+                if (
+                    tip in ("", 0)
+                    and cid_val in ("", 0)
+                    and x in ("", 0)
+                    and y in ("", 0)
+                    and width in ("", 0)
+                    and height in ("", 0)
+                ):
                     continue
 
                 row_map = {
                     "__frame__": self._frame_seq,
                     "__rid__": f"0x{report_id:02X}",
                     "__slot__": group["slot"],
+                    "Confidence": confidence,
                     "TipSwitch": tip,
                     "ContactID": cid_val,
                     "X": x,
@@ -1183,7 +1306,17 @@ class HIDToolApp(tk.Tk):
                     "__raw__": raw_hex,
                 }
                 row_map.update(common_values)
-                row = [row_map.get(col["col_id"], "") for col in self._col_defs]
+                row = []
+                for col in self._col_defs:
+                    if col["col_id"] in row_map:
+                        row.append(row_map[col["col_id"]])
+                    elif col.get("byte_index", -1) >= 0:
+                        hf = col["field_ref"]
+                        byte_pos = (hf.bit_offset // 8) + col["byte_index"]
+                        val = payload[byte_pos] if byte_pos < len(payload) else 0
+                        row.append(f"{val:02X}")
+                    else:
+                        row.append("")
                 self._append_monitor_row(pkt, headers, row, row_tags, error_reasons)
                 appended = True
 
@@ -1195,7 +1328,17 @@ class HIDToolApp(tk.Tk):
                     "__raw__": raw_hex,
                 }
                 row_map.update(common_values)
-                row = [row_map.get(col["col_id"], "") for col in self._col_defs]
+                row = []
+                for col in self._col_defs:
+                    if col["col_id"] in row_map:
+                        row.append(row_map[col["col_id"]])
+                    elif col.get("byte_index", -1) >= 0:
+                        hf = col["field_ref"]
+                        byte_pos = (hf.bit_offset // 8) + col["byte_index"]
+                        val = payload[byte_pos] if byte_pos < len(payload) else 0
+                        row.append(f"{val:02X}")
+                    else:
+                        row.append("")
                 self._append_monitor_row(pkt, headers, row, row_tags, error_reasons)
             return
 
@@ -1311,10 +1454,12 @@ class HIDToolApp(tk.Tk):
             f.bit_size for f in fields
             if f.report_type == REPORT_TYPE_FEATURE and f.report_id == report_id
         )
-        return (total_bits + 7) // 8 if total_bits > 0 else 64
+        payload_len = (total_bits + 7) // 8 if total_bits > 0 else 64
+        # hid.get_feature_report() expects the total report length including the report ID byte.
+        return payload_len + 1
 
     def _do_get_report(self, path, report_id: int, length: int):
-        self._send_log_append(f"\nGet Feature Report  ID=0x{report_id:02X}  Length={length}")
+        self._send_log_append(f"\nGet Feature Report  ID=0x{report_id:02X}  Total Length={length}")
         try:
             data = get_feature_report(path, report_id, length)
             if not data:
