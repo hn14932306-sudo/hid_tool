@@ -28,7 +28,6 @@ from hid_device import (
     enumerate_hid_devices,
     format_device_label,
     read_descriptor_via_hidapi,
-    match_device_name_to_hidapi,
     send_output_report,
     send_feature_report,
     get_feature_report,
@@ -58,6 +57,8 @@ class HIDToolApp(tk.Tk):
         self._packet_queue:     queue.Queue              = queue.Queue()
         self._listening:        bool                     = False
         self._col_defs:         List[dict]               = []
+        self._ff01_usage_vars:  Dict[int, tk.BooleanVar] = {}  # FF01 usage -> visible
+        self._ff01_fmt:         tk.StringVar             = tk.StringVar(value="Hex")
         self._table_rid:        int                      = -1
         self._frame_deque:      collections.deque        = collections.deque()
         self._monitor_log_rows: List[dict]               = []
@@ -72,6 +73,21 @@ class HIDToolApp(tk.Tk):
         self._frame_seq:        int                      = 0
         self._dev_tooltip:      Optional[tk.Toplevel]    = None
         self._dev_tooltip_label: Optional[tk.Label]      = None
+
+        # Canvas state
+        self._canvas_x_logical: Tuple[int, int]          = (0, 4096)
+        self._canvas_y_logical: Tuple[int, int]          = (0, 4096)
+        self._canvas_contacts:         Dict[int, dict]              = {}
+        self._canvas_trails:           Dict[int, collections.deque] = {}
+        self._canvas_prev_active:      set                          = set()
+        self._canvas_item_ids:         Dict[int, Tuple[int, int]]   = {}
+        self._canvas_trail_line_ids:   Dict[int, int]               = {}
+        self._table_pending:           List[tuple]                   = []   # (row, tags, errs)
+        self._table_flush_pending:     bool                         = False
+        self._canvas_flush_pending:    bool                         = False
+        self._canvas_dirty_keys:       set                          = set()  # 有新資料的 cid
+        self._canvas_trail_reset_keys: set                          = set()  # 需清除舊軌跡線
+        self._canvas_circle_del_keys:  set                          = set()  # 需刪除圓圈
 
         # Error-detection state
         self._scan_time_delta:  int                      = 0   # delta of last scan time change
@@ -150,6 +166,9 @@ class HIDToolApp(tk.Tk):
         self._desc_tree.column("bit_size",      width=70,  stretch=False)
         self._desc_tree.column("logical_range", width=100, stretch=False)
 
+        tk.Button(left_frame, text="顯示原始 Descriptor Bytes",
+                  command=self._show_raw_descriptor).pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
+
         desc_sb = ttk.Scrollbar(left_frame, orient=tk.VERTICAL, command=self._desc_tree.yview)
         self._desc_tree.configure(yscrollcommand=desc_sb.set)
         desc_sb.pack(side=tk.RIGHT, fill=tk.Y)
@@ -158,9 +177,6 @@ class HIDToolApp(tk.Tk):
         self._desc_tree.tag_configure("vendor", foreground="darkorange", font=("Consolas", 9, "bold"))
         self._desc_tree.tag_configure("touch",  foreground="darkgreen")
         self._desc_tree.tag_configure("const",  foreground="gray")
-
-        tk.Button(left_frame, text="顯示原始 Descriptor Bytes",
-                  command=self._show_raw_descriptor).pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
 
         # -- Right panel: Notebook --
         right_frame = tk.Frame(paned)
@@ -176,6 +192,10 @@ class HIDToolApp(tk.Tk):
         send_tab = tk.Frame(self._notebook)
         self._notebook.add(send_tab, text="  發送  ")
         self._build_send_tab(send_tab)
+
+        canvas_tab = tk.Frame(self._notebook)
+        self._notebook.add(canvas_tab, text="  畫布  ")
+        self._build_canvas_tab(canvas_tab)
 
         # ---- Status bar ----
         sb_frame = tk.Frame(self, bd=1, relief=tk.SUNKEN)
@@ -197,7 +217,6 @@ class HIDToolApp(tk.Tk):
         ctrl_row = tk.Frame(parent)
         ctrl_row.pack(side=tk.TOP, fill=tk.X, padx=2, pady=2)
 
-        self._only_vendor = tk.BooleanVar(value=False)
         self._show_raw    = tk.BooleanVar(value=False)
         self._view_mode   = tk.StringVar(value="Hybrid")
 
@@ -227,14 +246,30 @@ class HIDToolApp(tk.Tk):
         tk.Spinbox(ctrl_row, from_=0, to=9999, textvariable=self._max_scan_delta_var,
                    width=5).pack(side=tk.LEFT, padx=(2, 8))
 
-        tk.Checkbutton(ctrl_row, text="只顯示含 Vendor 資料",
-                       variable=self._only_vendor).pack(side=tk.LEFT)
         tk.Checkbutton(ctrl_row, text="顯示 RAW 欄位",
                        variable=self._show_raw,
                        command=self._rebuild_table_columns).pack(side=tk.LEFT, padx=8)
         tk.Button(ctrl_row, text="清除", command=self._clear_log).pack(side=tk.RIGHT, padx=4)
-
         tk.Button(ctrl_row, text="Export Excel", command=self._export_monitor_to_excel).pack(side=tk.RIGHT, padx=4)
+
+        # FF01 usage filter row
+        self._ff01_filter_frame = ttk.LabelFrame(parent, text="Usage Page FF01 欄位顯示")
+        self._ff01_filter_frame.pack(side=tk.TOP, fill=tk.X, padx=2, pady=(0, 2))
+
+        # 格式選擇器永久固定在右側
+        fmt_right = tk.Frame(self._ff01_filter_frame)
+        fmt_right.pack(side=tk.RIGHT, padx=4, pady=1)
+        tk.Label(fmt_right, text="格式:").pack(side=tk.LEFT)
+        fmt_combo = ttk.Combobox(
+            fmt_right, textvariable=self._ff01_fmt,
+            values=("Hex", "Dec", "Bin"), state="readonly", width=5,
+        )
+        fmt_combo.pack(side=tk.LEFT, padx=2)
+        fmt_combo.bind("<<ComboboxSelected>>", lambda _: self._rebuild_table_columns())
+
+        # 動態 checkbox 區域（每次換裝置時重建）
+        self._ff01_check_frame = tk.Frame(self._ff01_filter_frame)
+        self._ff01_check_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         tbl_frame = tk.Frame(parent)
         tbl_frame.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
@@ -293,7 +328,10 @@ class HIDToolApp(tk.Tk):
     # ------------------------------------------------------------------
 
     def _refresh_devices(self):
-        self._hidapi_devices = enumerate_hid_devices()
+        self._hidapi_devices = sorted(
+            enumerate_hid_devices(),
+            key=lambda d: (d.get("vendor_id", 0), d.get("product_id", 0)),
+        )
         labels = [format_device_label(d) for d in self._hidapi_devices]
         self._dev_combo["values"] = labels
         self._hide_dev_tooltip()
@@ -430,7 +468,44 @@ class HIDToolApp(tk.Tk):
         ))
         self._rid_combo["values"] = ["全部"] + [f"0x{r:02X}" for r in input_rids]
         self._rid_filter_var.set(f"0x{input_rids[0]:02X}" if len(input_rids) == 1 else "全部")
+        self._update_ff01_filter(path_str)
+        self._update_canvas_range(path_str)
         self._rebuild_table_columns()
+
+    # ------------------------------------------------------------------
+    # FF01 usage filter
+    # ------------------------------------------------------------------
+
+    def _update_ff01_filter(self, path_str: str):
+        """根據目前 descriptor 重建 FF01 usage 勾選面板。"""
+        for widget in self._ff01_check_frame.winfo_children():
+            widget.destroy()
+        self._ff01_usage_vars.clear()
+
+        fields = self._descriptors.get(path_str, [])
+        seen: set = set()
+        ff01_usages: List[int] = []
+        for hf in fields:
+            if hf.usage_page == 0xFF01 and hf.report_type == REPORT_TYPE_INPUT:
+                usage = hf.usages[0] if hf.usages else 0
+                if usage not in seen:
+                    ff01_usages.append(usage)
+                    seen.add(usage)
+
+        if not ff01_usages:
+            tk.Label(self._ff01_check_frame, text="（無 FF01 欄位）", fg="gray").pack(side=tk.LEFT, padx=4)
+            return
+
+        for usage in ff01_usages:
+            var = tk.BooleanVar(value=True)
+            self._ff01_usage_vars[usage] = var
+            cb = tk.Checkbutton(
+                self._ff01_check_frame,
+                text=f"U{usage:02X}",
+                variable=var,
+                command=self._rebuild_table_columns,
+            )
+            cb.pack(side=tk.LEFT, padx=2, pady=1)
 
     # ------------------------------------------------------------------
     # Raw Descriptor viewer
@@ -756,8 +831,6 @@ class HIDToolApp(tk.Tk):
             {"col_id": "__frame__", "label": "Frame", "width": 60, "kind": "meta", "field_ref": None, "value_index": -1, "byte_index": -1},
             {"col_id": "__rid__", "label": "RID", "width": 50, "kind": "meta", "field_ref": None, "value_index": -1, "byte_index": -1},
             {"col_id": "__slot__", "label": "Slot", "width": 50, "kind": "meta", "field_ref": None, "value_index": -1, "byte_index": -1},
-            {"col_id": "Confidence", "label": "Confidence", "width": 85, "kind": "group", "field_ref": None, "value_index": -1, "byte_index": -1},
-            {"col_id": "TipSwitch", "label": "Tip", "width": 55, "kind": "group", "field_ref": None, "value_index": -1, "byte_index": -1},
             {"col_id": "ContactID", "label": "ContactID", "width": 80, "kind": "group", "field_ref": None, "value_index": -1, "byte_index": -1},
             {"col_id": "X", "label": "X", "width": 80, "kind": "group", "field_ref": None, "value_index": -1, "byte_index": -1},
             {"col_id": "Y", "label": "Y", "width": 80, "kind": "group", "field_ref": None, "value_index": -1, "byte_index": -1},
@@ -769,16 +842,34 @@ class HIDToolApp(tk.Tk):
         if "ScanTime" in self._hybrid_common:
             col_defs.append({"col_id": "ScanTime", "label": "ScanTime", "width": 85, "kind": "common", "field_ref": None, "value_index": -1, "byte_index": -1})
 
+        # Button fields (usage page 0x09) — stored in _hybrid_common for value reading, merged into ConfTip
+        for hf in input_fields:
+            if hf.is_vendor or self._is_byte_expanded_field(hf):
+                continue
+            if hf.usage_page != 0x09:
+                continue
+            for i in range(hf.report_count):
+                usage = hf.usages[i] if i < len(hf.usages) else (hf.usages[-1] if hf.usages else 0)
+                key = f"btn_{usage:02X}"
+                if key not in self._hybrid_common:
+                    self._hybrid_common[key] = (hf, i)
+
+        # ConfTip column goes here — after touch/common fields, before FF01
+        col_defs.append({"col_id": "ConfTip", "label": "Conf/Tip", "width": 130, "kind": "group", "field_ref": None, "value_index": -1, "byte_index": -1})
+
+        _vu_col_w = {"Hex": 58, "Dec": 42, "Bin": 78}.get(self._ff01_fmt.get(), 58)
         for hf in input_fields:
             if not self._is_vendor_usage_byte_expanded_field(hf):
                 continue
             usage = hf.usages[0] if hf.usages else 0
+            if usage in self._ff01_usage_vars and not self._ff01_usage_vars[usage].get():
+                continue
             n_bytes = max(1, (hf.bit_size + 7) // 8)
             for b in range(n_bytes):
                 col_defs.append({
                     "col_id": f"vu_{usage:02X}_{id(hf)}_{b}",
                     "label": f"U{usage:02X}[{b}]",
-                    "width": 58,
+                    "width": _vu_col_w,
                     "kind": "extra",
                     "field_ref": hf,
                     "value_index": -1,
@@ -796,6 +887,33 @@ class HIDToolApp(tk.Tk):
         if self._is_combined_value_field(hf):
             return self._combine_field_parts(vals, hf.per_bit_size, hf.logical_min) if vals else ""
         return vals[idx] if idx < len(vals) else ""
+
+    def _merge_conf_tip(self, conf, tip, btn=None) -> str:
+        parts = []
+        try:
+            if int(conf):
+                parts.append("Confidence")
+        except (TypeError, ValueError):
+            pass
+        try:
+            if int(tip):
+                parts.append("Tip")
+        except (TypeError, ValueError):
+            pass
+        try:
+            if btn is not None and int(btn):
+                parts.append("phyButton")
+        except (TypeError, ValueError):
+            pass
+        return " ".join(parts)
+
+    def _fmt_ff01_byte(self, val: int) -> str:
+        fmt = self._ff01_fmt.get()
+        if fmt == "Dec":
+            return str(val)
+        if fmt == "Bin":
+            return f"{val:08b}"
+        return f"{val:02X}"
 
     def _rebuild_table_columns(self):
         path_str = self._get_dev_path_str(self._selected_dev) if self._selected_dev else ""
@@ -877,16 +995,19 @@ class HIDToolApp(tk.Tk):
         usage_seen:      Dict[Tuple[int, int], int] = {}
         vendor_byte_idx: int = 0
         byte_field_idx:  int = 0
+        _vu_col_w = {"Hex": 58, "Dec": 42, "Bin": 78}.get(self._ff01_fmt.get(), 58)
 
         for hf in input_fields:
             if self._is_vendor_usage_byte_expanded_field(hf):
                 usage = hf.usages[0] if hf.usages else 0
+                if usage in self._ff01_usage_vars and not self._ff01_usage_vars[usage].get():
+                    continue
                 n_bytes = max(1, (hf.bit_size + 7) // 8)
                 for b in range(n_bytes):
                     col_defs.append({
                         "col_id":      f"vu_{usage:02X}_{id(hf)}_{b}",
                         "label":       f"U{usage:02X}[{b}]",
-                        "width":       58,
+                        "width":       _vu_col_w,
                         "field_ref":   hf,
                         "value_index": -1,
                         "byte_index":  b,
@@ -1199,12 +1320,23 @@ class HIDToolApp(tk.Tk):
             "data": dict(zip(headers, row)),
             "errors": list(error_reasons),
         })
-        self._table.insert("", 0, values=row, tags=row_tags)
-
         if error_reasons:
             self._error_count += 1
             self._error_var.set(f"ERR:{self._error_count} | {error_reasons[0]}")
 
+        # Buffer row — actual table.insert() done in _table_flush via after(0)
+        self._table_pending.append((row, row_tags))
+        if not self._table_flush_pending:
+            self._table_flush_pending = True
+            self.after(0, self._table_flush)
+
+    def _table_flush(self):
+        self._table_flush_pending = False
+        if not self._table_pending:
+            return
+        pending, self._table_pending = self._table_pending, []
+        for row, row_tags in pending:
+            self._table.insert("", 0, values=row, tags=row_tags)
         children = self._table.get_children()
         if len(children) > self._MAX_ROWS:
             for iid in children[self._MAX_ROWS:]:
@@ -1224,25 +1356,6 @@ class HIDToolApp(tk.Tk):
 
         if self._table_rid != -1 and report_id != self._table_rid:
             return
-
-        descriptor_fields: Optional[List[HIDField]] = None
-        matched_dev = match_device_name_to_hidapi(pkt.get("device_name", ""), self._hidapi_devices)
-        if matched_dev:
-            descriptor_fields = self._descriptors.get(self._get_dev_path_str(matched_dev))
-
-        if self._only_vendor.get():
-            if not descriptor_fields:
-                return
-            if not any(
-                f.is_vendor for f in descriptor_fields
-                if f.report_type == REPORT_TYPE_INPUT
-                and f.report_id == report_id
-                and (
-                    not f.is_const
-                    or self._is_vendor_usage_byte_expanded_field(f)
-                )
-            ):
-                return
 
         if not self._col_defs:
             return
@@ -1319,10 +1432,14 @@ class HIDToolApp(tk.Tk):
                 return self._get_field_display_value(payload, hf, idx)
 
             common_values = {name: read_entry(entry) for name, entry in self._hybrid_common.items()}
+            _btn1_val = common_values.get("btn_01")
             try:
                 active_count = int(common_values.get("ContactCount", ""))
             except (TypeError, ValueError):
                 active_count = -1
+            if is_new_frame:
+                self._canvas_prev_active = set(self._canvas_contacts.keys())
+                self._canvas_contacts.clear()
             appended = False
             for group in self._hybrid_groups:
                 confidence = read_entry(group.get("Confidence"))
@@ -1353,8 +1470,7 @@ class HIDToolApp(tk.Tk):
                     "__frame__": self._frame_seq,
                     "__rid__": f"0x{report_id:02X}",
                     "__slot__": group["slot"],
-                    "Confidence": confidence,
-                    "TipSwitch": tip,
+                    "ConfTip": self._merge_conf_tip(confidence, tip, _btn1_val),
                     "ContactID": cid_val,
                     "X": x,
                     "Y": y,
@@ -1371,11 +1487,27 @@ class HIDToolApp(tk.Tk):
                         hf = col["field_ref"]
                         byte_pos = (hf.bit_offset // 8) + col["byte_index"]
                         val = payload[byte_pos] if byte_pos < len(payload) else 0
-                        row.append(f"{val:02X}")
+                        if col["col_id"].startswith("vu_"):
+                            row.append(self._fmt_ff01_byte(val))
+                        else:
+                            row.append(f"{val:02X}")
                     else:
                         row.append("")
                 self._append_monitor_row(pkt, headers, row, row_tags, error_reasons)
                 appended = True
+
+                # Canvas: 用 ContactID 當 key，避免兩指交叉時 slot 互串
+                try:
+                    lx = int(x) if x not in ("", None) else None
+                    ly = int(y) if y not in ("", None) else None
+                except (TypeError, ValueError):
+                    lx = ly = None
+                try:
+                    track_key = int(cid_val)
+                except (TypeError, ValueError):
+                    track_key = None
+                if track_key is not None:
+                    self._canvas_update_slot(track_key, tip, lx, ly, cid_val, confidence)
 
             if not appended:
                 row_map = {
@@ -1383,6 +1515,7 @@ class HIDToolApp(tk.Tk):
                     "__rid__": f"0x{report_id:02X}",
                     "__slot__": "",
                     "__raw__": raw_hex,
+                    "ConfTip": self._merge_conf_tip("", "", _btn1_val),
                 }
                 row_map.update(common_values)
                 row = []
@@ -1393,7 +1526,10 @@ class HIDToolApp(tk.Tk):
                         hf = col["field_ref"]
                         byte_pos = (hf.bit_offset // 8) + col["byte_index"]
                         val = payload[byte_pos] if byte_pos < len(payload) else 0
-                        row.append(f"{val:02X}")
+                        if col["col_id"].startswith("vu_"):
+                            row.append(self._fmt_ff01_byte(val))
+                        else:
+                            row.append(f"{val:02X}")
                     else:
                         row.append("")
                 self._append_monitor_row(pkt, headers, row, row_tags, error_reasons)
@@ -1410,7 +1546,10 @@ class HIDToolApp(tk.Tk):
                 hf       = col["field_ref"]
                 byte_pos = (hf.bit_offset // 8) + col["byte_index"]
                 val      = payload[byte_pos] if byte_pos < len(payload) else 0
-                row.append(f"{val:02X}")
+                if cid.startswith("vu_"):
+                    row.append(self._fmt_ff01_byte(val))
+                else:
+                    row.append(f"{val:02X}")
             else:
                 hf   = col["field_ref"]
                 idx  = col["value_index"]
@@ -1425,6 +1564,7 @@ class HIDToolApp(tk.Tk):
 
     def _clear_log(self):
         self._monitor_log_rows.clear()
+        self._table_pending.clear()
         for iid in self._table.get_children():
             self._table.delete(iid)
         self._frame_seq = 0
@@ -1543,6 +1683,280 @@ class HIDToolApp(tk.Tk):
         self._send_log.configure(state="normal")
         self._send_log.delete("1.0", "end")
         self._send_log.configure(state="disabled")
+
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Canvas tab
+    # ------------------------------------------------------------------
+
+    _SLOT_COLORS = [
+        "#e74c3c", "#3498db", "#2ecc71", "#f39c12", "#9b59b6",
+        "#1abc9c", "#e67e22", "#34495e", "#e91e63", "#00bcd4",
+    ]
+
+    def _build_canvas_tab(self, parent):
+        info_row = tk.Frame(parent)
+        info_row.pack(side=tk.TOP, fill=tk.X, padx=4, pady=2)
+
+        self._canvas_info_var = tk.StringVar(value="（尚未載入裝置）")
+        tk.Label(info_row, textvariable=self._canvas_info_var,
+                 font=("Consolas", 9), fg="#555").pack(side=tk.LEFT)
+
+        tk.Button(info_row, text="清除", command=self._clear_canvas).pack(side=tk.RIGHT, padx=4)
+        tk.Button(info_row, text="Export Excel",
+                  command=self._export_monitor_to_excel).pack(side=tk.RIGHT, padx=4)
+
+        self._touch_canvas = tk.Canvas(
+            parent, bg="white", cursor="crosshair",
+            highlightthickness=1, highlightbackground="#aaaaaa",
+        )
+        self._touch_canvas.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
+        self._touch_canvas.bind("<Configure>", lambda *_: self._redraw_canvas())
+
+    def _update_canvas_range(self, path_str: str):
+        """從 descriptor 取出 X/Y 的 logical 範圍並更新畫布標註。"""
+        fields = self._descriptors.get(path_str, [])
+        x_field = next(
+            (hf for hf in fields
+             if hf.report_type == REPORT_TYPE_INPUT and not hf.is_vendor
+             and any((hf.usage_page, u) == (0x01, 0x30) for u in hf.usages)),
+            None,
+        )
+        y_field = next(
+            (hf for hf in fields
+             if hf.report_type == REPORT_TYPE_INPUT and not hf.is_vendor
+             and any((hf.usage_page, u) == (0x01, 0x31) for u in hf.usages)),
+            None,
+        )
+        self._canvas_x_logical = (x_field.logical_min, x_field.logical_max) if x_field else (0, 4096)
+        self._canvas_y_logical = (y_field.logical_min, y_field.logical_max) if y_field else (0, 4096)
+        x_min, x_max = self._canvas_x_logical
+        y_min, y_max = self._canvas_y_logical
+        self._canvas_info_var.set(
+            f"X: {x_min} ~ {x_max}   Y: {y_min} ~ {y_max}"
+        )
+        self._canvas_contacts.clear()
+        self._canvas_trails.clear()
+        self._canvas_prev_active.clear()
+        self._canvas_item_ids.clear()
+        self._canvas_trail_line_ids.clear()
+        self._redraw_canvas()
+
+    def _logical_to_canvas(self, lx: float, ly: float) -> Tuple[float, float]:
+        w = self._touch_canvas.winfo_width()
+        h = self._touch_canvas.winfo_height()
+        pad = 14
+        x_min, x_max = self._canvas_x_logical
+        y_min, y_max = self._canvas_y_logical
+        x_range = max(1, x_max - x_min)
+        y_range = max(1, y_max - y_min)
+        cx = pad + (lx - x_min) / x_range * (w - 2 * pad)
+        cy = pad + (ly - y_min) / y_range * (h - 2 * pad)
+        return cx, cy
+
+    def _canvas_update_slot(self, track_key: int, tip, lx, ly, cid_val, confidence=""):
+        """純資料更新，不呼叫任何 tkinter — 畫面由 _canvas_flush 統一處理。"""
+        if tip and lx is not None and ly is not None:
+            if track_key not in self._canvas_prev_active:
+                self._canvas_trails.pop(track_key, None)
+                self._canvas_trail_reset_keys.add(track_key)
+            trail = self._canvas_trails.setdefault(track_key, collections.deque(maxlen=500))
+            if not trail or lx != trail[-1][0] or ly != trail[-1][1]:
+                trail.append((lx, ly))
+                self._canvas_dirty_keys.add(track_key)
+            try:
+                conf_val = int(confidence)
+            except (TypeError, ValueError):
+                conf_val = 1
+            self._canvas_contacts[track_key] = {
+                "x": lx, "y": ly, "cid": cid_val, "conf": conf_val,
+            }
+        else:
+            self._canvas_contacts.pop(track_key, None)
+            self._canvas_circle_del_keys.add(track_key)
+            self._canvas_dirty_keys.discard(track_key)
+        self._schedule_canvas_flush()
+
+    def _schedule_canvas_flush(self):
+        if not self._canvas_flush_pending:
+            self._canvas_flush_pending = True
+            self.after(0, self._canvas_flush)   # event loop 閒置立刻執行
+
+    def _canvas_flush(self):
+        """每次 _poll_queue 後執行一次，只處理有新資料的 slot。"""
+        self._canvas_flush_pending = False
+        # 只在畫布 tab 可見時才渲染
+        try:
+            canvas_visible = self._touch_canvas.winfo_viewable()
+        except Exception:
+            canvas_visible = False
+        if not canvas_visible:
+            self._canvas_trail_reset_keys.clear()
+            self._canvas_circle_del_keys.clear()
+            self._canvas_dirty_keys.clear()
+            return
+
+        c = self._touch_canvas
+
+        # 清除需重置的軌跡線（新按下同一 ID）
+        for key in self._canvas_trail_reset_keys:
+            old_line = self._canvas_trail_line_ids.pop(key, None)
+            if old_line is not None:
+                c.delete(old_line)
+        self._canvas_trail_reset_keys.clear()
+
+        # 刪除 tip=0 的圓圈
+        for key in self._canvas_circle_del_keys:
+            ids = self._canvas_item_ids.pop(key, None)
+            if ids:
+                for item_id in ids:
+                    c.delete(item_id)
+        self._canvas_circle_del_keys.clear()
+
+        if not self._canvas_dirty_keys:
+            return
+
+        # 座標轉換常數（只呼叫一次 winfo）
+        w = c.winfo_width()
+        h = c.winfo_height()
+        if w <= 1 or h <= 1:
+            self._canvas_dirty_keys.clear()
+            return
+        pad = 14
+        x_min, x_max = self._canvas_x_logical
+        y_min, y_max = self._canvas_y_logical
+        xs = (w - 2 * pad) / max(1, x_max - x_min)
+        ys = (h - 2 * pad) / max(1, y_max - y_min)
+
+        # 只更新有新資料的 slot
+        dirty = self._canvas_dirty_keys.copy()
+        self._canvas_dirty_keys.clear()
+        for track_key in dirty:
+            contact = self._canvas_contacts.get(track_key)
+            if contact is None:
+                continue
+            lx   = contact["x"]
+            ly   = contact["y"]
+            cid  = contact["cid"]
+            conf = contact.get("conf", 1)
+            color  = self._SLOT_COLORS[track_key % len(self._SLOT_COLORS)]
+            new_cx = pad + (lx - x_min) * xs
+            new_cy = pad + (ly - y_min) * ys
+
+            # confidence=0 → 加粗加大
+            r          = 50  if conf == 0 else 20
+            line_width = 4   if conf == 0 else 2
+
+            trail = self._canvas_trails.get(track_key)
+            if trail and len(trail) >= 2:
+                flat: List[float] = []
+                for pt_x, pt_y in trail:
+                    flat.append(pad + (pt_x - x_min) * xs)
+                    flat.append(pad + (pt_y - y_min) * ys)
+                line_id = self._canvas_trail_line_ids.get(track_key)
+                if line_id is not None:
+                    c.coords(line_id, flat)
+                    c.itemconfig(line_id, width=line_width)
+                else:
+                    line_id = c.create_line(
+                        flat, fill=color, width=line_width,
+                        capstyle=tk.ROUND, joinstyle=tk.ROUND,
+                        tags=(f"trail_{track_key}", "trail"),
+                    )
+                    self._canvas_trail_line_ids[track_key] = line_id
+
+            ids = self._canvas_item_ids.get(track_key)
+            if ids:
+                oval_id, text_id = ids
+                c.coords(oval_id, new_cx - r, new_cy - r, new_cx + r, new_cy + r)
+                c.coords(text_id, new_cx, new_cy)
+            else:
+                contact_tag = f"contact_{track_key}"
+                oval_id = c.create_oval(
+                    new_cx - r, new_cy - r, new_cx + r, new_cy + r,
+                    fill=color, outline="white", width=2,
+                    tags=(contact_tag, "contact"),
+                )
+                text_id = c.create_text(
+                    new_cx, new_cy,
+                    text=str(cid if cid not in ("", None) else track_key),
+                    fill="white", font=("Arial", 10, "bold"),
+                    tags=(contact_tag, "contact"),
+                )
+                self._canvas_item_ids[track_key] = (oval_id, text_id)
+
+        c.tag_raise("contact")
+
+    def _redraw_canvas(self):
+        """完整重繪（視窗 resize 或清除時呼叫）。"""
+        c = self._touch_canvas
+        c.delete("all")
+        w = c.winfo_width()
+        h = c.winfo_height()
+        if w <= 1 or h <= 1:
+            return
+
+        pad = 14
+        c.create_rectangle(pad, pad, w - pad, h - pad,
+                            outline="#cccccc", width=1, dash=(4, 4), tags="border")
+        x_min, x_max = self._canvas_x_logical
+        y_min, y_max = self._canvas_y_logical
+        c.create_text(pad + 2, pad + 2, text=f"({x_min},{y_min})",
+                      anchor="nw", font=("Consolas", 7), fill="#aaaaaa", tags="border")
+        c.create_text(w - pad - 2, h - pad - 2, text=f"({x_max},{y_max})",
+                      anchor="se", font=("Consolas", 7), fill="#aaaaaa", tags="border")
+
+        # Redraw all trails，同時重建 line ID 對照表
+        xs = (w - 2 * pad) / max(1, x_max - x_min)
+        ys = (h - 2 * pad) / max(1, y_max - y_min)
+        new_line_ids: Dict[int, int] = {}
+        for slot, trail in self._canvas_trails.items():
+            pts = list(trail)
+            if len(pts) < 2:
+                continue
+            color = self._SLOT_COLORS[slot % len(self._SLOT_COLORS)]
+            flat: List[float] = []
+            for lx_t, ly_t in pts:
+                flat.append(pad + (lx_t - x_min) * xs)
+                flat.append(pad + (ly_t - y_min) * ys)
+            line_id = c.create_line(
+                flat, fill=color, width=2,
+                capstyle=tk.ROUND, joinstyle=tk.ROUND,
+                tags=(f"trail_{slot}", "trail"),
+            )
+            new_line_ids[slot] = line_id
+        self._canvas_trail_line_ids = new_line_ids
+
+        # Redraw active contact circles on top，重建 item ID 對照表
+        r = 20
+        new_ids: Dict[int, Tuple[int, int]] = {}
+        for slot, contact in self._canvas_contacts.items():
+            try:
+                lx = float(contact["x"])
+                ly = float(contact["y"])
+            except (TypeError, ValueError):
+                continue
+            cx = pad + (lx - x_min) * xs
+            cy = pad + (ly - y_min) * ys
+            color = self._SLOT_COLORS[slot % len(self._SLOT_COLORS)]
+            contact_tag = f"contact_{slot}"
+            oval_id = c.create_oval(cx - r, cy - r, cx + r, cy + r,
+                                    fill=color, outline="white", width=2,
+                                    tags=(contact_tag, "contact"))
+            cid_label = str(contact.get("cid", slot))
+            text_id = c.create_text(cx, cy, text=cid_label,
+                                    fill="white", font=("Arial", 10, "bold"),
+                                    tags=(contact_tag, "contact"))
+            new_ids[slot] = (oval_id, text_id)
+        self._canvas_item_ids = new_ids
+
+    def _clear_canvas(self):
+        self._canvas_contacts.clear()
+        self._canvas_trails.clear()
+        self._canvas_prev_active.clear()
+        self._canvas_item_ids.clear()
+        self._canvas_trail_line_ids.clear()
+        self._redraw_canvas()
 
     # ------------------------------------------------------------------
     # Cleanup
