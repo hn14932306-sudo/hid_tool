@@ -246,6 +246,12 @@ class HIDToolApp(tk.Tk):
         tk.Spinbox(ctrl_row, from_=0, to=9999, textvariable=self._max_scan_delta_var,
                    width=5).pack(side=tk.LEFT, padx=(2, 8))
 
+        tk.Label(ctrl_row, text="保留筆數:").pack(side=tk.LEFT, padx=(8, 0))
+        self._max_rows_var = tk.StringVar(value="200")
+        tk.Spinbox(ctrl_row, from_=50, to=5000, increment=50,
+                   textvariable=self._max_rows_var,
+                   width=5).pack(side=tk.LEFT, padx=(2, 8))
+
         tk.Checkbutton(ctrl_row, text="顯示 RAW 欄位",
                        variable=self._show_raw,
                        command=self._rebuild_table_columns).pack(side=tk.LEFT, padx=8)
@@ -786,7 +792,7 @@ class HIDToolApp(tk.Tk):
             len(usage_entries["Y"]),
             len(usage_entries["TipSwitch"]),
         )
-        if group_count <= 1:
+        if group_count < 1:
             self._hybrid_groups = []
             self._hybrid_common = {}
             return False
@@ -1337,9 +1343,13 @@ class HIDToolApp(tk.Tk):
         pending, self._table_pending = self._table_pending, []
         for row, row_tags in pending:
             self._table.insert("", 0, values=row, tags=row_tags)
+        try:
+            max_rows = max(50, int(self._max_rows_var.get()))
+        except (ValueError, AttributeError):
+            max_rows = 200
         children = self._table.get_children()
-        if len(children) > self._MAX_ROWS:
-            for iid in children[self._MAX_ROWS:]:
+        if len(children) > max_rows:
+            for iid in children[max_rows:]:
                 self._table.delete(iid)
 
     def _handle_packet(
@@ -1432,7 +1442,10 @@ class HIDToolApp(tk.Tk):
                 return self._get_field_display_value(payload, hf, idx)
 
             common_values = {name: read_entry(entry) for name, entry in self._hybrid_common.items()}
-            _btn1_val = common_values.get("btn_01")
+            _btn1_val = next(
+                (v for k, v in common_values.items() if k.startswith("btn_") and v not in ("", 0, None)),
+                None,
+            )
             try:
                 active_count = int(common_values.get("ContactCount", ""))
             except (TypeError, ValueError):
