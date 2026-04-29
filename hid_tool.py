@@ -492,11 +492,13 @@ class HIDToolApp(tk.Tk):
         seen: set = set()
         ff01_usages: List[int] = []
         for hf in fields:
-            if hf.usage_page == 0xFF01 and hf.report_type == REPORT_TYPE_INPUT:
-                usage = hf.usages[0] if hf.usages else 0
-                if usage not in seen:
-                    ff01_usages.append(usage)
-                    seen.add(usage)
+            if hf.report_type != REPORT_TYPE_INPUT or hf.bit_size < 8:
+                continue
+            first_usage = hf.usages[0] if hf.usages else 0
+            if hf.usage_page == 0xFF01 or (hf.usage_page, first_usage) in self._FF01_LIKE:
+                if first_usage not in seen:
+                    ff01_usages.append(first_usage)
+                    seen.add(first_usage)
 
         if not ff01_usages:
             tk.Label(self._ff01_check_frame, text="（無 FF01 欄位）", fg="gray").pack(side=tk.LEFT, padx=4)
@@ -719,14 +721,25 @@ class HIDToolApp(tk.Tk):
     # Monitor: Table columns
     # ------------------------------------------------------------------
 
+    # Usage Page 0x09 / Usage 0xC5 以外、UP=0xFF01 以外的特殊展開欄位
+    _FF01_LIKE = {(0x09, 0xC5)}
+
     @staticmethod
     def _is_byte_expanded_field(hf: HIDField) -> bool:
-        """UP=0x09 且 bit_size >= 8 的欄位按 byte 展開顯示（排除 1-bit button）。"""
-        return hf.usage_page == 0x09 and hf.bit_size >= 8
+        """UP=0x09 且 bit_size >= 8 的欄位按 byte 展開顯示（排除 1-bit button 及 FF01-like 欄位）。"""
+        if hf.usage_page != 0x09 or hf.bit_size < 8:
+            return False
+        first_usage = hf.usages[0] if hf.usages else 0
+        return (0x09, first_usage) not in HIDToolApp._FF01_LIKE
 
     @staticmethod
     def _is_vendor_usage_byte_expanded_field(hf: HIDField) -> bool:
-        return hf.usage_page == 0xFF01 and hf.bit_size >= 8
+        if hf.bit_size < 8:
+            return False
+        if hf.usage_page == 0xFF01:
+            return True
+        first_usage = hf.usages[0] if hf.usages else 0
+        return (hf.usage_page, first_usage) in HIDToolApp._FF01_LIKE
 
     @staticmethod
     def _is_combined_value_field(hf: HIDField) -> bool:
@@ -853,6 +866,9 @@ class HIDToolApp(tk.Tk):
             if hf.is_vendor or self._is_byte_expanded_field(hf):
                 continue
             if hf.usage_page != 0x09:
+                continue
+            first_usage = hf.usages[0] if hf.usages else 0
+            if (hf.usage_page, first_usage) in self._FF01_LIKE:
                 continue
             for i in range(hf.report_count):
                 usage = hf.usages[i] if i < len(hf.usages) else (hf.usages[-1] if hf.usages else 0)
