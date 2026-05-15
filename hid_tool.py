@@ -4,6 +4,7 @@ Imports backend modules: hid_descriptor, hid_rawinput, hid_device
 """
 
 import collections
+import csv
 import datetime
 import os
 import queue
@@ -93,6 +94,20 @@ class HIDToolApp(tk.Tk):
         self._scan_time_delta:  int                      = 0   # delta of last scan time change
         self._error_count:      int                      = 0
 
+        # Command device (separate from monitor device)
+        self._cmd_dev:           Optional[dict] = None  # None = use _selected_dev
+
+        # Stress test state
+        self._stress_running:          bool          = False
+        self._stress_count:            int           = 0
+        self._stress_fail_count:       int           = 0
+        self._stress_start_time:       float         = 0.0
+        self._stress_tip_active:       bool          = False
+        self._stress_touch_had_no_conf: bool         = False
+        self._stress_pending:          bool          = False
+        self._stress_delay_id:         Optional[str] = None
+        self._stress_records:          List[dict]    = []
+
         self._build_ui()
         self._refresh_devices()
         self.after(20, self._poll_queue)
@@ -107,9 +122,13 @@ class HIDToolApp(tk.Tk):
         top = tk.Frame(self, bd=2, relief=tk.RAISED, padx=4, pady=4)
         top.pack(side=tk.TOP, fill=tk.X)
 
-        tk.Label(top, text="裝置:").pack(side=tk.LEFT)
+        # Row 1: 監聽裝置
+        row1 = tk.Frame(top)
+        row1.pack(fill=tk.X)
+
+        tk.Label(row1, text="監聽裝置:", width=8, anchor="e").pack(side=tk.LEFT)
         self._dev_var = tk.StringVar()
-        self._dev_combo = ttk.Combobox(top, textvariable=self._dev_var, width=120, state="readonly")
+        self._dev_combo = ttk.Combobox(row1, textvariable=self._dev_var, width=120, state="readonly")
         self._dev_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 8))
         self._dev_combo.bind("<<ComboboxSelected>>", self._on_device_selected)
         self._dev_combo.bind("<Enter>", self._show_dev_tooltip)
@@ -117,13 +136,23 @@ class HIDToolApp(tk.Tk):
         self._dev_combo.bind("<Leave>", self._hide_dev_tooltip)
         self._dev_combo.bind("<ButtonPress-1>", self._hide_dev_tooltip)
 
-        tk.Button(top, text="重新整理", command=self._refresh_devices).pack(side=tk.LEFT, padx=2)
+        tk.Button(row1, text="重新整理", command=self._refresh_devices).pack(side=tk.LEFT, padx=2)
 
         self._listen_btn = tk.Button(
-            top, text="開始監聽", command=self._toggle_listen,
+            row1, text="開始監聽", command=self._toggle_listen,
             bg="#4CAF50", fg="white", font=("Arial", 10, "bold"),
         )
         self._listen_btn.pack(side=tk.LEFT, padx=8)
+
+        # Row 2: 指令裝置
+        row2 = tk.Frame(top)
+        row2.pack(fill=tk.X, pady=(2, 0))
+
+        tk.Label(row2, text="指令裝置:", width=8, anchor="e").pack(side=tk.LEFT)
+        self._cmd_dev_var = tk.StringVar()
+        self._cmd_dev_combo = ttk.Combobox(row2, textvariable=self._cmd_dev_var, width=120, state="readonly")
+        self._cmd_dev_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 8))
+        self._cmd_dev_combo.bind("<<ComboboxSelected>>", self._on_cmd_device_selected)
 
         # ---- Main PanedWindow ----
         paned = tk.PanedWindow(self, orient=tk.HORIZONTAL, sashrelief=tk.RAISED, sashwidth=5)
@@ -196,6 +225,10 @@ class HIDToolApp(tk.Tk):
         canvas_tab = tk.Frame(self._notebook)
         self._notebook.add(canvas_tab, text="  畫布  ")
         self._build_canvas_tab(canvas_tab)
+
+        stress_tab = tk.Frame(self._notebook)
+        self._notebook.add(stress_tab, text="  壓測  ")
+        self._build_stress_tab(stress_tab)
 
         # ---- Status bar ----
         sb_frame = tk.Frame(self, bd=1, relief=tk.SUNKEN)
@@ -333,6 +366,8 @@ class HIDToolApp(tk.Tk):
     # Shared Device Management
     # ------------------------------------------------------------------
 
+    _CMD_SAME_LABEL = "（同監聽裝置）"
+
     def _refresh_devices(self):
         self._hidapi_devices = sorted(
             enumerate_hid_devices(),
@@ -344,6 +379,13 @@ class HIDToolApp(tk.Tk):
         if labels:
             self._dev_combo.current(0)
             self._on_device_selected(None)
+
+        cmd_labels = [self._CMD_SAME_LABEL] + labels
+        self._cmd_dev_combo["values"] = cmd_labels
+        if self._cmd_dev_combo.current() < 0:
+            self._cmd_dev_combo.current(0)
+            self._cmd_dev = None
+
         self._status_var.set(f"找到 {len(self._hidapi_devices)} 個 HID 裝置")
 
     def _on_device_selected(self, event):
@@ -353,6 +395,19 @@ class HIDToolApp(tk.Tk):
         self._selected_dev = self._hidapi_devices[idx]
         self._hide_dev_tooltip()
         self._load_descriptor(self._selected_dev)
+
+    def _on_cmd_device_selected(self, event):
+        idx = self._cmd_dev_combo.current()
+        if idx <= 0:
+            self._cmd_dev = None  # same as monitor device
+        else:
+            dev_idx = idx - 1  # offset by 1 because of "（同監聽裝置）"
+            if dev_idx < len(self._hidapi_devices):
+                self._cmd_dev = self._hidapi_devices[dev_idx]
+
+    def _get_cmd_dev(self) -> Optional[dict]:
+        """Return the device to use for sending commands."""
+        return self._cmd_dev if self._cmd_dev is not None else self._selected_dev
 
     def _get_selected_device_label(self) -> str:
         idx = self._dev_combo.current()
@@ -1469,10 +1524,18 @@ class HIDToolApp(tk.Tk):
             if is_new_frame:
                 self._canvas_prev_active = set(self._canvas_contacts.keys())
                 self._canvas_contacts.clear()
+            _stress_pkt_conf = False
+            _stress_pkt_tip  = False
             appended = False
             for group in self._hybrid_groups:
                 confidence = read_entry(group.get("Confidence"))
                 tip = read_entry(group.get("TipSwitch"))
+                try:
+                    if int(confidence): _stress_pkt_conf = True
+                except (TypeError, ValueError): pass
+                try:
+                    if int(tip): _stress_pkt_tip = True
+                except (TypeError, ValueError): pass
                 cid_val = read_entry(group.get("ContactID"))
                 x = read_entry(group.get("X"))
                 y = read_entry(group.get("Y"))
@@ -1537,6 +1600,18 @@ class HIDToolApp(tk.Tk):
                     track_key = None
                 if track_key is not None:
                     self._canvas_update_slot(track_key, tip, lx, ly, cid_val, confidence)
+
+            if self._stress_running and not self._stress_pending:
+                if _stress_pkt_tip:
+                    if not self._stress_tip_active:
+                        self._stress_touch_had_no_conf = False  # 新的一次按壓
+                    self._stress_tip_active = True
+                    if not _stress_pkt_conf:
+                        self._stress_touch_had_no_conf = True   # Tip=1 但沒有 Confidence
+                else:  # Tip=0 → 抬起
+                    if self._stress_tip_active:
+                        self._stress_tip_active = False
+                        self._stress_on_lift_detected()
 
             if not appended:
                 row_map = {
@@ -1611,7 +1686,7 @@ class HIDToolApp(tk.Tk):
             self._get_btn.pack_forget()
 
     def _on_send(self):
-        if not self._selected_dev:
+        if not self._get_cmd_dev():
             self._send_log_append("[錯誤] 請先選擇一個裝置")
             return
 
@@ -1633,7 +1708,7 @@ class HIDToolApp(tk.Tk):
         use_feature = self._report_type.get() == "Feature"
         threading.Thread(
             target=self._send_report,
-            args=(self._selected_dev["path"], report_id, data, use_feature),
+            args=(self._get_cmd_dev()["path"], report_id, data, use_feature),
             daemon=True,
         ).start()
 
@@ -1653,7 +1728,7 @@ class HIDToolApp(tk.Tk):
             self._send_log_append(f"  [錯誤] {e}")
 
     def _on_get_report(self):
-        if not self._selected_dev:
+        if not self._get_cmd_dev():
             self._send_log_append("[錯誤] 請先選擇一個裝置")
             return
 
@@ -1669,12 +1744,12 @@ class HIDToolApp(tk.Tk):
         length = self._feature_report_length(report_id)
         threading.Thread(
             target=self._do_get_report,
-            args=(self._selected_dev["path"], report_id, length),
+            args=(self._get_cmd_dev()["path"], report_id, length),
             daemon=True,
         ).start()
 
     def _feature_report_length(self, report_id: int) -> int:
-        path_str   = self._get_dev_path_str(self._selected_dev) if self._selected_dev else ""
+        path_str   = self._get_dev_path_str(self._get_cmd_dev()) if self._get_cmd_dev() else ""
         fields     = self._descriptors.get(path_str, [])
         total_bits = sum(
             f.bit_size for f in fields
@@ -1741,6 +1816,84 @@ class HIDToolApp(tk.Tk):
         )
         self._touch_canvas.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
         self._touch_canvas.bind("<Configure>", lambda *_: self._redraw_canvas())
+
+    def _build_stress_tab(self, parent):
+        pad = {"padx": 8, "pady": 4}
+
+        cmd_frame = ttk.LabelFrame(parent, text="壓測後發送指令", padding=8)
+        cmd_frame.pack(fill=tk.X, **pad)
+
+        ttk.Label(cmd_frame, text="Report 類型:").grid(row=0, column=0, sticky="w", padx=4)
+        self._stress_report_type = tk.StringVar(value="Output")
+        ttk.Radiobutton(cmd_frame, text="Output",  variable=self._stress_report_type, value="Output").grid(row=0, column=1, sticky="w")
+        ttk.Radiobutton(cmd_frame, text="Feature", variable=self._stress_report_type, value="Feature").grid(row=0, column=2, sticky="w")
+
+        ttk.Label(cmd_frame, text="Report ID (hex):").grid(row=1, column=0, sticky="w", padx=4, pady=4)
+        self._stress_report_id_var = tk.StringVar(value="01")
+        ttk.Entry(cmd_frame, textvariable=self._stress_report_id_var, width=10).grid(row=1, column=1, columnspan=2, sticky="w")
+
+        ttk.Label(cmd_frame, text="Data (hex):").grid(row=2, column=0, sticky="w", padx=4)
+        self._stress_data_var = tk.StringVar()
+        ttk.Entry(cmd_frame, textvariable=self._stress_data_var, width=55).grid(row=2, column=1, columnspan=3, sticky="w")
+
+        settings_frame = ttk.LabelFrame(parent, text="壓測設定", padding=8)
+        settings_frame.pack(fill=tk.X, **pad)
+
+        ttk.Label(settings_frame, text="抬起後延遲 (ms):").grid(row=0, column=0, sticky="w", padx=4)
+        self._stress_delay_var = tk.StringVar(value="200")
+        ttk.Spinbox(settings_frame, from_=0, to=9999, textvariable=self._stress_delay_var, width=6).grid(row=0, column=1, sticky="w", padx=(2, 20))
+
+        ttk.Label(settings_frame, text="最大次數 (0=無限):").grid(row=0, column=2, sticky="w", padx=4)
+        self._stress_max_count_var = tk.StringVar(value="0")
+        ttk.Spinbox(settings_frame, from_=0, to=99999, textvariable=self._stress_max_count_var, width=7).grid(row=0, column=3, sticky="w", padx=(2, 20))
+
+        ttk.Label(settings_frame, text="最大時間 (s, 0=無限):").grid(row=0, column=4, sticky="w", padx=4)
+        self._stress_max_time_var = tk.StringVar(value="0")
+        ttk.Spinbox(settings_frame, from_=0, to=99999, textvariable=self._stress_max_time_var, width=7).grid(row=0, column=5, sticky="w")
+
+        ctrl_row = tk.Frame(parent)
+        ctrl_row.pack(fill=tk.X, padx=8, pady=4)
+        self._stress_start_btn = tk.Button(
+            ctrl_row, text="開始壓測", command=self._stress_toggle,
+            bg="#4CAF50", fg="white", font=("Arial", 10, "bold"), padx=12, pady=4,
+        )
+        self._stress_start_btn.pack(side=tk.LEFT, padx=4)
+        tk.Button(ctrl_row, text="清除記錄", command=self._stress_log_clear).pack(side=tk.LEFT, padx=4)
+        tk.Button(ctrl_row, text="Export CSV", command=self._stress_export_csv).pack(side=tk.LEFT, padx=4)
+
+        stats_frame = ttk.LabelFrame(parent, text="統計", padding=6)
+        stats_frame.pack(fill=tk.X, padx=8, pady=2)
+
+        ttk.Label(stats_frame, text="總次數:").pack(side=tk.LEFT, padx=(4, 2))
+        self._stress_count_var = tk.StringVar(value="0")
+        ttk.Label(stats_frame, textvariable=self._stress_count_var,
+                  font=("Consolas", 12, "bold"), width=6, foreground="#2196F3").pack(side=tk.LEFT, padx=(0, 12))
+
+        ttk.Label(stats_frame, text="失敗:").pack(side=tk.LEFT, padx=(0, 2))
+        self._stress_fail_var = tk.StringVar(value="0")
+        ttk.Label(stats_frame, textvariable=self._stress_fail_var,
+                  font=("Consolas", 12, "bold"), width=6, foreground="#e53935").pack(side=tk.LEFT, padx=(0, 12))
+
+        ttk.Label(stats_frame, text="通過:").pack(side=tk.LEFT, padx=(0, 2))
+        self._stress_pass_var = tk.StringVar(value="0")
+        ttk.Label(stats_frame, textvariable=self._stress_pass_var,
+                  font=("Consolas", 12, "bold"), width=6, foreground="#43a047").pack(side=tk.LEFT, padx=(0, 16))
+
+        ttk.Label(stats_frame, text="已運行:").pack(side=tk.LEFT, padx=(0, 2))
+        self._stress_elapsed_var = tk.StringVar(value="0.0s")
+        ttk.Label(stats_frame, textvariable=self._stress_elapsed_var,
+                  font=("Consolas", 11), width=8).pack(side=tk.LEFT, padx=(0, 16))
+
+        ttk.Label(stats_frame, text="狀態:").pack(side=tk.LEFT, padx=(0, 2))
+        self._stress_status_var = tk.StringVar(value="就緒")
+        ttk.Label(stats_frame, textvariable=self._stress_status_var,
+                  font=("Arial", 10), foreground="#555").pack(side=tk.LEFT)
+
+        log_frame = ttk.LabelFrame(parent, text="壓測記錄", padding=4)
+        log_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 8))
+        self._stress_log = scrolledtext.ScrolledText(
+            log_frame, height=12, state="disabled", font=("Consolas", 9))
+        self._stress_log.pack(fill=tk.BOTH, expand=True)
 
     def _update_canvas_range(self, path_str: str):
         """從 descriptor 取出 X/Y 的 logical 範圍並更新畫布標註。"""
@@ -1986,6 +2139,215 @@ class HIDToolApp(tk.Tk):
         self._canvas_item_ids.clear()
         self._canvas_trail_line_ids.clear()
         self._redraw_canvas()
+
+    # ------------------------------------------------------------------
+    # Stress test
+    # ------------------------------------------------------------------
+
+    def _stress_toggle(self):
+        if self._stress_running:
+            self._stress_stop()
+        else:
+            self._stress_start()
+
+    def _stress_start(self):
+        if not self._get_cmd_dev():
+            messagebox.showwarning("警告", "請先選擇一個裝置")
+            return
+        if not self._listening:
+            messagebox.showwarning("警告", "請先開始監聽（按上方「開始監聽」按鈕）")
+            return
+        self._stress_running           = True
+        self._stress_count             = 0
+        self._stress_fail_count        = 0
+        self._stress_start_time        = time.monotonic()
+        self._stress_tip_active        = False
+        self._stress_touch_had_no_conf = False
+        self._stress_pending           = False
+        self._stress_records           = []
+        self._stress_start_btn.config(text="停止壓測", bg="#e74c3c")
+        self._stress_status_var.set("運行中")
+        self._stress_log_clear()
+        self._stress_log_append("=== 壓測開始 ===")
+        self._stress_update_stats()
+        self._stress_update_timer()
+
+    def _stress_stop(self):
+        if not self._stress_running:
+            return
+        self._stress_running = False
+        if self._stress_delay_id:
+            self.after_cancel(self._stress_delay_id)
+            self._stress_delay_id = None
+        self._stress_pending           = False
+        self._stress_tip_active        = False
+        self._stress_touch_had_no_conf = False
+        elapsed    = time.monotonic() - self._stress_start_time
+        pass_count = self._stress_count - self._stress_fail_count
+        self._stress_log_append(
+            f"=== 壓測結束 === 共 {self._stress_count} 次  "
+            f"通過 {pass_count}  失敗 {self._stress_fail_count}  耗時 {elapsed:.1f}s"
+        )
+        self._stress_start_btn.config(text="開始壓測", bg="#4CAF50")
+        self._stress_status_var.set("已停止")
+        self._stress_update_stats()
+
+    def _stress_on_lift_detected(self):
+        self._stress_count += 1
+        is_fail = self._stress_touch_had_no_conf
+        if is_fail:
+            self._stress_fail_count += 1
+        self._stress_update_stats()
+        result = "FAIL" if is_fail else "OK"
+        reason = "觸控中無 Confidence" if is_fail else ""
+        self._stress_records.append({
+            "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+            "count":     self._stress_count,
+            "result":    result,
+            "reason":    reason,
+        })
+        self._stress_log_append(
+            f"[{self._stress_count}] 抬起 [{result}]" + (f" — {reason}" if reason else "")
+        )
+
+        try:
+            max_count = int(self._stress_max_count_var.get())
+        except ValueError:
+            max_count = 0
+        if max_count > 0 and self._stress_count >= max_count:
+            self._stress_log_append(f"[完成] 達到目標次數 {max_count}")
+            self.after(0, self._stress_stop)
+            return
+
+        elapsed = time.monotonic() - self._stress_start_time
+        try:
+            max_time = float(self._stress_max_time_var.get())
+        except ValueError:
+            max_time = 0
+        if max_time > 0 and elapsed >= max_time:
+            self._stress_log_append(f"[完成] 達到目標時間 {max_time:.0f}s")
+            self.after(0, self._stress_stop)
+            return
+
+        self._stress_pending = True
+        try:
+            delay_ms = max(0, int(self._stress_delay_var.get()))
+        except ValueError:
+            delay_ms = 200
+        self._stress_delay_id = self.after(delay_ms, self._stress_send_command)
+
+    def _stress_send_command(self):
+        self._stress_pending  = False
+        self._stress_delay_id = None
+        cmd_dev = self._get_cmd_dev()
+        if not self._stress_running or not cmd_dev:
+            return
+
+        rid_str = self._stress_report_id_var.get().strip()
+        try:
+            report_id = int(rid_str, 16)
+            if not (0 <= report_id <= 255):
+                raise ValueError
+        except ValueError:
+            self._stress_log_append("[錯誤] Report ID 格式錯誤")
+            return
+
+        try:
+            data = parse_hex_bytes(self._stress_data_var.get().strip())
+        except ValueError:
+            self._stress_log_append("[錯誤] Data 格式錯誤")
+            return
+
+        use_feature = self._stress_report_type.get() == "Feature"
+        path = cmd_dev["path"]
+        rtype = "Feature" if use_feature else "Output"
+
+        def worker():
+            try:
+                sent = send_feature_report(path, report_id, data) if use_feature \
+                       else send_output_report(path, report_id, data)
+                if sent < 0:
+                    self._stress_log_append(f"  → 發送 {rtype} 失敗 (回傳 {sent})")
+                else:
+                    self._stress_log_append(
+                        f"  → 發送 {rtype} ID=0x{report_id:02X} OK ({sent} bytes)"
+                    )
+            except Exception as exc:
+                self._stress_log_append(f"  → [錯誤] {exc}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _stress_update_stats(self):
+        pass_count = self._stress_count - self._stress_fail_count
+        self._stress_count_var.set(str(self._stress_count))
+        self._stress_fail_var.set(str(self._stress_fail_count))
+        self._stress_pass_var.set(str(pass_count))
+        if self._stress_running:
+            elapsed = time.monotonic() - self._stress_start_time
+            self._stress_elapsed_var.set(f"{elapsed:.1f}s")
+        else:
+            self._stress_elapsed_var.set("0.0s")
+
+    def _stress_update_timer(self):
+        if not self._stress_running:
+            return
+        elapsed = time.monotonic() - self._stress_start_time
+        self._stress_count_var.set(str(self._stress_count))
+        self._stress_elapsed_var.set(f"{elapsed:.1f}s")
+
+        try:
+            max_time = float(self._stress_max_time_var.get())
+        except ValueError:
+            max_time = 0
+        if max_time > 0 and elapsed >= max_time and not self._stress_pending:
+            self._stress_log_append(f"[完成] 達到目標時間 {max_time:.0f}s")
+            self._stress_stop()
+            return
+
+        self.after(500, self._stress_update_timer)
+
+    _STRESS_LOG_MAX_LINES = 500
+
+    def _stress_log_append(self, msg: str):
+        ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        line = f"[{ts}] {msg}"
+        def _do():
+            self._stress_log.configure(state="normal")
+            self._stress_log.insert("end", line + "\n")
+            # 超過上限時刪除最舊的 100 行，避免長時間累積
+            line_count = int(self._stress_log.index("end-1c").split(".")[0])
+            if line_count > self._STRESS_LOG_MAX_LINES:
+                self._stress_log.delete("1.0", "101.0")
+            self._stress_log.see("end")
+            self._stress_log.configure(state="disabled")
+        self.after(0, _do)
+
+    def _stress_log_clear(self):
+        self._stress_log.configure(state="normal")
+        self._stress_log.delete("1.0", "end")
+        self._stress_log.configure(state="disabled")
+
+    def _stress_export_csv(self):
+        if not self._stress_records:
+            messagebox.showinfo("提示", "尚無壓測記錄可匯出")
+            return
+        default_name = f"stress_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            initialfile=default_name,
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.DictWriter(
+                    f, fieldnames=["timestamp", "count", "result", "reason"])
+                writer.writeheader()
+                writer.writerows(self._stress_records)
+            messagebox.showinfo("完成", f"已匯出 {len(self._stress_records)} 筆\n{path}")
+        except Exception as e:
+            messagebox.showerror("錯誤", f"匯出失敗: {e}")
 
     # ------------------------------------------------------------------
     # Cleanup

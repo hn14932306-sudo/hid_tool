@@ -25,6 +25,9 @@ def enumerate_hid_devices() -> List[dict]:
         return []
 
 
+_COL_RE = re.compile(r"&Col(\d+)", re.IGNORECASE)
+
+
 def format_device_label(dev: dict) -> str:
     vid  = dev.get("vendor_id",  0)
     pid  = dev.get("product_id", 0)
@@ -33,7 +36,9 @@ def format_device_label(dev: dict) -> str:
     path = dev.get("path", b"")
     if isinstance(path, bytes):
         path = path.decode("utf-8", errors="replace")
-    return f"VID={vid:04X} PID={pid:04X}  {mfr} {prod}  [{path}]".strip()
+    m = _COL_RE.search(path)
+    col_tag = f" [Col{int(m.group(1)):02d}]" if m else " [TLC]"
+    return f"VID={vid:04X} PID={pid:04X}{col_tag}  {mfr} {prod}  [{path}]".strip()
 
 
 # ---------------------------------------------------------------------------
@@ -96,22 +101,35 @@ def match_device_name_to_hidapi(
 # Report send / receive
 # ---------------------------------------------------------------------------
 
+def _hid_error(dev) -> str:
+    try:
+        return dev.error() or "unknown error"
+    except Exception:
+        return "unknown error"
+
+
 def send_output_report(path, report_id: int, data: List[int]) -> int:
-    """Send an Output report via hid.write(). Returns bytes written or -1."""
+    """Send an Output report via hid.write(). Raises RuntimeError on failure."""
     dev = hid.device()
     dev.open_path(path if isinstance(path, bytes) else path.encode())
     try:
-        return dev.write([report_id] + data)
+        result = dev.write([report_id] + data)
+        if result < 0:
+            raise RuntimeError(_hid_error(dev))
+        return result
     finally:
         dev.close()
 
 
 def send_feature_report(path, report_id: int, data: List[int]) -> int:
-    """Send a Feature report via hid.send_feature_report(). Returns bytes written or -1."""
+    """Send a Feature report via hid.send_feature_report(). Raises RuntimeError on failure."""
     dev = hid.device()
     dev.open_path(path if isinstance(path, bytes) else path.encode())
     try:
-        return dev.send_feature_report([report_id] + data)
+        result = dev.send_feature_report([report_id] + data)
+        if result < 0:
+            raise RuntimeError(_hid_error(dev))
+        return result
     finally:
         dev.close()
 
