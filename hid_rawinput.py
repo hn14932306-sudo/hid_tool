@@ -116,6 +116,7 @@ class RawInputThread(threading.Thread):
         self._hwnd            = None
         self._stop_event      = threading.Event()
         self._ready_event     = threading.Event()
+        self._device_name_cache = {}
 
     def run(self):
         user32   = ctypes.windll.user32
@@ -234,6 +235,9 @@ class RawInputThread(threading.Thread):
 
         try:
             device_name = get_device_name_from_handle(hdr.hDevice)
+            if hdr.hDevice not in self._device_name_cache:
+                self._device_name_cache[hdr.hDevice] = get_device_name_from_handle(hdr.hDevice)
+            device_name = self._device_name_cache[hdr.hDevice]
         except Exception:
             device_name = ""
 

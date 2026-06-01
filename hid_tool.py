@@ -369,6 +369,8 @@ class HIDToolApp(tk.Tk):
     _CMD_SAME_LABEL = "（同監聽裝置）"
 
     def _refresh_devices(self):
+        self._descriptors.clear()
+        self._raw_descriptors.clear()
         self._hidapi_devices = sorted(
             enumerate_hid_devices(),
             key=lambda d: (d.get("vendor_id", 0), d.get("product_id", 0)),
@@ -1174,6 +1176,12 @@ class HIDToolApp(tk.Tk):
         if self._raw_thread and self._raw_thread.is_alive():
             return
 
+        if self._selected_dev:
+            path_str = self._get_dev_path_str(self._selected_dev)
+            self._descriptors.pop(path_str, None)
+            self._raw_descriptors.pop(path_str, None)
+            self._load_descriptor(self._selected_dev)
+
         extra_up = self._selected_dev.get("usage_page", 0) if self._selected_dev else 0
         extra_u  = self._selected_dev.get("usage",      0) if self._selected_dev else 0
 
@@ -1825,16 +1833,36 @@ class HIDToolApp(tk.Tk):
 
         ttk.Label(cmd_frame, text="Report 類型:").grid(row=0, column=0, sticky="w", padx=4)
         self._stress_report_type = tk.StringVar(value="Output")
-        ttk.Radiobutton(cmd_frame, text="Output",  variable=self._stress_report_type, value="Output").grid(row=0, column=1, sticky="w")
-        ttk.Radiobutton(cmd_frame, text="Feature", variable=self._stress_report_type, value="Feature").grid(row=0, column=2, sticky="w")
+        ttk.Radiobutton(cmd_frame, text="Output",  variable=self._stress_report_type, value="Output",
+                        command=self._stress_update_cmd_ui).grid(row=0, column=1, sticky="w")
+        ttk.Radiobutton(cmd_frame, text="Feature", variable=self._stress_report_type, value="Feature",
+                        command=self._stress_update_cmd_ui).grid(row=0, column=2, sticky="w")
+
+        self._stress_feature_dir = tk.StringVar(value="Set")
+        self._stress_dir_lbl = ttk.Label(cmd_frame, text="方向:")
+        self._stress_dir_lbl.grid(row=0, column=3, sticky="w", padx=(20, 4))
+        self._stress_dir_set_rb = ttk.Radiobutton(cmd_frame, text="Set", variable=self._stress_feature_dir,
+                                                   value="Set", command=self._stress_update_cmd_ui)
+        self._stress_dir_set_rb.grid(row=0, column=4, sticky="w")
+        self._stress_dir_get_rb = ttk.Radiobutton(cmd_frame, text="Get", variable=self._stress_feature_dir,
+                                                   value="Get", command=self._stress_update_cmd_ui)
+        self._stress_dir_get_rb.grid(row=0, column=5, sticky="w")
 
         ttk.Label(cmd_frame, text="Report ID (hex):").grid(row=1, column=0, sticky="w", padx=4, pady=4)
         self._stress_report_id_var = tk.StringVar(value="01")
         ttk.Entry(cmd_frame, textvariable=self._stress_report_id_var, width=10).grid(row=1, column=1, columnspan=2, sticky="w")
 
-        ttk.Label(cmd_frame, text="Data (hex):").grid(row=2, column=0, sticky="w", padx=4)
+        self._stress_data_lbl = ttk.Label(cmd_frame, text="Data (hex):")
+        self._stress_data_lbl.grid(row=2, column=0, sticky="w", padx=4)
         self._stress_data_var = tk.StringVar()
-        ttk.Entry(cmd_frame, textvariable=self._stress_data_var, width=55).grid(row=2, column=1, columnspan=3, sticky="w")
+        self._stress_data_entry = ttk.Entry(cmd_frame, textvariable=self._stress_data_var, width=55)
+        self._stress_data_entry.grid(row=2, column=1, columnspan=3, sticky="w")
+
+        self._stress_get_len_lbl = ttk.Label(cmd_frame, text="Length (bytes):")
+        self._stress_get_len_lbl.grid(row=3, column=0, sticky="w", padx=4, pady=4)
+        self._stress_get_len_var = tk.StringVar(value="64")
+        self._stress_get_len_entry = ttk.Entry(cmd_frame, textvariable=self._stress_get_len_var, width=10)
+        self._stress_get_len_entry.grid(row=3, column=1, columnspan=2, sticky="w")
 
         settings_frame = ttk.LabelFrame(parent, text="壓測設定", padding=8)
         settings_frame.pack(fill=tk.X, **pad)
@@ -1894,6 +1922,8 @@ class HIDToolApp(tk.Tk):
         self._stress_log = scrolledtext.ScrolledText(
             log_frame, height=12, state="disabled", font=("Consolas", 9))
         self._stress_log.pack(fill=tk.BOTH, expand=True)
+
+        self._stress_update_cmd_ui()
 
     def _update_canvas_range(self, path_str: str):
         """從 descriptor 取出 X/Y 的 logical 範圍並更新畫布標註。"""
@@ -2144,6 +2174,24 @@ class HIDToolApp(tk.Tk):
     # Stress test
     # ------------------------------------------------------------------
 
+    def _stress_update_cmd_ui(self):
+        is_feature = self._stress_report_type.get() == "Feature"
+        is_get = is_feature and self._stress_feature_dir.get() == "Get"
+        dir_state = "normal" if is_feature else "disabled"
+        self._stress_dir_lbl.config(state=dir_state)
+        self._stress_dir_set_rb.config(state=dir_state)
+        self._stress_dir_get_rb.config(state=dir_state)
+        if is_get:
+            self._stress_data_lbl.grid_remove()
+            self._stress_data_entry.grid_remove()
+            self._stress_get_len_lbl.grid()
+            self._stress_get_len_entry.grid()
+        else:
+            self._stress_get_len_lbl.grid_remove()
+            self._stress_get_len_entry.grid_remove()
+            self._stress_data_lbl.grid()
+            self._stress_data_entry.grid()
+
     def _stress_toggle(self):
         if self._stress_running:
             self._stress_stop()
@@ -2252,28 +2300,52 @@ class HIDToolApp(tk.Tk):
             self._stress_log_append("[錯誤] Report ID 格式錯誤")
             return
 
-        try:
-            data = parse_hex_bytes(self._stress_data_var.get().strip())
-        except ValueError:
-            self._stress_log_append("[錯誤] Data 格式錯誤")
-            return
-
         use_feature = self._stress_report_type.get() == "Feature"
+        use_get = use_feature and self._stress_feature_dir.get() == "Get"
         path = cmd_dev["path"]
-        rtype = "Feature" if use_feature else "Output"
 
-        def worker():
+        if use_get:
             try:
-                sent = send_feature_report(path, report_id, data) if use_feature \
-                       else send_output_report(path, report_id, data)
-                if sent < 0:
-                    self._stress_log_append(f"  → 發送 {rtype} 失敗 (回傳 {sent})")
-                else:
-                    self._stress_log_append(
-                        f"  → 發送 {rtype} ID=0x{report_id:02X} OK ({sent} bytes)"
-                    )
-            except Exception as exc:
-                self._stress_log_append(f"  → [錯誤] {exc}")
+                length = int(self._stress_get_len_var.get())
+                if length <= 0:
+                    raise ValueError
+            except ValueError:
+                self._stress_log_append("[錯誤] Length 格式錯誤")
+                return
+
+            def worker():
+                try:
+                    recv = get_feature_report(path, report_id, length)
+                    if not recv:
+                        self._stress_log_append(f"  → Get Feature ID=0x{report_id:02X} 回傳空資料")
+                    else:
+                        hex_str = ' '.join(f'{b:02X}' for b in recv)
+                        self._stress_log_append(
+                            f"  → Get Feature ID=0x{report_id:02X} ({len(recv)} bytes): {hex_str}"
+                        )
+                except Exception as exc:
+                    self._stress_log_append(f"  → [錯誤] {exc}")
+        else:
+            try:
+                data = parse_hex_bytes(self._stress_data_var.get().strip())
+            except ValueError:
+                self._stress_log_append("[錯誤] Data 格式錯誤")
+                return
+
+            rtype = "Feature" if use_feature else "Output"
+
+            def worker():
+                try:
+                    sent = send_feature_report(path, report_id, data) if use_feature \
+                           else send_output_report(path, report_id, data)
+                    if sent < 0:
+                        self._stress_log_append(f"  → 發送 {rtype} 失敗 (回傳 {sent})")
+                    else:
+                        self._stress_log_append(
+                            f"  → 發送 {rtype} ID=0x{report_id:02X} OK ({sent} bytes)"
+                        )
+                except Exception as exc:
+                    self._stress_log_append(f"  → [錯誤] {exc}")
 
         threading.Thread(target=worker, daemon=True).start()
 
