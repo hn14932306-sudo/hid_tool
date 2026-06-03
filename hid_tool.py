@@ -19,6 +19,7 @@ from xml.sax.saxutils import escape
 from hid_descriptor import (
     HIDField,
     REPORT_TYPE_INPUT,
+    REPORT_TYPE_OUTPUT,
     REPORT_TYPE_FEATURE,
     parse_report_descriptor,
     extract_field_value,
@@ -32,6 +33,8 @@ from hid_device import (
     send_output_report,
     send_feature_report,
     get_feature_report,
+    get_input_report,
+    set_output_report_cmd,
     parse_hex_bytes,
 )
 
@@ -106,6 +109,7 @@ class HIDToolApp(tk.Tk):
         self._stress_touch_had_no_conf: bool         = False
         self._stress_pending:          bool          = False
         self._stress_delay_id:         Optional[str] = None
+        self._stress_poll_id:          Optional[str] = None
         self._stress_records:          List[dict]    = []
 
         self._build_ui()
@@ -336,6 +340,8 @@ class HIDToolApp(tk.Tk):
                         value="Output").grid(row=0, column=1, sticky="w")
         ttk.Radiobutton(param_frame, text="Feature", variable=self._report_type,
                         value="Feature").grid(row=0, column=2, sticky="w")
+        ttk.Radiobutton(param_frame, text="Input",   variable=self._report_type,
+                        value="Input").grid(row=0, column=3, sticky="w")
 
         ttk.Label(param_frame, text="Report ID (hex):").grid(row=1, column=0, sticky="w", padx=4, pady=4)
         self._report_id_var = tk.StringVar(value="01")
@@ -1688,7 +1694,8 @@ class HIDToolApp(tk.Tk):
     # ------------------------------------------------------------------
 
     def _on_report_type_changed(self, *_):
-        if self._report_type.get() == "Feature":
+        rtype = self._report_type.get()
+        if rtype in ("Feature", "Input"):
             self._get_btn.pack(side=tk.LEFT, padx=4)
         else:
             self._get_btn.pack_forget()
@@ -1713,25 +1720,34 @@ class HIDToolApp(tk.Tk):
             self._send_log_append("[錯誤] Data 格式錯誤，請使用十六進位")
             return
 
-        use_feature = self._report_type.get() == "Feature"
         threading.Thread(
             target=self._send_report,
-            args=(self._get_cmd_dev()["path"], report_id, data, use_feature),
+            args=(self._get_cmd_dev()["path"], report_id, data, self._report_type.get()),
             daemon=True,
         ).start()
 
-    def _send_report(self, path, report_id: int, data: list, use_feature: bool):
-        rtype = "Feature" if use_feature else "Output"
+    def _send_report(self, path, report_id: int, data: list, rtype: str):
         self._send_log_append(f"\n發送 {rtype} Report")
         self._send_log_append(f"  Report ID : 0x{report_id:02X}")
         self._send_log_append(f"  Data      : {' '.join(f'{b:02X}' for b in data)}")
         try:
-            sent = send_feature_report(path, report_id, data) if use_feature \
-                   else send_output_report(path, report_id, data)
-            if sent < 0:
-                self._send_log_append(f"  [錯誤] 發送失敗 (回傳 {sent})")
+            if rtype == "Feature":
+                sent = send_feature_report(path, report_id, data)
+                if sent < 0:
+                    self._send_log_append(f"  [錯誤] 發送失敗 (回傳 {sent})")
+                else:
+                    self._send_log_append(f"  [成功] 已發送 {sent} bytes")
+            elif rtype == "Input":
+                required = self._report_length(report_id, REPORT_TYPE_OUTPUT) - 1
+                padded = (data + [0] * required)[:required]
+                set_output_report_cmd(path, report_id, padded)
+                self._send_log_append(f"  [成功] SET_REPORT(Output) command 已送出")
             else:
-                self._send_log_append(f"  [成功] 已發送 {sent} bytes")
+                sent = send_output_report(path, report_id, data)
+                if sent < 0:
+                    self._send_log_append(f"  [錯誤] 發送失敗 (回傳 {sent})")
+                else:
+                    self._send_log_append(f"  [成功] 已發送 {sent} bytes")
         except Exception as e:
             self._send_log_append(f"  [錯誤] {e}")
 
@@ -1749,28 +1765,52 @@ class HIDToolApp(tk.Tk):
             self._send_log_append("[錯誤] Report ID 必須是 0x00~0xFF 的十六進位數值")
             return
 
-        length = self._feature_report_length(report_id)
-        threading.Thread(
-            target=self._do_get_report,
-            args=(self._get_cmd_dev()["path"], report_id, length),
-            daemon=True,
-        ).start()
+        rtype = self._report_type.get()
+        if rtype == "Input":
+            length = self._report_length(report_id, REPORT_TYPE_INPUT)
+            threading.Thread(
+                target=self._do_get_input_report,
+                args=(self._get_cmd_dev()["path"], report_id, length),
+                daemon=True,
+            ).start()
+        else:
+            length = self._report_length(report_id, REPORT_TYPE_FEATURE)
+            threading.Thread(
+                target=self._do_get_feature_report,
+                args=(self._get_cmd_dev()["path"], report_id, length),
+                daemon=True,
+            ).start()
 
-    def _feature_report_length(self, report_id: int) -> int:
+    def _report_length(self, report_id: int, report_type: str) -> int:
         path_str   = self._get_dev_path_str(self._get_cmd_dev()) if self._get_cmd_dev() else ""
         fields     = self._descriptors.get(path_str, [])
         total_bits = sum(
             f.bit_size for f in fields
-            if f.report_type == REPORT_TYPE_FEATURE and f.report_id == report_id
+            if f.report_type == report_type and f.report_id == report_id
         )
         payload_len = (total_bits + 7) // 8 if total_bits > 0 else 64
-        # hid.get_feature_report() expects the total report length including the report ID byte.
         return payload_len + 1
 
-    def _do_get_report(self, path, report_id: int, length: int):
+    def _do_get_feature_report(self, path, report_id: int, length: int):
         self._send_log_append(f"\nGet Feature Report  ID=0x{report_id:02X}  Total Length={length}")
         try:
             data = get_feature_report(path, report_id, length)
+            if not data:
+                self._send_log_append("  [錯誤] 回傳空資料")
+            else:
+                self._send_log_append(f"  [成功] {len(data)} bytes:")
+                for off in range(0, len(data), 16):
+                    chunk = data[off:off + 16]
+                    self._send_log_append(
+                        f"    {off:04X}:  {' '.join(f'{b:02X}' for b in chunk)}"
+                    )
+        except Exception as e:
+            self._send_log_append(f"  [錯誤] {e}")
+
+    def _do_get_input_report(self, path, report_id: int, length: int):
+        self._send_log_append(f"\nGet Input Report  ID=0x{report_id:02X}  Total Length={length}")
+        try:
+            data = get_input_report(path, report_id, length)
             if not data:
                 self._send_log_append("  [錯誤] 回傳空資料")
             else:
@@ -1837,6 +1877,8 @@ class HIDToolApp(tk.Tk):
                         command=self._stress_update_cmd_ui).grid(row=0, column=1, sticky="w")
         ttk.Radiobutton(cmd_frame, text="Feature", variable=self._stress_report_type, value="Feature",
                         command=self._stress_update_cmd_ui).grid(row=0, column=2, sticky="w")
+        ttk.Radiobutton(cmd_frame, text="Input",   variable=self._stress_report_type, value="Input",
+                        command=self._stress_update_cmd_ui).grid(row=0, column=3, sticky="w")
 
         self._stress_feature_dir = tk.StringVar(value="Set")
         self._stress_dir_lbl = ttk.Label(cmd_frame, text="方向:")
@@ -1864,6 +1906,10 @@ class HIDToolApp(tk.Tk):
         self._stress_get_len_entry = ttk.Entry(cmd_frame, textvariable=self._stress_get_len_var, width=10)
         self._stress_get_len_entry.grid(row=3, column=1, columnspan=2, sticky="w")
 
+        self._stress_post_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(cmd_frame, text="壓測結束後執行一次", variable=self._stress_post_var).grid(
+            row=4, column=0, columnspan=4, sticky="w", padx=4, pady=(6, 0))
+
         settings_frame = ttk.LabelFrame(parent, text="壓測設定", padding=8)
         settings_frame.pack(fill=tk.X, **pad)
 
@@ -1878,6 +1924,38 @@ class HIDToolApp(tk.Tk):
         ttk.Label(settings_frame, text="最大時間 (s, 0=無限):").grid(row=0, column=4, sticky="w", padx=4)
         self._stress_max_time_var = tk.StringVar(value="0")
         ttk.Spinbox(settings_frame, from_=0, to=99999, textvariable=self._stress_max_time_var, width=7).grid(row=0, column=5, sticky="w")
+
+        poll_frame = ttk.LabelFrame(parent, text="定時讀取指令", padding=8)
+        poll_frame.pack(fill=tk.X, **pad)
+
+        # Row 0: 間隔 / Report 類型 / Report ID
+        ttk.Label(poll_frame, text="間隔 (ms, 0=停用):").grid(row=0, column=0, sticky="w", padx=4)
+        self._stress_interval_var = tk.StringVar(value="0")
+        ttk.Spinbox(poll_frame, from_=0, to=99999, textvariable=self._stress_interval_var, width=7).grid(row=0, column=1, sticky="w", padx=(2, 20))
+
+        ttk.Label(poll_frame, text="Report 類型:").grid(row=0, column=2, sticky="w", padx=4)
+        self._poll_report_type = tk.StringVar(value="Input")
+        ttk.Radiobutton(poll_frame, text="Output",  variable=self._poll_report_type, value="Output").grid(row=0, column=3, sticky="w")
+        ttk.Radiobutton(poll_frame, text="Feature", variable=self._poll_report_type, value="Feature").grid(row=0, column=4, sticky="w")
+        ttk.Radiobutton(poll_frame, text="Input",   variable=self._poll_report_type, value="Input").grid(row=0, column=5, sticky="w")
+
+        ttk.Label(poll_frame, text="Report ID (hex):").grid(row=0, column=6, sticky="w", padx=(16, 4))
+        self._poll_report_id_var = tk.StringVar(value="06")
+        ttk.Entry(poll_frame, textvariable=self._poll_report_id_var, width=8).grid(row=0, column=7, sticky="w")
+
+        # Row 1: SET Data
+        ttk.Label(poll_frame, text="SET Data (hex):").grid(row=1, column=0, sticky="w", padx=4, pady=(6, 0))
+        self._poll_data_var = tk.StringVar()
+        ttk.Entry(poll_frame, textvariable=self._poll_data_var, width=55).grid(row=1, column=1, columnspan=7, sticky="w", pady=(6, 0))
+
+        # Row 2: GET Length / GET 次數
+        ttk.Label(poll_frame, text="GET Length (bytes):").grid(row=2, column=0, sticky="w", padx=4, pady=(4, 0))
+        self._poll_len_var = tk.StringVar(value="64")
+        ttk.Entry(poll_frame, textvariable=self._poll_len_var, width=8).grid(row=2, column=1, sticky="w", pady=(4, 0))
+
+        ttk.Label(poll_frame, text="GET 次數:").grid(row=2, column=2, sticky="w", padx=(16, 4), pady=(4, 0))
+        self._poll_count_var = tk.StringVar(value="1")
+        ttk.Spinbox(poll_frame, from_=1, to=100, textvariable=self._poll_count_var, width=5).grid(row=2, column=3, sticky="w", pady=(4, 0))
 
         ctrl_row = tk.Frame(parent)
         ctrl_row.pack(fill=tk.X, padx=8, pady=4)
@@ -2175,9 +2253,10 @@ class HIDToolApp(tk.Tk):
     # ------------------------------------------------------------------
 
     def _stress_update_cmd_ui(self):
-        is_feature = self._stress_report_type.get() == "Feature"
-        is_get = is_feature and self._stress_feature_dir.get() == "Get"
-        dir_state = "normal" if is_feature else "disabled"
+        rtype = self._stress_report_type.get()
+        has_dir = rtype in ("Feature", "Input")
+        is_get  = has_dir and self._stress_feature_dir.get() == "Get"
+        dir_state = "normal" if has_dir else "disabled"
         self._stress_dir_lbl.config(state=dir_state)
         self._stress_dir_set_rb.config(state=dir_state)
         self._stress_dir_get_rb.config(state=dir_state)
@@ -2219,6 +2298,12 @@ class HIDToolApp(tk.Tk):
         self._stress_log_append("=== 壓測開始 ===")
         self._stress_update_stats()
         self._stress_update_timer()
+        try:
+            interval = int(self._stress_interval_var.get())
+        except ValueError:
+            interval = 0
+        if interval > 0:
+            self._stress_poll_id = self.after(interval, self._stress_poll_tick)
 
     def _stress_stop(self):
         if not self._stress_running:
@@ -2227,6 +2312,9 @@ class HIDToolApp(tk.Tk):
         if self._stress_delay_id:
             self.after_cancel(self._stress_delay_id)
             self._stress_delay_id = None
+        if self._stress_poll_id:
+            self.after_cancel(self._stress_poll_id)
+            self._stress_poll_id = None
         self._stress_pending           = False
         self._stress_tip_active        = False
         self._stress_touch_had_no_conf = False
@@ -2239,6 +2327,9 @@ class HIDToolApp(tk.Tk):
         self._stress_start_btn.config(text="開始壓測", bg="#4CAF50")
         self._stress_status_var.set("已停止")
         self._stress_update_stats()
+        if self._stress_post_var.get():
+            self._stress_log_append("→ 執行壓測結束後指令...")
+            self._stress_send_command()
 
     def _stress_on_lift_detected(self):
         self._stress_count += 1
@@ -2284,6 +2375,66 @@ class HIDToolApp(tk.Tk):
             delay_ms = 200
         self._stress_delay_id = self.after(delay_ms, self._stress_send_command)
 
+    def _stress_poll_tick(self):
+        if not self._stress_running:
+            return
+        self._stress_do_poll()
+        try:
+            interval = int(self._stress_interval_var.get())
+        except ValueError:
+            interval = 0
+        if interval > 0:
+            self._stress_poll_id = self.after(interval, self._stress_poll_tick)
+
+    def _stress_do_poll(self):
+        cmd_dev = self._get_cmd_dev()
+        if not cmd_dev:
+            return
+        path = cmd_dev["path"]
+        rtype = self._poll_report_type.get()
+        rid_str = self._poll_report_id_var.get().strip()
+        try:
+            report_id = int(rid_str, 16)
+        except ValueError:
+            self._stress_log_append("  [定時] Report ID 格式錯誤")
+            return
+        try:
+            get_count = max(1, int(self._poll_count_var.get()))
+        except ValueError:
+            get_count = 1
+        try:
+            length = max(1, int(self._poll_len_var.get()))
+        except ValueError:
+            length = 64
+        raw = parse_hex_bytes(self._poll_data_var.get().strip())
+
+        def worker():
+            try:
+                # SET
+                if rtype == "Feature":
+                    send_feature_report(path, report_id, raw)
+                elif rtype == "Input":
+                    required = self._report_length(report_id, REPORT_TYPE_OUTPUT) - 1
+                    padded   = (raw + [0] * required)[:required]
+                    set_output_report_cmd(path, report_id, padded)
+                else:
+                    send_output_report(path, report_id, raw)
+                self._stress_log_append(f"  [定時] Set {rtype} ID=0x{report_id:02X} OK")
+
+                # GET × N
+                for i in range(get_count):
+                    if rtype == "Input":
+                        data = get_input_report(path, report_id, length)
+                    else:
+                        data = get_feature_report(path, report_id, length)
+                    hex_str = ' '.join(f'{b:02X}' for b in data) if data else "(空)"
+                    idx = f"[{i+1}/{get_count}]" if get_count > 1 else ""
+                    self._stress_log_append(f"  [定時] Get {rtype} ID=0x{report_id:02X}{idx}: {hex_str}")
+            except Exception as exc:
+                self._stress_log_append(f"  [定時] 錯誤: {exc}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _stress_send_command(self):
         self._stress_pending  = False
         self._stress_delay_id = None
@@ -2300,9 +2451,9 @@ class HIDToolApp(tk.Tk):
             self._stress_log_append("[錯誤] Report ID 格式錯誤")
             return
 
-        use_feature = self._stress_report_type.get() == "Feature"
-        use_get = use_feature and self._stress_feature_dir.get() == "Get"
-        path = cmd_dev["path"]
+        rtype   = self._stress_report_type.get()
+        use_get = rtype in ("Feature", "Input") and self._stress_feature_dir.get() == "Get"
+        path    = cmd_dev["path"]
 
         if use_get:
             try:
@@ -2315,13 +2466,18 @@ class HIDToolApp(tk.Tk):
 
             def worker():
                 try:
-                    recv = get_feature_report(path, report_id, length)
+                    if rtype == "Input":
+                        recv = get_input_report(path, report_id, length)
+                        tag  = "Input"
+                    else:
+                        recv = get_feature_report(path, report_id, length)
+                        tag  = "Feature"
                     if not recv:
-                        self._stress_log_append(f"  → Get Feature ID=0x{report_id:02X} 回傳空資料")
+                        self._stress_log_append(f"  → Get {tag} ID=0x{report_id:02X} 回傳空資料")
                     else:
                         hex_str = ' '.join(f'{b:02X}' for b in recv)
                         self._stress_log_append(
-                            f"  → Get Feature ID=0x{report_id:02X} ({len(recv)} bytes): {hex_str}"
+                            f"  → Get {tag} ID=0x{report_id:02X} ({len(recv)} bytes): {hex_str}"
                         )
                 except Exception as exc:
                     self._stress_log_append(f"  → [錯誤] {exc}")
@@ -2332,18 +2488,25 @@ class HIDToolApp(tk.Tk):
                 self._stress_log_append("[錯誤] Data 格式錯誤")
                 return
 
-            rtype = "Feature" if use_feature else "Output"
-
             def worker():
                 try:
-                    sent = send_feature_report(path, report_id, data) if use_feature \
-                           else send_output_report(path, report_id, data)
-                    if sent < 0:
-                        self._stress_log_append(f"  → 發送 {rtype} 失敗 (回傳 {sent})")
+                    if rtype == "Feature":
+                        sent = send_feature_report(path, report_id, data)
+                        if sent < 0:
+                            self._stress_log_append(f"  → 發送 Feature 失敗 (回傳 {sent})")
+                        else:
+                            self._stress_log_append(f"  → 發送 Feature ID=0x{report_id:02X} OK ({sent} bytes)")
+                    elif rtype == "Input":
+                        required = self._report_length(report_id, REPORT_TYPE_OUTPUT) - 1
+                        padded   = (data + [0] * required)[:required]
+                        set_output_report_cmd(path, report_id, padded)
+                        self._stress_log_append(f"  → SET_REPORT(Output) ID=0x{report_id:02X} OK")
                     else:
-                        self._stress_log_append(
-                            f"  → 發送 {rtype} ID=0x{report_id:02X} OK ({sent} bytes)"
-                        )
+                        sent = send_output_report(path, report_id, data)
+                        if sent < 0:
+                            self._stress_log_append(f"  → 發送 Output 失敗 (回傳 {sent})")
+                        else:
+                            self._stress_log_append(f"  → 發送 Output ID=0x{report_id:02X} OK ({sent} bytes)")
                 except Exception as exc:
                     self._stress_log_append(f"  → [錯誤] {exc}")
 

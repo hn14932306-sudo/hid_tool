@@ -4,12 +4,68 @@ and HID report send/receive helpers.
 """
 
 import re
+import sys
+import ctypes
+import ctypes.wintypes as wintypes
 from typing import Dict, List, Optional, Tuple
 
 try:
     import hid
 except ImportError:
     hid = None
+
+# ---------------------------------------------------------------------------
+# Windows-only ctypes setup for HidD_GetInputReport
+# ---------------------------------------------------------------------------
+
+if sys.platform == "win32":
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _hid_dll  = ctypes.WinDLL("hid",      use_last_error=True)
+
+    _kernel32.CreateFileW.restype  = wintypes.HANDLE
+    _kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+        ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    _kernel32.CloseHandle.restype  = wintypes.BOOL
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    _hid_dll.HidD_GetInputReport.restype  = wintypes.BOOL
+    _hid_dll.HidD_GetInputReport.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.ULONG]
+
+    _hid_dll.HidD_SetOutputReport.restype  = wintypes.BOOL
+    _hid_dll.HidD_SetOutputReport.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.ULONG]
+
+    _kernel32.DeviceIoControl.restype  = wintypes.BOOL
+    _kernel32.DeviceIoControl.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD,
+        ctypes.c_void_p, wintypes.DWORD,
+        ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p,
+    ]
+
+    _GENERIC_READ       = 0x80000000
+    _GENERIC_WRITE      = 0x40000000
+    _FILE_SHARE_READ    = 0x00000001
+    _FILE_SHARE_WRITE   = 0x00000002
+    _OPEN_EXISTING      = 3
+    _INVALID_HANDLE_VAL = ctypes.c_void_p(-1).value
+    # CTL_CODE(FILE_DEVICE_KEYBOARD=0xB, func=105, METHOD_IN_DIRECT=1, FILE_ANY_ACCESS=0)
+    _IOCTL_HID_SET_OUTPUT_REPORT = 0x000B01A5
+
+
+def _open_win_handle(path):
+    path_str = path.decode("utf-8", errors="replace") if isinstance(path, bytes) else path
+    h = _kernel32.CreateFileW(
+        path_str,
+        _GENERIC_READ | _GENERIC_WRITE,
+        _FILE_SHARE_READ | _FILE_SHARE_WRITE,
+        None, _OPEN_EXISTING, 0, None,
+    )
+    if h is None or h == _INVALID_HANDLE_VAL:
+        err = ctypes.get_last_error()
+        raise RuntimeError(f"CreateFileW: ({err:#010x}) {ctypes.FormatError(err)}")
+    return h
 
 # ---------------------------------------------------------------------------
 # Device enumeration
@@ -143,6 +199,40 @@ def get_feature_report(path, report_id: int, length: int) -> bytes:
         return bytes(result) if result else b""
     finally:
         dev.close()
+
+
+def set_output_report_cmd(path, report_id: int, data: List[int]) -> None:
+    """Send a SET_REPORT(Output) via HidD_SetOutputReport (generates 05 00 26 03 ... on I2C bus)."""
+    if sys.platform != "win32":
+        raise RuntimeError("set_output_report_cmd 僅支援 Windows")
+    h = _open_win_handle(path)
+    try:
+        buf_data = bytes([report_id] + data)
+        buf = (ctypes.c_ubyte * len(buf_data))(*buf_data)
+        ok = _hid_dll.HidD_SetOutputReport(h, buf, len(buf))
+        if not ok:
+            err = ctypes.get_last_error()
+            raise RuntimeError(f"HidD_SetOutputReport: ({err:#010x}) {ctypes.FormatError(err)}")
+    finally:
+        _kernel32.CloseHandle(h)
+
+
+def get_input_report(path, report_id: int, length: int) -> bytes:
+    """Read an Input report via HidD_GetInputReport (Windows only).
+    Returns raw bytes including the report-ID byte."""
+    if sys.platform != "win32":
+        raise RuntimeError("HidD_GetInputReport 僅支援 Windows")
+    h = _open_win_handle(path)
+    try:
+        buf = (ctypes.c_ubyte * length)()
+        buf[0] = report_id
+        ok = _hid_dll.HidD_GetInputReport(h, buf, length)
+        if not ok:
+            err = ctypes.get_last_error()
+            raise RuntimeError(f"HidD_GetInputReport: ({err:#010x}) {ctypes.FormatError(err)}")
+        return bytes(buf)
+    finally:
+        _kernel32.CloseHandle(h)
 
 
 # ---------------------------------------------------------------------------
