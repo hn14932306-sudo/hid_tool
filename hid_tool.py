@@ -1756,13 +1756,20 @@ class HIDToolApp(tk.Tk):
         except Exception as e:
             self._send_log_append(f"  [錯誤] {e}")
 
+    def _log_bytes(self, data, append_fn):
+        """顯示 bytes：第一行 64 bytes（對齊 I2C block 去掉 2-byte Length field），後續每行 66 bytes。"""
+        if not data:
+            return
+        first = data[:64]
+        append_fn(f"    0000:  {' '.join(f'{b:02X}' for b in first)}")
+        for off in range(64, len(data), 66):
+            chunk = data[off:off + 66]
+            append_fn(f"    {off:04X}:  {' '.join(f'{b:02X}' for b in chunk)}")
+
     def _log_payload(self, report_id: int, payload: list):
         full = [report_id] + list(payload)
-        total = len(full)
-        self._send_log_append(f"  實際送出 ({total} bytes):")
-        for off in range(0, total, 66):
-            chunk = full[off:off + 66]
-            self._send_log_append(f"    {off:04X}: {' '.join(f'{b:02X}' for b in chunk)}")
+        self._send_log_append(f"  實際送出 ({len(full)} bytes):")
+        self._log_bytes(full, self._send_log_append)
 
     def _on_get_report(self):
         if not self._get_cmd_dev():
@@ -1812,11 +1819,7 @@ class HIDToolApp(tk.Tk):
                 self._send_log_append("  [錯誤] 回傳空資料")
             else:
                 self._send_log_append(f"  [成功] {len(data)} bytes:")
-                for off in range(0, len(data), 66):
-                    chunk = data[off:off + 66]
-                    self._send_log_append(
-                        f"    {off:04X}:  {' '.join(f'{b:02X}' for b in chunk)}"
-                    )
+                self._log_bytes(data, self._send_log_append)
         except Exception as e:
             self._send_log_append(f"  [錯誤] {e}")
 
@@ -1828,11 +1831,7 @@ class HIDToolApp(tk.Tk):
                 self._send_log_append("  [錯誤] 回傳空資料")
             else:
                 self._send_log_append(f"  [成功] {len(data)} bytes:")
-                for off in range(0, len(data), 66):
-                    chunk = data[off:off + 66]
-                    self._send_log_append(
-                        f"    {off:04X}:  {' '.join(f'{b:02X}' for b in chunk)}"
-                    )
+                self._log_bytes(data, self._send_log_append)
         except Exception as e:
             self._send_log_append(f"  [錯誤] {e}")
 
@@ -2441,9 +2440,12 @@ class HIDToolApp(tk.Tk):
                         data = get_input_report(path, report_id, length)
                     else:
                         data = get_feature_report(path, report_id, length)
-                    hex_str = ' '.join(f'{b:02X}' for b in data) if data else "(空)"
                     idx = f"[{i+1}/{get_count}]" if get_count > 1 else ""
-                    self._stress_log_append(f"  [定時] Get {rtype} ID=0x{report_id:02X}{idx}: {hex_str}")
+                    if not data:
+                        self._stress_log_append(f"  [定時] Get {rtype} ID=0x{report_id:02X}{idx}: (空)")
+                    else:
+                        self._stress_log_append(f"  [定時] Get {rtype} ID=0x{report_id:02X}{idx} ({len(data)} bytes):")
+                        self._log_bytes(data, self._stress_log_append)
             except Exception as exc:
                 self._stress_log_append(f"  [定時] 錯誤: {exc}")
 
@@ -2489,10 +2491,8 @@ class HIDToolApp(tk.Tk):
                     if not recv:
                         self._stress_log_append(f"  → Get {tag} ID=0x{report_id:02X} 回傳空資料")
                     else:
-                        hex_str = ' '.join(f'{b:02X}' for b in recv)
-                        self._stress_log_append(
-                            f"  → Get {tag} ID=0x{report_id:02X} ({len(recv)} bytes): {hex_str}"
-                        )
+                        self._stress_log_append(f"  → Get {tag} ID=0x{report_id:02X} ({len(recv)} bytes):")
+                        self._log_bytes(recv, self._stress_log_append)
                 except Exception as exc:
                     self._stress_log_append(f"  → [錯誤] {exc}")
         else:
