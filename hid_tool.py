@@ -1902,7 +1902,7 @@ class HIDToolApp(tk.Tk):
         self._stress_data_entry = ttk.Entry(cmd_frame, textvariable=self._stress_data_var, width=55)
         self._stress_data_entry.grid(row=2, column=1, columnspan=3, sticky="w")
 
-        self._stress_get_len_lbl = ttk.Label(cmd_frame, text="Length (bytes):")
+        self._stress_get_len_lbl = ttk.Label(cmd_frame, text="Length (payload bytes):")
         self._stress_get_len_lbl.grid(row=3, column=0, sticky="w", padx=4, pady=4)
         self._stress_get_len_var = tk.StringVar(value="64")
         self._stress_get_len_entry = ttk.Entry(cmd_frame, textvariable=self._stress_get_len_var, width=10)
@@ -1951,7 +1951,7 @@ class HIDToolApp(tk.Tk):
         ttk.Entry(poll_frame, textvariable=self._poll_data_var, width=55).grid(row=1, column=1, columnspan=7, sticky="w", pady=(6, 0))
 
         # Row 2: GET Length / GET 次數
-        ttk.Label(poll_frame, text="GET Length (bytes):").grid(row=2, column=0, sticky="w", padx=4, pady=(4, 0))
+        ttk.Label(poll_frame, text="GET Length (payload bytes):").grid(row=2, column=0, sticky="w", padx=4, pady=(4, 0))
         self._poll_len_var = tk.StringVar(value="64")
         ttk.Entry(poll_frame, textvariable=self._poll_len_var, width=8).grid(row=2, column=1, sticky="w", pady=(4, 0))
 
@@ -2405,7 +2405,7 @@ class HIDToolApp(tk.Tk):
         except ValueError:
             get_count = 1
         try:
-            length = max(1, int(self._poll_len_var.get()))
+            length = max(1, int(self._poll_len_var.get())) + 1  # +1 for report ID byte
         except ValueError:
             length = 64
         raw = parse_hex_bytes(self._poll_data_var.get().strip())
@@ -2460,8 +2460,8 @@ class HIDToolApp(tk.Tk):
 
         if use_get:
             try:
-                length = int(self._stress_get_len_var.get())
-                if length <= 0:
+                length = int(self._stress_get_len_var.get()) + 1  # +1 for report ID byte
+                if length <= 1:
                     raise ValueError
             except ValueError:
                 self._stress_log_append("[錯誤] Length 格式錯誤")
