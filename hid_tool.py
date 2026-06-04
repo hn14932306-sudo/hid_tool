@@ -1760,8 +1760,8 @@ class HIDToolApp(tk.Tk):
         full = [report_id] + list(payload)
         total = len(full)
         self._send_log_append(f"  實際送出 ({total} bytes):")
-        for off in range(0, total, 16):
-            chunk = full[off:off + 16]
+        for off in range(0, total, 66):
+            chunk = full[off:off + 66]
             self._send_log_append(f"    {off:04X}: {' '.join(f'{b:02X}' for b in chunk)}")
 
     def _on_get_report(self):
@@ -1812,8 +1812,8 @@ class HIDToolApp(tk.Tk):
                 self._send_log_append("  [錯誤] 回傳空資料")
             else:
                 self._send_log_append(f"  [成功] {len(data)} bytes:")
-                for off in range(0, len(data), 16):
-                    chunk = data[off:off + 16]
+                for off in range(0, len(data), 66):
+                    chunk = data[off:off + 66]
                     self._send_log_append(
                         f"    {off:04X}:  {' '.join(f'{b:02X}' for b in chunk)}"
                     )
@@ -1828,8 +1828,8 @@ class HIDToolApp(tk.Tk):
                 self._send_log_append("  [錯誤] 回傳空資料")
             else:
                 self._send_log_append(f"  [成功] {len(data)} bytes:")
-                for off in range(0, len(data), 16):
-                    chunk = data[off:off + 16]
+                for off in range(0, len(data), 66):
+                    chunk = data[off:off + 66]
                     self._send_log_append(
                         f"    {off:04X}:  {' '.join(f'{b:02X}' for b in chunk)}"
                     )
