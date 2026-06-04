@@ -362,6 +362,12 @@ class HIDToolApp(tk.Tk):
         log_frame = ttk.LabelFrame(parent, text="操作記錄", padding=6)
         log_frame.pack(fill=tk.BOTH, expand=True, **pad)
 
+        log_ctrl = tk.Frame(log_frame)
+        log_ctrl.pack(fill=tk.X, pady=(0, 4))
+        self._pair_bytes_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(log_ctrl, text="2-byte 合併顯示（第一行32個，其他33個）",
+                        variable=self._pair_bytes_var).pack(side=tk.LEFT)
+
         self._send_log = scrolledtext.ScrolledText(
             log_frame, height=14, state="disabled", font=("Consolas", 9))
         self._send_log.pack(fill=tk.BOTH, expand=True)
@@ -1757,14 +1763,28 @@ class HIDToolApp(tk.Tk):
             self._send_log_append(f"  [錯誤] {e}")
 
     def _log_bytes(self, data, append_fn):
-        """顯示 bytes：第一行 64 bytes（對齊 I2C block 去掉 2-byte Length field），後續每行 66 bytes。"""
+        """顯示 bytes：第一行 64 bytes，後續每行 66 bytes（對齊 I2C block）。
+        若 _pair_bytes_var 打勾，每 2 bytes 合併為一個 4-hex 值顯示。"""
         if not data:
             return
+        pair = getattr(self, '_pair_bytes_var', None) and self._pair_bytes_var.get()
+
+        def fmt(chunk):
+            if pair:
+                parts = []
+                for i in range(0, len(chunk), 2):
+                    if i + 1 < len(chunk):
+                        parts.append(f'{chunk[i]:02X}{chunk[i+1]:02X}')
+                    else:
+                        parts.append(f'{chunk[i]:02X}  ')
+                return ' '.join(parts)
+            return ' '.join(f'{b:02X}' for b in chunk)
+
         first = data[:64]
-        append_fn(f"    0000:  {' '.join(f'{b:02X}' for b in first)}")
+        append_fn(f"    0000:  {fmt(first)}")
         for off in range(64, len(data), 66):
             chunk = data[off:off + 66]
-            append_fn(f"    {off:04X}:  {' '.join(f'{b:02X}' for b in chunk)}")
+            append_fn(f"    {off:04X}:  {fmt(chunk)}")
 
     def _log_payload(self, report_id: int, payload: list):
         full = [report_id] + list(payload)
