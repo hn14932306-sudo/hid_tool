@@ -1729,11 +1729,12 @@ class HIDToolApp(tk.Tk):
     def _send_report(self, path, report_id: int, data: list, rtype: str):
         self._send_log_append(f"\n發送 {rtype} Report")
         self._send_log_append(f"  Report ID : 0x{report_id:02X}")
-        self._send_log_append(f"  Data      : {' '.join(f'{b:02X}' for b in data)}")
+        self._send_log_append(f"  Data (輸入) : {' '.join(f'{b:02X}' for b in data) or '(空)'}")
         try:
             if rtype == "Feature":
                 required = self._report_length(report_id, REPORT_TYPE_FEATURE) - 1
                 padded = (data + [0] * required)[:required]
+                self._log_payload(report_id, padded)
                 sent = send_feature_report(path, report_id, padded)
                 if sent < 0:
                     self._send_log_append(f"  [錯誤] 發送失敗 (回傳 {sent})")
@@ -1742,9 +1743,11 @@ class HIDToolApp(tk.Tk):
             elif rtype == "Input":
                 required = self._report_length(report_id, REPORT_TYPE_OUTPUT) - 1
                 padded = (data + [0] * required)[:required]
+                self._log_payload(report_id, padded)
                 set_output_report_cmd(path, report_id, padded)
                 self._send_log_append(f"  [成功] SET_REPORT(Output) command 已送出")
             else:
+                self._log_payload(report_id, data)
                 sent = send_output_report(path, report_id, data)
                 if sent < 0:
                     self._send_log_append(f"  [錯誤] 發送失敗 (回傳 {sent})")
@@ -1752,6 +1755,14 @@ class HIDToolApp(tk.Tk):
                     self._send_log_append(f"  [成功] 已發送 {sent} bytes")
         except Exception as e:
             self._send_log_append(f"  [錯誤] {e}")
+
+    def _log_payload(self, report_id: int, payload: list):
+        full = [report_id] + list(payload)
+        total = len(full)
+        self._send_log_append(f"  實際送出 ({total} bytes):")
+        for off in range(0, total, 16):
+            chunk = full[off:off + 16]
+            self._send_log_append(f"    {off:04X}: {' '.join(f'{b:02X}' for b in chunk)}")
 
     def _on_get_report(self):
         if not self._get_cmd_dev():
