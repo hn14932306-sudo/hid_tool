@@ -1732,7 +1732,9 @@ class HIDToolApp(tk.Tk):
         self._send_log_append(f"  Data      : {' '.join(f'{b:02X}' for b in data)}")
         try:
             if rtype == "Feature":
-                sent = send_feature_report(path, report_id, data)
+                required = self._report_length(report_id, REPORT_TYPE_FEATURE) - 1
+                padded = (data + [0] * required)[:required]
+                sent = send_feature_report(path, report_id, padded)
                 if sent < 0:
                     self._send_log_append(f"  [錯誤] 發送失敗 (回傳 {sent})")
                 else:
@@ -2412,7 +2414,8 @@ class HIDToolApp(tk.Tk):
             try:
                 # SET
                 if rtype == "Feature":
-                    send_feature_report(path, report_id, raw)
+                    required = self._report_length(report_id, REPORT_TYPE_FEATURE) - 1
+                    send_feature_report(path, report_id, (raw + [0] * required)[:required])
                 elif rtype == "Input":
                     required = self._report_length(report_id, REPORT_TYPE_OUTPUT) - 1
                     padded   = (raw + [0] * required)[:required]
@@ -2491,7 +2494,9 @@ class HIDToolApp(tk.Tk):
             def worker():
                 try:
                     if rtype == "Feature":
-                        sent = send_feature_report(path, report_id, data)
+                        required = self._report_length(report_id, REPORT_TYPE_FEATURE) - 1
+                        padded   = (data + [0] * required)[:required]
+                        sent = send_feature_report(path, report_id, padded)
                         if sent < 0:
                             self._stress_log_append(f"  → 發送 Feature 失敗 (回傳 {sent})")
                         else:
