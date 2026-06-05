@@ -268,15 +268,16 @@ def get_input_report(path, report_id: int, length: int) -> bytes:
     h = _open_win_handle(path)
     try:
         # HidD_GetInputReport 需要 buffer >= collection 最大 Input report 大小
-        min_len = _get_input_report_byte_length(h)
-        buf_len = max(length, min_len) if min_len > 0 else length
+        # 先從 HidP_GetCaps 取得正確大小，取不到就用 4096 保底
+        caps_len = _get_input_report_byte_length(h)
+        buf_len  = max(length, caps_len if caps_len > 0 else 4096)
         buf = (ctypes.c_ubyte * buf_len)()
         buf[0] = report_id
         ok = _hid_dll.HidD_GetInputReport(h, buf, buf_len)
         if not ok:
             err = ctypes.get_last_error()
             raise RuntimeError(f"HidD_GetInputReport: ({err:#010x}) {ctypes.FormatError(err)}")
-        return bytes(buf[:length])  # 只回傳呼叫端要求的長度
+        return bytes(buf[:length])
     finally:
         _kernel32.CloseHandle(h)
 
