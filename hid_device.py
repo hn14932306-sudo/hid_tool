@@ -230,6 +230,17 @@ def get_feature_report(path, report_id: int, length: int) -> bytes:
         dev.close()
 
 
+def read_interrupt(path, length: int, timeout_ms: int = 1000) -> bytes:
+    """從 interrupt endpoint 讀取 Input Report（含 Report ID byte）。"""
+    dev = hid.device()
+    dev.open_path(path if isinstance(path, bytes) else path.encode())
+    try:
+        result = dev.read(length + 1, timeout_ms)
+        return bytes(result) if result else b""
+    finally:
+        dev.close()
+
+
 def set_output_report_cmd(path, report_id: int, data: List[int]) -> None:
     """Send a SET_REPORT(Output) via HidD_SetOutputReport (generates 05 00 26 03 ... on I2C bus)."""
     if sys.platform != "win32":

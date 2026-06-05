@@ -35,6 +35,7 @@ from hid_device import (
     get_feature_report,
     get_input_report,
     set_output_report_cmd,
+    read_interrupt,
     parse_hex_bytes,
 )
 
@@ -358,6 +359,17 @@ class HIDToolApp(tk.Tk):
         ttk.Button(btn_row, text="發送 (Set Report)", command=self._on_send).pack(side=tk.LEFT, padx=4)
         self._get_btn = ttk.Button(btn_row, text="Get Report", command=self._on_get_report)
         # 初始隱藏，切到 Feature 才顯示
+
+        int_row = tk.Frame(parent)
+        int_row.pack(fill=tk.X, padx=8, pady=(0, 4))
+        self._wait_int_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(int_row, text="等待 INT 回應", variable=self._wait_int_var).pack(side=tk.LEFT)
+        ttk.Label(int_row, text="Timeout (ms):").pack(side=tk.LEFT, padx=(12, 2))
+        self._int_timeout_var = tk.StringVar(value="1000")
+        ttk.Spinbox(int_row, from_=50, to=10000, textvariable=self._int_timeout_var, width=6).pack(side=tk.LEFT)
+        ttk.Label(int_row, text="Length (payload bytes):").pack(side=tk.LEFT, padx=(12, 2))
+        self._int_length_var = tk.StringVar(value="63")
+        ttk.Entry(int_row, textvariable=self._int_length_var, width=6).pack(side=tk.LEFT)
 
         log_frame = ttk.LabelFrame(parent, text="操作記錄", padding=6)
         log_frame.pack(fill=tk.BOTH, expand=True, **pad)
@@ -1761,6 +1773,28 @@ class HIDToolApp(tk.Tk):
                     self._send_log_append(f"  [成功] 已發送 {sent} bytes")
         except Exception as e:
             self._send_log_append(f"  [錯誤] {e}")
+            return
+
+        if self._wait_int_var.get():
+            self._wait_int(path)
+
+    def _wait_int(self, path):
+        try:
+            timeout_ms = int(self._int_timeout_var.get())
+            length     = int(self._int_length_var.get())
+        except ValueError:
+            self._send_log_append("  [錯誤] Timeout 或 Length 格式錯誤")
+            return
+        self._send_log_append(f"  等待 INT 回應（timeout={timeout_ms}ms, length={length}B）...")
+        try:
+            resp = read_interrupt(path, length, timeout_ms)
+            if not resp:
+                self._send_log_append("  [INT] 逾時，無回應")
+            else:
+                self._send_log_append(f"  [INT] 收到 {len(resp)} bytes:")
+                self._log_bytes(resp, self._send_log_append)
+        except Exception as e:
+            self._send_log_append(f"  [INT 錯誤] {e}")
 
     def _log_bytes(self, data, append_fn):
         """顯示 bytes：第一行 64 bytes，後續每行 66 bytes（對齊 I2C block）。
