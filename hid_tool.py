@@ -1764,27 +1764,38 @@ class HIDToolApp(tk.Tk):
 
     def _log_bytes(self, data, append_fn):
         """顯示 bytes：第一行 64 bytes，後續每行 66 bytes（對齊 I2C block）。
-        若 _pair_bytes_var 打勾，每 2 bytes 合併為一個 4-hex 值顯示。"""
+        若 _pair_bytes_var 打勾，每 2 bytes 合併顯示；第一行 byte0 留空，
+        配對從 byte1 開始，第一行 32 個單位、後續 33 個單位。"""
         if not data:
             return
         pair = getattr(self, '_pair_bytes_var', None) and self._pair_bytes_var.get()
 
-        def fmt(chunk):
-            if pair:
-                parts = []
-                for i in range(0, len(chunk), 2):
-                    if i + 1 < len(chunk):
-                        parts.append(f'{chunk[i]:02X}{chunk[i+1]:02X}')
-                    else:
-                        parts.append(f'{chunk[i]:02X}  ')
-                return ' '.join(parts)
-            return ' '.join(f'{b:02X}' for b in chunk)
+        def fmt_pairs(chunk):
+            parts = []
+            for i in range(0, len(chunk), 2):
+                if i + 1 < len(chunk):
+                    parts.append(f'{chunk[i]:02X}{chunk[i+1]:02X}')
+                else:
+                    parts.append(f'{chunk[i]:02X}  ')
+            return ' '.join(parts)
 
-        first = data[:64]
-        append_fn(f"    0000:  {fmt(first)}")
-        for off in range(64, len(data), 66):
-            chunk = data[off:off + 66]
-            append_fn(f"    {off:04X}:  {fmt(chunk)}")
+        if pair:
+            # 第一行：byte0 留空 + bytes 1-62 配對 = 1 + 31 = 32 個單位
+            first_units = ['----'] + [
+                f'{data[i]:02X}{data[i+1]:02X}' if i + 1 < 63 else f'{data[i]:02X}  '
+                for i in range(1, 63, 2)
+            ]
+            append_fn(f"    0000:  {' '.join(first_units)}")
+            # 後續：從 byte63 開始，每 66 bytes（33 對）一行
+            for off in range(63, len(data), 66):
+                chunk = data[off:off + 66]
+                append_fn(f"    {off:04X}:  {fmt_pairs(chunk)}")
+        else:
+            first = data[:64]
+            append_fn(f"    0000:  {' '.join(f'{b:02X}' for b in first)}")
+            for off in range(64, len(data), 66):
+                chunk = data[off:off + 66]
+                append_fn(f"    {off:04X}:  {' '.join(f'{b:02X}' for b in chunk)}")
 
     def _log_payload(self, report_id: int, payload: list):
         full = [report_id] + list(payload)
