@@ -1780,13 +1780,10 @@ class HIDToolApp(tk.Tk):
             return ' '.join(parts)
 
         if pair:
-            # 補回 Windows strip 掉的 2-byte I2C-HID Length field
+            # 補回 Windows strip 掉的 2-byte I2C-HID Length field，每行 33 對（66 bytes）
             length_val = len(data) + 2
             extended = bytes([length_val & 0xFF, (length_val >> 8) & 0xFF]) + bytes(data)
-            # 第一行：32 對（64 bytes）
-            append_fn(f"    0000:  {fmt_pairs(extended[:64])}")
-            # 後續：33 對（66 bytes）一行
-            for off in range(64, len(extended), 66):
+            for off in range(0, len(extended), 66):
                 chunk = extended[off:off + 66]
                 append_fn(f"    {off:04X}:  {fmt_pairs(chunk)}")
         else:
