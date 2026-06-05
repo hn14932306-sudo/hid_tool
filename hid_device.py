@@ -33,6 +33,35 @@ if sys.platform == "win32":
     _hid_dll.HidD_GetInputReport.restype  = wintypes.BOOL
     _hid_dll.HidD_GetInputReport.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.ULONG]
 
+    _hid_dll.HidD_GetPreparsedData.restype  = wintypes.BOOL
+    _hid_dll.HidD_GetPreparsedData.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_void_p)]
+    _hid_dll.HidD_FreePreparsedData.restype  = wintypes.BOOL
+    _hid_dll.HidD_FreePreparsedData.argtypes = [ctypes.c_void_p]
+    _hid_dll.HidP_GetCaps.restype  = wintypes.LONG
+    _hid_dll.HidP_GetCaps.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+
+    _HIDP_STATUS_SUCCESS = 0x00110000
+
+    class _HIDP_CAPS(ctypes.Structure):
+        _fields_ = [
+            ("Usage",                      wintypes.USHORT),
+            ("UsagePage",                  wintypes.USHORT),
+            ("InputReportByteLength",      wintypes.USHORT),
+            ("OutputReportByteLength",     wintypes.USHORT),
+            ("FeatureReportByteLength",    wintypes.USHORT),
+            ("Reserved",                   wintypes.USHORT * 17),
+            ("NumberLinkCollectionNodes",  wintypes.USHORT),
+            ("NumberInputButtonCaps",      wintypes.USHORT),
+            ("NumberInputValueCaps",       wintypes.USHORT),
+            ("NumberInputDataIndices",     wintypes.USHORT),
+            ("NumberOutputButtonCaps",     wintypes.USHORT),
+            ("NumberOutputValueCaps",      wintypes.USHORT),
+            ("NumberOutputDataIndices",    wintypes.USHORT),
+            ("NumberFeatureButtonCaps",    wintypes.USHORT),
+            ("NumberFeatureValueCaps",     wintypes.USHORT),
+            ("NumberFeatureDataIndices",   wintypes.USHORT),
+        ]
+
     _hid_dll.HidD_SetOutputReport.restype  = wintypes.BOOL
     _hid_dll.HidD_SetOutputReport.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.ULONG]
 
@@ -217,6 +246,20 @@ def set_output_report_cmd(path, report_id: int, data: List[int]) -> None:
         _kernel32.CloseHandle(h)
 
 
+def _get_input_report_byte_length(h) -> int:
+    """取得此 HID collection 的 InputReportByteLength（HidP_GetCaps）。"""
+    preparsed = ctypes.c_void_p()
+    if not _hid_dll.HidD_GetPreparsedData(h, ctypes.byref(preparsed)):
+        return 0
+    try:
+        caps = _HIDP_CAPS()
+        if _hid_dll.HidP_GetCaps(preparsed, ctypes.byref(caps)) == _HIDP_STATUS_SUCCESS:
+            return caps.InputReportByteLength
+        return 0
+    finally:
+        _hid_dll.HidD_FreePreparsedData(preparsed)
+
+
 def get_input_report(path, report_id: int, length: int) -> bytes:
     """Read an Input report via HidD_GetInputReport (Windows only).
     Returns raw bytes including the report-ID byte."""
@@ -224,13 +267,16 @@ def get_input_report(path, report_id: int, length: int) -> bytes:
         raise RuntimeError("HidD_GetInputReport 僅支援 Windows")
     h = _open_win_handle(path)
     try:
-        buf = (ctypes.c_ubyte * length)()
+        # HidD_GetInputReport 需要 buffer >= collection 最大 Input report 大小
+        min_len = _get_input_report_byte_length(h)
+        buf_len = max(length, min_len) if min_len > 0 else length
+        buf = (ctypes.c_ubyte * buf_len)()
         buf[0] = report_id
-        ok = _hid_dll.HidD_GetInputReport(h, buf, length)
+        ok = _hid_dll.HidD_GetInputReport(h, buf, buf_len)
         if not ok:
             err = ctypes.get_last_error()
             raise RuntimeError(f"HidD_GetInputReport: ({err:#010x}) {ctypes.FormatError(err)}")
-        return bytes(buf)
+        return bytes(buf[:length])  # 只回傳呼叫端要求的長度
     finally:
         _kernel32.CloseHandle(h)
 
