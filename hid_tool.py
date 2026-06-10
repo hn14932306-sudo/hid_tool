@@ -46,18 +46,18 @@ from hid_device import (
 
 class HIDToolApp(tk.Tk):
     # ---- UI palette & fonts ----
-    _BG          = "#f3f5f8"   # window background
+    _BG          = "#f4f4f5"   # window background (neutral gray)
     _SURFACE     = "#ffffff"   # cards / tables / logs
-    _BORDER      = "#cdd5df"
-    _TEXT        = "#1f2937"
-    _TEXT_MUTED  = "#6b7280"
+    _BORDER      = "#d4d4d8"
+    _TEXT        = "#27272a"
+    _TEXT_MUTED  = "#71717a"
     _ACCENT      = "#2563eb"
     _ACCENT_DARK = "#1d4ed8"
     _GREEN       = "#2f9e44"
     _GREEN_DARK  = "#268a3b"
     _RED         = "#e03131"
     _RED_DARK    = "#c92a2a"
-    _STRIPE      = "#eef2f7"   # zebra row background
+    _STRIPE      = "#f6f6f7"   # zebra row background (subtle)
 
     _FONT_UI      = ("Microsoft JhengHei UI", 9)
     _FONT_UI_BOLD = ("Microsoft JhengHei UI", 9, "bold")
@@ -116,6 +116,7 @@ class HIDToolApp(tk.Tk):
 
         # Error-detection state
         self._scan_time_delta:  int                      = 0   # delta of last scan time change
+        self._scan_delta_suppress: bool                  = False  # 觸控中斷後下一個 frame 的 Δ 不列入錯誤
         self._error_count:      int                      = 0
 
         # Command device (separate from monitor device)
@@ -170,11 +171,11 @@ class HIDToolApp(tk.Tk):
         style.configure("TLabelframe", background=self._BG,
                         bordercolor=self._BORDER, relief="solid", borderwidth=1)
         style.configure("TLabelframe.Label", background=self._BG,
-                        foreground="#334155", font=self._FONT_UI_BOLD)
+                        foreground=self._TEXT_MUTED, font=self._FONT_UI_BOLD)
 
         style.configure("TButton", padding=(10, 3))
         style.map("TButton",
-                  background=[("pressed", "#d6dde7"), ("active", "#e4e9f0")])
+                  background=[("pressed", "#dcdce0"), ("active", "#e8e8ea")])
         for name, color, hover in (
             ("Accent", self._ACCENT, self._ACCENT_DARK),
             ("Start",  self._GREEN,  self._GREEN_DARK),
@@ -185,25 +186,24 @@ class HIDToolApp(tk.Tk):
             style.map(f"{name}.TButton",
                       background=[("pressed", hover), ("active", hover)],
                       foreground=[("disabled", "#e5e7eb")])
-        style.configure("Toggle.TButton", anchor="w", background="#e2e8f0", padding=(8, 3))
-        style.map("Toggle.TButton", background=[("pressed", "#c9d4e0"), ("active", "#d3dce6")])
+        style.configure("Toggle.TButton", anchor="w", background="#e7e7e9", padding=(8, 3))
+        style.map("Toggle.TButton", background=[("pressed", "#d4d4d8"), ("active", "#dedee1")])
 
         style.configure("TNotebook", background=self._BG, borderwidth=0,
                         tabmargins=(8, 4, 8, 0))
-        style.configure("TNotebook.Tab", padding=(18, 6), background="#dde3ea")
+        style.configure("TNotebook.Tab", padding=(18, 6), background="#e4e4e7")
         style.map("TNotebook.Tab",
-                  background=[("selected", self._SURFACE)],
-                  foreground=[("selected", self._ACCENT)])
+                  background=[("selected", self._SURFACE)])
 
         style.configure("Treeview", background=self._SURFACE,
                         fieldbackground=self._SURFACE, foreground=self._TEXT,
                         rowheight=24, borderwidth=1)
         style.configure("Mono.Treeview", font=self._FONT_MONO)
-        style.configure("Treeview.Heading", background="#e7ecf3", foreground="#334155",
+        style.configure("Treeview.Heading", background="#ececee", foreground=self._TEXT,
                         font=self._FONT_UI_BOLD, relief="flat", padding=(4, 4))
-        style.map("Treeview.Heading", background=[("active", "#dbe3ec")])
+        style.map("Treeview.Heading", background=[("active", "#e0e0e3")])
         style.map("Treeview",
-                  background=[("selected", "#cfe1ff")],
+                  background=[("selected", "#d9e2ef")],
                   foreground=[("selected", self._TEXT)])
 
         style.configure("TCheckbutton", background=self._BG)
@@ -219,7 +219,7 @@ class HIDToolApp(tk.Tk):
                         relief="solid", borderwidth=1)
         style.configure("Status.TLabel", background=self._SURFACE)
         style.configure("StatusRate.TLabel", background=self._SURFACE,
-                        foreground=self._ACCENT, font=("Consolas", 9, "bold"))
+                        foreground="#52525b", font=("Consolas", 9, "bold"))
         style.configure("StatusError.TLabel", background=self._SURFACE,
                         foreground=self._RED, font=("Consolas", 11, "bold"))
 
@@ -264,6 +264,23 @@ class HIDToolApp(tk.Tk):
         self._cmd_dev_combo = ttk.Combobox(row2, textvariable=self._cmd_dev_var, width=120, state="readonly")
         self._cmd_dev_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 8))
         self._cmd_dev_combo.bind("<<ComboboxSelected>>", self._on_cmd_device_selected)
+
+        # ---- Status bar ----
+        # 比 PanedWindow 先 pack：視窗高度不足時才不會被擠出畫面
+        sb_frame = ttk.Frame(self, style="Status.TFrame", padding=(8, 3))
+        sb_frame.pack(side=tk.BOTTOM, fill=tk.X)
+
+        self._status_var = tk.StringVar(value="就緒")
+        ttk.Label(sb_frame, textvariable=self._status_var, style="Status.TLabel",
+                  anchor=tk.W).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        self._rate_var = tk.StringVar(value="")
+        ttk.Label(sb_frame, textvariable=self._rate_var, anchor=tk.E,
+                  style="StatusRate.TLabel", width=14).pack(side=tk.RIGHT)
+
+        self._error_var = tk.StringVar(value="")
+        ttk.Label(sb_frame, textvariable=self._error_var, anchor=tk.E,
+                  style="StatusError.TLabel", width=34).pack(side=tk.RIGHT, padx=(8, 4))
 
         # ---- Main PanedWindow ----
         paned = tk.PanedWindow(self, orient=tk.HORIZONTAL, sashrelief=tk.FLAT,
@@ -314,9 +331,8 @@ class HIDToolApp(tk.Tk):
         desc_sb.pack(side=tk.RIGHT, fill=tk.Y)
         self._desc_tree.pack(fill=tk.BOTH, expand=True)
 
-        self._desc_tree.tag_configure("vendor", foreground="darkorange", font=("Consolas", 9, "bold"))
-        self._desc_tree.tag_configure("touch",  foreground="darkgreen")
-        self._desc_tree.tag_configure("const",  foreground="gray")
+        self._desc_tree.tag_configure("vendor", foreground="#b45309")
+        self._desc_tree.tag_configure("const",  foreground="#a1a1aa")
 
         # -- Right panel: Notebook --
         right_frame = ttk.Frame(paned)
@@ -340,22 +356,6 @@ class HIDToolApp(tk.Tk):
         stress_tab = ttk.Frame(self._notebook)
         self._notebook.add(stress_tab, text="壓測")
         self._build_stress_tab(stress_tab)
-
-        # ---- Status bar ----
-        sb_frame = ttk.Frame(self, style="Status.TFrame", padding=(8, 3))
-        sb_frame.pack(side=tk.BOTTOM, fill=tk.X)
-
-        self._status_var = tk.StringVar(value="就緒")
-        ttk.Label(sb_frame, textvariable=self._status_var, style="Status.TLabel",
-                  anchor=tk.W).pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        self._rate_var = tk.StringVar(value="")
-        ttk.Label(sb_frame, textvariable=self._rate_var, anchor=tk.E,
-                  style="StatusRate.TLabel", width=14).pack(side=tk.RIGHT)
-
-        self._error_var = tk.StringVar(value="")
-        ttk.Label(sb_frame, textvariable=self._error_var, anchor=tk.E,
-                  style="StatusError.TLabel", width=34).pack(side=tk.RIGHT, padx=(8, 4))
 
     def _build_monitor_tab(self, parent):
         ctrl_row = ttk.Frame(parent)
@@ -464,8 +464,7 @@ class HIDToolApp(tk.Tk):
 
         btn_row = ttk.Frame(parent)
         btn_row.pack(pady=6)
-        ttk.Button(btn_row, text="發送 (Set Report)", command=self._on_send,
-                   style="Accent.TButton").pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_row, text="發送 (Set Report)", command=self._on_send).pack(side=tk.LEFT, padx=4)
         self._get_btn = ttk.Button(btn_row, text="Get Report", command=self._on_get_report)
         # 初始隱藏，切到 Feature 才顯示
 
@@ -1085,16 +1084,18 @@ class HIDToolApp(tk.Tk):
             {"col_id": "__frame__", "label": "Frame", "width": 60, "kind": "meta", "field_ref": None, "value_index": -1, "byte_index": -1},
             {"col_id": "__rid__", "label": "RID", "width": 50, "kind": "meta", "field_ref": None, "value_index": -1, "byte_index": -1},
             {"col_id": "__slot__", "label": "Slot", "width": 50, "kind": "meta", "field_ref": None, "value_index": -1, "byte_index": -1},
-            {"col_id": "ContactID", "label": "ContactID", "width": 80, "kind": "group", "field_ref": None, "value_index": -1, "byte_index": -1},
+        ]
+        if "ScanTime" in self._hybrid_common:
+            col_defs.append({"col_id": "ScanTime", "label": "ScanTime", "width": 85, "kind": "common", "field_ref": None, "value_index": -1, "byte_index": -1})
+        col_defs += [
             {"col_id": "X", "label": "X", "width": 80, "kind": "group", "field_ref": None, "value_index": -1, "byte_index": -1},
             {"col_id": "Y", "label": "Y", "width": 80, "kind": "group", "field_ref": None, "value_index": -1, "byte_index": -1},
             {"col_id": "Width", "label": "Width", "width": 70, "kind": "group", "field_ref": None, "value_index": -1, "byte_index": -1},
             {"col_id": "Height", "label": "Height", "width": 70, "kind": "group", "field_ref": None, "value_index": -1, "byte_index": -1},
+            {"col_id": "ContactID", "label": "ContactID", "width": 80, "kind": "group", "field_ref": None, "value_index": -1, "byte_index": -1},
         ]
         if "ContactCount" in self._hybrid_common:
             col_defs.append({"col_id": "ContactCount", "label": "Count", "width": 60, "kind": "common", "field_ref": None, "value_index": -1, "byte_index": -1})
-        if "ScanTime" in self._hybrid_common:
-            col_defs.append({"col_id": "ScanTime", "label": "ScanTime", "width": 85, "kind": "common", "field_ref": None, "value_index": -1, "byte_index": -1})
 
         # Button fields (usage page 0x09) — stored in _hybrid_common for value reading, merged into ConfTip
         for hf in input_fields:
@@ -1195,6 +1196,7 @@ class HIDToolApp(tk.Tk):
         self._last_pkt_rx_time = 0.0
         self._last_scan_time   = -1
         self._scan_time_delta  = 0
+        self._scan_delta_suppress = False
         self._scan_time_field  = next(
             (hf for hf in input_fields if not hf.is_vendor
              and any((hf.usage_page, u) == (0x0D, 0x56) for u in hf.usages)), None
@@ -1396,11 +1398,12 @@ class HIDToolApp(tk.Tk):
                 if vals:
                     st = vals[0]
                     if st != self._last_scan_time:
-                        if self._last_scan_time >= 0:
+                        if self._last_scan_time >= 0 and not self._scan_delta_suppress:
                             wrap_base = max(1, hf.logical_max - hf.logical_min + 1)
                             self._scan_time_delta = (st - self._last_scan_time) % wrap_base
                         else:
                             self._scan_time_delta = 0
+                        self._scan_delta_suppress = False
                         self._last_scan_time = st
                         return True
                     return False
@@ -1682,11 +1685,12 @@ class HIDToolApp(tk.Tk):
             error_reasons.append(f"ScanΔ={self._scan_time_delta}>{max_delta}")
             row_tags = ("scan_error",)
         if is_new_frame:
+            # 觸控非活動時只抑制下一個 frame 的 scan Δ 錯誤判斷，不重設
+            # _last_scan_time —— 重設會讓 frame 計數把同一 frame 的後續封包
+            # （或 scan time 未變的封包）重複累計，造成 Hybrid 模式 scan/s 偏高
             if not current_touch_active:
-                self._last_scan_time = -1
-                self._scan_time_delta = 0
-            else:
-                self._scan_time_delta = 0
+                self._scan_delta_suppress = True
+            self._scan_time_delta = 0
             if current_contact_count >= 0:
                 self._last_contact_count = current_contact_count
             self._last_touch_active = current_touch_active
@@ -2203,7 +2207,7 @@ class HIDToolApp(tk.Tk):
         ttk.Label(stats_frame, text="總次數:").pack(side=tk.LEFT, padx=(4, 2))
         self._stress_count_var = tk.StringVar(value="0")
         ttk.Label(stats_frame, textvariable=self._stress_count_var,
-                  font=("Consolas", 12, "bold"), width=6, foreground="#2196F3").pack(side=tk.LEFT, padx=(0, 12))
+                  font=("Consolas", 12, "bold"), width=6).pack(side=tk.LEFT, padx=(0, 12))
 
         ttk.Label(stats_frame, text="失敗:").pack(side=tk.LEFT, padx=(0, 2))
         self._stress_fail_var = tk.StringVar(value="0")
