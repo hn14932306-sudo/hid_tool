@@ -257,3 +257,130 @@ class RawInputThread(threading.Thread):
         self._stop_event.set()
         if self._hwnd:
             ctypes.windll.user32.PostMessageW(self._hwnd, 0x0012, 0, 0)  # WM_QUIT
+
+
+# ---------------------------------------------------------------------------
+# Device change (hot-plug) notification thread
+# ---------------------------------------------------------------------------
+
+WM_DEVICECHANGE             = 0x0219
+DBT_DEVICEARRIVAL           = 0x8000
+DBT_DEVICEREMOVECOMPLETE    = 0x8004
+DBT_DEVTYP_DEVICEINTERFACE  = 0x00000005
+DEVICE_NOTIFY_WINDOW_HANDLE = 0x00000000
+
+
+class GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", ctypes.c_uint32),
+        ("Data2", ctypes.c_uint16),
+        ("Data3", ctypes.c_uint16),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+
+GUID_DEVINTERFACE_HID = GUID(
+    0x4D1E55B2, 0xF16F, 0x11CF,
+    (ctypes.c_ubyte * 8)(0x88, 0xCB, 0x00, 0x11, 0x11, 0x00, 0x00, 0x30),
+)
+
+
+class DEV_BROADCAST_DEVICEINTERFACE_W(ctypes.Structure):
+    _fields_ = [
+        ("dbcc_size",       ctypes.wintypes.DWORD),
+        ("dbcc_devicetype", ctypes.wintypes.DWORD),
+        ("dbcc_reserved",   ctypes.wintypes.DWORD),
+        ("dbcc_classguid",  GUID),
+        ("dbcc_name",       ctypes.c_wchar * 1),
+    ]
+
+
+class DeviceChangeThread(threading.Thread):
+    """
+    Creates a hidden message-only window registered for HID device-interface
+    notifications (RegisterDeviceNotification). On arrival/removal, calls
+    `callback(event)` from this thread, where event is "arrival" or "removal".
+    """
+
+    def __init__(self, callback):
+        super().__init__(daemon=True)
+        self.callback    = callback
+        self._hwnd       = None
+        self._stop_event = threading.Event()
+
+    def run(self):
+        user32    = ctypes.windll.user32
+        kernel32  = ctypes.windll.kernel32
+        hInstance = kernel32.GetModuleHandleW(None)
+
+        user32.DefWindowProcW.restype  = ctypes.c_ssize_t
+        user32.DefWindowProcW.argtypes = [
+            ctypes.wintypes.HWND,
+            ctypes.c_uint,
+            ctypes.c_size_t,    # WPARAM
+            ctypes.c_ssize_t,   # LPARAM
+        ]
+        user32.RegisterDeviceNotificationW.restype  = ctypes.wintypes.HANDLE
+        user32.RegisterDeviceNotificationW.argtypes = [
+            ctypes.wintypes.HANDLE,
+            ctypes.c_void_p,
+            ctypes.wintypes.DWORD,
+        ]
+        user32.UnregisterDeviceNotification.restype  = ctypes.wintypes.BOOL
+        user32.UnregisterDeviceNotification.argtypes = [ctypes.wintypes.HANDLE]
+
+        def wnd_proc(hwnd, msg, wparam, lparam):
+            if msg == WM_DEVICECHANGE and wparam in (DBT_DEVICEARRIVAL, DBT_DEVICEREMOVECOMPLETE):
+                try:
+                    self.callback("arrival" if wparam == DBT_DEVICEARRIVAL else "removal")
+                except Exception:
+                    pass
+                return 1  # TRUE
+            return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+        self._wnd_proc_cb = WNDPROCTYPE(wnd_proc)
+
+        class_name = "HIDToolDevChangeWnd"
+        wc = WNDCLASSEXW()
+        wc.cbSize        = ctypes.sizeof(WNDCLASSEXW)
+        wc.style         = 0
+        wc.lpfnWndProc   = ctypes.cast(self._wnd_proc_cb, ctypes.c_void_p)
+        wc.hInstance     = hInstance
+        wc.lpszClassName = class_name
+
+        if not user32.RegisterClassExW(ctypes.byref(wc)):
+            if kernel32.GetLastError() != 1410:   # ERROR_CLASS_ALREADY_EXISTS
+                return
+
+        hwnd = user32.CreateWindowExW(
+            0, class_name, "HIDToolDevChange", 0,
+            0, 0, 0, 0,
+            HWND_MESSAGE, None, hInstance, None,
+        )
+        if not hwnd:
+            return
+        self._hwnd = hwnd
+
+        flt = DEV_BROADCAST_DEVICEINTERFACE_W()
+        flt.dbcc_size       = ctypes.sizeof(DEV_BROADCAST_DEVICEINTERFACE_W)
+        flt.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE
+        flt.dbcc_classguid  = GUID_DEVINTERFACE_HID
+        hnotify = user32.RegisterDeviceNotificationW(
+            hwnd, ctypes.byref(flt), DEVICE_NOTIFY_WINDOW_HANDLE,
+        )
+
+        msg = ctypes.wintypes.MSG()
+        while not self._stop_event.is_set():
+            ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+            if ret == 0 or ret == -1:
+                break
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+
+        if hnotify:
+            user32.UnregisterDeviceNotification(hnotify)
+
+    def stop(self):
+        self._stop_event.set()
+        if self._hwnd:
+            ctypes.windll.user32.PostMessageW(self._hwnd, 0x0012, 0, 0)  # WM_QUIT

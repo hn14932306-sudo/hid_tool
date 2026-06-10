@@ -25,7 +25,7 @@ from hid_descriptor import (
     extract_field_value,
     get_usage_name,
 )
-from hid_rawinput import RawInputThread
+from hid_rawinput import RawInputThread, DeviceChangeThread
 from hid_device import (
     enumerate_hid_devices,
     format_device_label,
@@ -45,11 +45,30 @@ from hid_device import (
 # ---------------------------------------------------------------------------
 
 class HIDToolApp(tk.Tk):
+    # ---- UI palette & fonts ----
+    _BG          = "#f3f5f8"   # window background
+    _SURFACE     = "#ffffff"   # cards / tables / logs
+    _BORDER      = "#cdd5df"
+    _TEXT        = "#1f2937"
+    _TEXT_MUTED  = "#6b7280"
+    _ACCENT      = "#2563eb"
+    _ACCENT_DARK = "#1d4ed8"
+    _GREEN       = "#2f9e44"
+    _GREEN_DARK  = "#268a3b"
+    _RED         = "#e03131"
+    _RED_DARK    = "#c92a2a"
+    _STRIPE      = "#eef2f7"   # zebra row background
+
+    _FONT_UI      = ("Microsoft JhengHei UI", 9)
+    _FONT_UI_BOLD = ("Microsoft JhengHei UI", 9, "bold")
+    _FONT_MONO    = ("Consolas", 9)
+
     def __init__(self):
         super().__init__()
         self.title("HID Tool — Monitor + Send")
         self.geometry("1300x780")
         self.minsize(1000, 620)
+        self._setup_style()
 
         # Shared state
         self._hidapi_devices:    List[dict]                = []
@@ -89,6 +108,7 @@ class HIDToolApp(tk.Tk):
         self._canvas_trail_line_ids:   Dict[int, int]               = {}
         self._table_pending:           List[tuple]                   = []   # (row, tags, errs)
         self._table_flush_pending:     bool                         = False
+        self._table_row_seq:           int                          = 0    # 斑馬紋交錯計數
         self._canvas_flush_pending:    bool                         = False
         self._canvas_dirty_keys:       set                          = set()  # 有新資料的 cid
         self._canvas_trail_reset_keys: set                          = set()  # 需清除舊軌跡線
@@ -118,20 +138,107 @@ class HIDToolApp(tk.Tk):
         self.after(20, self._poll_queue)
         self.after(50, self._toggle_desc_panel)   # start collapsed
 
+        # 裝置熱插拔偵測
+        self._devchange_after_id: Optional[str] = None
+        self._devchange_thread = DeviceChangeThread(self._on_device_change_event)
+        self._devchange_thread.start()
+
     # ------------------------------------------------------------------
     # UI Construction
     # ------------------------------------------------------------------
 
+    def _setup_style(self):
+        self.configure(bg=self._BG)
+        # 預設值（僅影響未明確指定的 tk 元件）
+        self.option_add("*Font", self._FONT_UI)
+        self.option_add("*Background", self._BG)
+        self.option_add("*TCombobox*Listbox.font", self._FONT_UI)
+        self.option_add("*TCombobox*Listbox.background", self._SURFACE)
+
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        style.configure(".", background=self._BG, foreground=self._TEXT,
+                        font=self._FONT_UI, bordercolor=self._BORDER,
+                        focuscolor=self._ACCENT)
+        style.configure("TFrame", background=self._BG)
+        style.configure("TLabel", background=self._BG, foreground=self._TEXT)
+        style.configure("Muted.TLabel", foreground=self._TEXT_MUTED)
+        style.configure("TLabelframe", background=self._BG,
+                        bordercolor=self._BORDER, relief="solid", borderwidth=1)
+        style.configure("TLabelframe.Label", background=self._BG,
+                        foreground="#334155", font=self._FONT_UI_BOLD)
+
+        style.configure("TButton", padding=(10, 3))
+        style.map("TButton",
+                  background=[("pressed", "#d6dde7"), ("active", "#e4e9f0")])
+        for name, color, hover in (
+            ("Accent", self._ACCENT, self._ACCENT_DARK),
+            ("Start",  self._GREEN,  self._GREEN_DARK),
+            ("Stop",   self._RED,    self._RED_DARK),
+        ):
+            style.configure(f"{name}.TButton", background=color, foreground="white",
+                            bordercolor=color, font=self._FONT_UI_BOLD, padding=(14, 4))
+            style.map(f"{name}.TButton",
+                      background=[("pressed", hover), ("active", hover)],
+                      foreground=[("disabled", "#e5e7eb")])
+        style.configure("Toggle.TButton", anchor="w", background="#e2e8f0", padding=(8, 3))
+        style.map("Toggle.TButton", background=[("pressed", "#c9d4e0"), ("active", "#d3dce6")])
+
+        style.configure("TNotebook", background=self._BG, borderwidth=0,
+                        tabmargins=(8, 4, 8, 0))
+        style.configure("TNotebook.Tab", padding=(18, 6), background="#dde3ea")
+        style.map("TNotebook.Tab",
+                  background=[("selected", self._SURFACE)],
+                  foreground=[("selected", self._ACCENT)])
+
+        style.configure("Treeview", background=self._SURFACE,
+                        fieldbackground=self._SURFACE, foreground=self._TEXT,
+                        rowheight=24, borderwidth=1)
+        style.configure("Mono.Treeview", font=self._FONT_MONO)
+        style.configure("Treeview.Heading", background="#e7ecf3", foreground="#334155",
+                        font=self._FONT_UI_BOLD, relief="flat", padding=(4, 4))
+        style.map("Treeview.Heading", background=[("active", "#dbe3ec")])
+        style.map("Treeview",
+                  background=[("selected", "#cfe1ff")],
+                  foreground=[("selected", self._TEXT)])
+
+        style.configure("TCheckbutton", background=self._BG)
+        style.configure("TRadiobutton", background=self._BG)
+        style.map("TCheckbutton", background=[("active", self._BG)])
+        style.map("TRadiobutton", background=[("active", self._BG)])
+        style.configure("TSpinbox", arrowsize=12, padding=(4, 1))
+        style.configure("TEntry", padding=(4, 1))
+        style.configure("TCombobox", padding=(4, 1))
+
+        # 狀態列
+        style.configure("Status.TFrame", background=self._SURFACE,
+                        relief="solid", borderwidth=1)
+        style.configure("Status.TLabel", background=self._SURFACE)
+        style.configure("StatusRate.TLabel", background=self._SURFACE,
+                        foreground=self._ACCENT, font=("Consolas", 9, "bold"))
+        style.configure("StatusError.TLabel", background=self._SURFACE,
+                        foreground=self._RED, font=("Consolas", 11, "bold"))
+
+    def _style_log_text(self, widget):
+        """統一 ScrolledText 外觀。"""
+        widget.configure(bg=self._SURFACE, relief=tk.FLAT,
+                         highlightthickness=1, highlightbackground=self._BORDER,
+                         highlightcolor=self._BORDER, padx=6, pady=4)
+
     def _build_ui(self):
         # ---- Top bar (shared) ----
-        top = tk.Frame(self, bd=2, relief=tk.RAISED, padx=4, pady=4)
+        top = ttk.Frame(self, padding=(8, 6))
         top.pack(side=tk.TOP, fill=tk.X)
 
         # Row 1: 監聽裝置
-        row1 = tk.Frame(top)
+        row1 = ttk.Frame(top)
         row1.pack(fill=tk.X)
 
-        tk.Label(row1, text="監聽裝置:", width=8, anchor="e").pack(side=tk.LEFT)
+        ttk.Label(row1, text="監聽裝置:", width=8, anchor="e").pack(side=tk.LEFT)
         self._dev_var = tk.StringVar()
         self._dev_combo = ttk.Combobox(row1, textvariable=self._dev_var, width=120, state="readonly")
         self._dev_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 8))
@@ -141,51 +248,50 @@ class HIDToolApp(tk.Tk):
         self._dev_combo.bind("<Leave>", self._hide_dev_tooltip)
         self._dev_combo.bind("<ButtonPress-1>", self._hide_dev_tooltip)
 
-        tk.Button(row1, text="重新整理", command=self._refresh_devices).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row1, text="重新整理", command=self._refresh_devices).pack(side=tk.LEFT, padx=2)
 
-        self._listen_btn = tk.Button(
-            row1, text="開始監聽", command=self._toggle_listen,
-            bg="#4CAF50", fg="white", font=("Arial", 10, "bold"),
+        self._listen_btn = ttk.Button(
+            row1, text="開始監聽", command=self._toggle_listen, style="Start.TButton",
         )
         self._listen_btn.pack(side=tk.LEFT, padx=8)
 
         # Row 2: 指令裝置
-        row2 = tk.Frame(top)
-        row2.pack(fill=tk.X, pady=(2, 0))
+        row2 = ttk.Frame(top)
+        row2.pack(fill=tk.X, pady=(4, 0))
 
-        tk.Label(row2, text="指令裝置:", width=8, anchor="e").pack(side=tk.LEFT)
+        ttk.Label(row2, text="指令裝置:", width=8, anchor="e").pack(side=tk.LEFT)
         self._cmd_dev_var = tk.StringVar()
         self._cmd_dev_combo = ttk.Combobox(row2, textvariable=self._cmd_dev_var, width=120, state="readonly")
         self._cmd_dev_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 8))
         self._cmd_dev_combo.bind("<<ComboboxSelected>>", self._on_cmd_device_selected)
 
         # ---- Main PanedWindow ----
-        paned = tk.PanedWindow(self, orient=tk.HORIZONTAL, sashrelief=tk.RAISED, sashwidth=5)
+        paned = tk.PanedWindow(self, orient=tk.HORIZONTAL, sashrelief=tk.FLAT,
+                               sashwidth=6, bd=0, bg=self._BG)
         paned.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
         self._paned = paned
         self._desc_panel_width = 300   # remembered width when expanded
 
         # -- Left panel: collapsible descriptor panel --
-        left_outer = tk.Frame(paned)
+        left_outer = ttk.Frame(paned)
         paned.add(left_outer, minsize=0)
 
         # Toggle button row
-        toggle_row = tk.Frame(left_outer)
+        toggle_row = ttk.Frame(left_outer)
         toggle_row.pack(side=tk.TOP, fill=tk.X)
         self._desc_collapsed = False
-        self._desc_toggle_btn = tk.Button(
+        self._desc_toggle_btn = ttk.Button(
             toggle_row, text="◀ Report Descriptor 欄位",
-            anchor=tk.W, relief=tk.FLAT, bg="#dde3ea",
-            font=("Arial", 9, "bold"),
+            style="Toggle.TButton",
             command=self._toggle_desc_panel,
         )
         self._desc_toggle_btn.pack(fill=tk.X)
 
         # Inner content (tree + raw button) — hidden when collapsed
-        self._desc_inner = tk.Frame(left_outer)
+        self._desc_inner = ttk.Frame(left_outer)
         self._desc_inner.pack(fill=tk.BOTH, expand=True)
 
-        left_frame = tk.Frame(self._desc_inner, padx=2, pady=2)
+        left_frame = ttk.Frame(self._desc_inner, padding=2)
         left_frame.pack(fill=tk.BOTH, expand=True)
 
         self._desc_tree = ttk.Treeview(
@@ -200,8 +306,8 @@ class HIDToolApp(tk.Tk):
         self._desc_tree.column("bit_size",      width=70,  stretch=False)
         self._desc_tree.column("logical_range", width=100, stretch=False)
 
-        tk.Button(left_frame, text="顯示原始 Descriptor Bytes",
-                  command=self._show_raw_descriptor).pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
+        ttk.Button(left_frame, text="顯示原始 Descriptor Bytes",
+                   command=self._show_raw_descriptor).pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
 
         desc_sb = ttk.Scrollbar(left_frame, orient=tk.VERTICAL, command=self._desc_tree.yview)
         self._desc_tree.configure(yscrollcommand=desc_sb.set)
@@ -213,52 +319,52 @@ class HIDToolApp(tk.Tk):
         self._desc_tree.tag_configure("const",  foreground="gray")
 
         # -- Right panel: Notebook --
-        right_frame = tk.Frame(paned)
+        right_frame = ttk.Frame(paned)
         paned.add(right_frame, minsize=560)
 
         self._notebook = ttk.Notebook(right_frame)
         self._notebook.pack(fill=tk.BOTH, expand=True)
 
-        monitor_tab = tk.Frame(self._notebook)
-        self._notebook.add(monitor_tab, text="  監聽  ")
+        monitor_tab = ttk.Frame(self._notebook)
+        self._notebook.add(monitor_tab, text="監聽")
         self._build_monitor_tab(monitor_tab)
 
-        send_tab = tk.Frame(self._notebook)
-        self._notebook.add(send_tab, text="  發送  ")
+        send_tab = ttk.Frame(self._notebook)
+        self._notebook.add(send_tab, text="發送")
         self._build_send_tab(send_tab)
 
-        canvas_tab = tk.Frame(self._notebook)
-        self._notebook.add(canvas_tab, text="  畫布  ")
+        canvas_tab = ttk.Frame(self._notebook)
+        self._notebook.add(canvas_tab, text="畫布")
         self._build_canvas_tab(canvas_tab)
 
-        stress_tab = tk.Frame(self._notebook)
-        self._notebook.add(stress_tab, text="  壓測  ")
+        stress_tab = ttk.Frame(self._notebook)
+        self._notebook.add(stress_tab, text="壓測")
         self._build_stress_tab(stress_tab)
 
         # ---- Status bar ----
-        sb_frame = tk.Frame(self, bd=1, relief=tk.SUNKEN)
+        sb_frame = ttk.Frame(self, style="Status.TFrame", padding=(8, 3))
         sb_frame.pack(side=tk.BOTTOM, fill=tk.X)
 
         self._status_var = tk.StringVar(value="就緒")
-        tk.Label(sb_frame, textvariable=self._status_var,
-                 anchor=tk.W, font=("Arial", 9)).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(sb_frame, textvariable=self._status_var, style="Status.TLabel",
+                  anchor=tk.W).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         self._rate_var = tk.StringVar(value="")
-        tk.Label(sb_frame, textvariable=self._rate_var, anchor=tk.E,
-                 font=("Consolas", 9, "bold"), width=14).pack(side=tk.RIGHT)
+        ttk.Label(sb_frame, textvariable=self._rate_var, anchor=tk.E,
+                  style="StatusRate.TLabel", width=14).pack(side=tk.RIGHT)
 
         self._error_var = tk.StringVar(value="")
-        tk.Label(sb_frame, textvariable=self._error_var, anchor=tk.E,
-                 font=("Consolas", 11, "bold"), fg="red", width=34).pack(side=tk.RIGHT, padx=(8, 4))
+        ttk.Label(sb_frame, textvariable=self._error_var, anchor=tk.E,
+                  style="StatusError.TLabel", width=34).pack(side=tk.RIGHT, padx=(8, 4))
 
     def _build_monitor_tab(self, parent):
-        ctrl_row = tk.Frame(parent)
-        ctrl_row.pack(side=tk.TOP, fill=tk.X, padx=2, pady=2)
+        ctrl_row = ttk.Frame(parent)
+        ctrl_row.pack(side=tk.TOP, fill=tk.X, padx=4, pady=4)
 
         self._show_raw    = tk.BooleanVar(value=False)
         self._view_mode   = tk.StringVar(value="Hybrid")
 
-        tk.Label(ctrl_row, text="Report ID:").pack(side=tk.LEFT)
+        ttk.Label(ctrl_row, text="Report ID:").pack(side=tk.LEFT)
         self._rid_filter_var = tk.StringVar(value="全部")
         self._rid_combo = ttk.Combobox(ctrl_row, textvariable=self._rid_filter_var,
                                        width=8, state="readonly")
@@ -267,43 +373,43 @@ class HIDToolApp(tk.Tk):
         self._rid_combo.pack(side=tk.LEFT, padx=(2, 12))
         self._rid_combo.bind("<<ComboboxSelected>>", lambda _: self._rebuild_table_columns())
 
-        tk.Label(ctrl_row, text="Frame gap(ms):").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(ctrl_row, text="Frame gap(ms):").pack(side=tk.LEFT, padx=(8, 0))
         self._gap_ms_var = tk.StringVar(value="4")
-        tk.Spinbox(ctrl_row, from_=1, to=50, textvariable=self._gap_ms_var,
-                   width=4).pack(side=tk.LEFT, padx=(2, 8))
+        ttk.Spinbox(ctrl_row, from_=1, to=50, textvariable=self._gap_ms_var,
+                    width=4).pack(side=tk.LEFT, padx=(2, 8))
 
-        tk.Label(ctrl_row, text="View:").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(ctrl_row, text="View:").pack(side=tk.LEFT, padx=(8, 0))
         self._view_combo = ttk.Combobox(ctrl_row, textvariable=self._view_mode,
                                         width=10, state="readonly",
                                         values=("Hybrid", "Parallel"))
         self._view_combo.pack(side=tk.LEFT, padx=(2, 8))
         self._view_combo.bind("<<ComboboxSelected>>", lambda _: self._rebuild_table_columns())
 
-        tk.Label(ctrl_row, text="最大 scan Δ:").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(ctrl_row, text="最大 scan Δ:").pack(side=tk.LEFT, padx=(8, 0))
         self._max_scan_delta_var = tk.StringVar(value="200")
-        tk.Spinbox(ctrl_row, from_=0, to=9999, textvariable=self._max_scan_delta_var,
-                   width=5).pack(side=tk.LEFT, padx=(2, 8))
+        ttk.Spinbox(ctrl_row, from_=0, to=9999, textvariable=self._max_scan_delta_var,
+                    width=5).pack(side=tk.LEFT, padx=(2, 8))
 
-        tk.Label(ctrl_row, text="保留筆數:").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(ctrl_row, text="保留筆數:").pack(side=tk.LEFT, padx=(8, 0))
         self._max_rows_var = tk.StringVar(value="200")
-        tk.Spinbox(ctrl_row, from_=50, to=5000, increment=50,
-                   textvariable=self._max_rows_var,
-                   width=5).pack(side=tk.LEFT, padx=(2, 8))
+        ttk.Spinbox(ctrl_row, from_=50, to=5000, increment=50,
+                    textvariable=self._max_rows_var,
+                    width=5).pack(side=tk.LEFT, padx=(2, 8))
 
-        tk.Checkbutton(ctrl_row, text="顯示 RAW 欄位",
-                       variable=self._show_raw,
-                       command=self._rebuild_table_columns).pack(side=tk.LEFT, padx=8)
-        tk.Button(ctrl_row, text="清除", command=self._clear_log).pack(side=tk.RIGHT, padx=4)
-        tk.Button(ctrl_row, text="Export Excel", command=self._export_monitor_to_excel).pack(side=tk.RIGHT, padx=4)
+        ttk.Checkbutton(ctrl_row, text="顯示 RAW 欄位",
+                        variable=self._show_raw,
+                        command=self._rebuild_table_columns).pack(side=tk.LEFT, padx=8)
+        ttk.Button(ctrl_row, text="清除", command=self._clear_log).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(ctrl_row, text="Export Excel", command=self._export_monitor_to_excel).pack(side=tk.RIGHT, padx=4)
 
         # FF01 usage filter row
         self._ff01_filter_frame = ttk.LabelFrame(parent, text="Usage Page FF01 欄位顯示")
         self._ff01_filter_frame.pack(side=tk.TOP, fill=tk.X, padx=2, pady=(0, 2))
 
         # 格式選擇器永久固定在右側
-        fmt_right = tk.Frame(self._ff01_filter_frame)
+        fmt_right = ttk.Frame(self._ff01_filter_frame)
         fmt_right.pack(side=tk.RIGHT, padx=4, pady=1)
-        tk.Label(fmt_right, text="格式:").pack(side=tk.LEFT)
+        ttk.Label(fmt_right, text="格式:").pack(side=tk.LEFT)
         fmt_combo = ttk.Combobox(
             fmt_right, textvariable=self._ff01_fmt,
             values=("Hex", "Dec", "Bin"), state="readonly", width=5,
@@ -312,13 +418,14 @@ class HIDToolApp(tk.Tk):
         fmt_combo.bind("<<ComboboxSelected>>", lambda _: self._rebuild_table_columns())
 
         # 動態 checkbox 區域（每次換裝置時重建）
-        self._ff01_check_frame = tk.Frame(self._ff01_filter_frame)
+        self._ff01_check_frame = ttk.Frame(self._ff01_filter_frame)
         self._ff01_check_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        tbl_frame = tk.Frame(parent)
-        tbl_frame.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+        tbl_frame = ttk.Frame(parent)
+        tbl_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
 
-        self._table = ttk.Treeview(tbl_frame, show="headings", selectmode="browse")
+        self._table = ttk.Treeview(tbl_frame, show="headings", selectmode="browse",
+                                   style="Mono.Treeview")
         vsb = ttk.Scrollbar(tbl_frame, orient=tk.VERTICAL,   command=self._table.yview)
         hsb = ttk.Scrollbar(tbl_frame, orient=tk.HORIZONTAL, command=self._table.xview)
         self._table.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
@@ -326,6 +433,7 @@ class HIDToolApp(tk.Tk):
         hsb.pack(side=tk.BOTTOM, fill=tk.X)
         self._table.pack(fill=tk.BOTH, expand=True)
         self._table.tag_configure("scan_error", background="#ffd6d6")
+        self._table.tag_configure("stripe", background=self._STRIPE)
 
 
     def _build_send_tab(self, parent):
@@ -354,13 +462,14 @@ class HIDToolApp(tk.Tk):
         ttk.Entry(param_frame, textvariable=self._send_data_var, width=55).grid(
             row=2, column=1, columnspan=3, sticky="w")
 
-        btn_row = tk.Frame(parent)
+        btn_row = ttk.Frame(parent)
         btn_row.pack(pady=6)
-        ttk.Button(btn_row, text="發送 (Set Report)", command=self._on_send).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_row, text="發送 (Set Report)", command=self._on_send,
+                   style="Accent.TButton").pack(side=tk.LEFT, padx=4)
         self._get_btn = ttk.Button(btn_row, text="Get Report", command=self._on_get_report)
         # 初始隱藏，切到 Feature 才顯示
 
-        int_row = tk.Frame(parent)
+        int_row = ttk.Frame(parent)
         int_row.pack(fill=tk.X, padx=8, pady=(0, 4))
         self._wait_int_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(int_row, text="等待 INT 回應", variable=self._wait_int_var).pack(side=tk.LEFT)
@@ -374,7 +483,7 @@ class HIDToolApp(tk.Tk):
         log_frame = ttk.LabelFrame(parent, text="操作記錄", padding=6)
         log_frame.pack(fill=tk.BOTH, expand=True, **pad)
 
-        log_ctrl = tk.Frame(log_frame)
+        log_ctrl = ttk.Frame(log_frame)
         log_ctrl.pack(fill=tk.X, pady=(0, 4))
         self._pair_bytes_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(log_ctrl, text="2-byte 合併顯示（第一行32個，其他33個）",
@@ -382,6 +491,7 @@ class HIDToolApp(tk.Tk):
 
         self._send_log = scrolledtext.ScrolledText(
             log_frame, height=14, state="disabled", font=("Consolas", 9))
+        self._style_log_text(self._send_log)
         self._send_log.pack(fill=tk.BOTH, expand=True)
 
         ttk.Button(parent, text="清除記錄", command=self._clear_send_log).pack(pady=(0, 6))
@@ -392,27 +502,67 @@ class HIDToolApp(tk.Tk):
 
     _CMD_SAME_LABEL = "（同監聽裝置）"
 
-    def _refresh_devices(self):
-        self._descriptors.clear()
-        self._raw_descriptors.clear()
+    def _refresh_devices(self, auto: bool = False):
+        """重新列舉 HID 裝置。auto=True 表示由熱插拔事件觸發：
+        保留現有選擇與 descriptor 快取，監聽中的 session 不受影響。"""
+        prev_path     = self._get_dev_path_str(self._selected_dev) if self._selected_dev else None
+        prev_cmd_path = self._get_dev_path_str(self._cmd_dev) if self._cmd_dev else None
+
+        if not auto:
+            self._descriptors.clear()
+            self._raw_descriptors.clear()
         self._hidapi_devices = sorted(
             enumerate_hid_devices(),
             key=lambda d: (d.get("vendor_id", 0), d.get("product_id", 0)),
         )
         labels = [format_device_label(d) for d in self._hidapi_devices]
+        paths  = [self._get_dev_path_str(d) for d in self._hidapi_devices]
         self._dev_combo["values"] = labels
         self._hide_dev_tooltip()
         if labels:
-            self._dev_combo.current(0)
-            self._on_device_selected(None)
+            if prev_path in paths:
+                idx = paths.index(prev_path)
+                self._dev_combo.current(idx)
+                self._selected_dev = self._hidapi_devices[idx]
+                if not auto:
+                    self._on_device_selected(None)   # 手動重整：重新載入 descriptor
+            else:
+                self._dev_combo.current(0)
+                self._on_device_selected(None)
+        else:
+            self._dev_var.set("")
+            self._selected_dev = None
 
         cmd_labels = [self._CMD_SAME_LABEL] + labels
         self._cmd_dev_combo["values"] = cmd_labels
-        if self._cmd_dev_combo.current() < 0:
+        if prev_cmd_path in paths:
+            cmd_idx = paths.index(prev_cmd_path)
+            self._cmd_dev_combo.current(cmd_idx + 1)
+            self._cmd_dev = self._hidapi_devices[cmd_idx]
+        else:
             self._cmd_dev_combo.current(0)
             self._cmd_dev = None
 
-        self._status_var.set(f"找到 {len(self._hidapi_devices)} 個 HID 裝置")
+        prefix = "偵測到裝置變更，" if auto else ""
+        self._status_var.set(f"{prefix}找到 {len(self._hidapi_devices)} 個 HID 裝置")
+
+    # ------------------------------------------------------------------
+    # Hot-plug detection
+    # ------------------------------------------------------------------
+
+    def _on_device_change_event(self, event: str):
+        """從 DeviceChangeThread 執行緒呼叫，轉回主執行緒。"""
+        self.after(0, self._schedule_device_refresh)
+
+    def _schedule_device_refresh(self):
+        """去抖動：插拔常連續觸發多筆事件，等 600ms 沒有新事件再重整。"""
+        if self._devchange_after_id is not None:
+            self.after_cancel(self._devchange_after_id)
+        self._devchange_after_id = self.after(600, self._do_device_refresh)
+
+    def _do_device_refresh(self):
+        self._devchange_after_id = None
+        self._refresh_devices(auto=True)
 
     def _on_device_selected(self, event):
         idx = self._dev_combo.current()
@@ -582,13 +732,14 @@ class HIDToolApp(tk.Tk):
                     seen.add(first_usage)
 
         if not ff01_usages:
-            tk.Label(self._ff01_check_frame, text="（無 FF01 欄位）", fg="gray").pack(side=tk.LEFT, padx=4)
+            ttk.Label(self._ff01_check_frame, text="（無 FF01 欄位）",
+                      style="Muted.TLabel").pack(side=tk.LEFT, padx=4)
             return
 
         for usage in ff01_usages:
             var = tk.BooleanVar(value=True)
             self._ff01_usage_vars[usage] = var
-            cb = tk.Checkbutton(
+            cb = ttk.Checkbutton(
                 self._ff01_check_frame,
                 text=f"U{usage:02X}",
                 variable=var,
@@ -634,15 +785,16 @@ class HIDToolApp(tk.Tk):
         win.title("Report Descriptor Bytes")
         win.geometry("820x560")
         win.minsize(600, 400)
+        win.configure(bg=self._BG)
 
         # Toolbar
-        tb = tk.Frame(win)
+        tb = ttk.Frame(win)
         tb.pack(side=tk.TOP, fill=tk.X, padx=4, pady=4)
-        tk.Label(tb, text=f"共 {len(raw)} bytes", font=("Arial", 9)).pack(side=tk.LEFT)
-        tk.Button(tb, text="複製 Hex", command=lambda: self._copy_to_clipboard(
+        ttk.Label(tb, text=f"共 {len(raw)} bytes").pack(side=tk.LEFT)
+        ttk.Button(tb, text="複製 Hex", command=lambda: self._copy_to_clipboard(
             win, " ".join(f"{b:02X}" for b in raw)
         )).pack(side=tk.RIGHT, padx=4)
-        tk.Button(tb, text="複製 C Array", command=lambda: self._copy_to_clipboard(
+        ttk.Button(tb, text="複製 C Array", command=lambda: self._copy_to_clipboard(
             win, "{\n" + "".join(
                 ("    " if i % 16 == 0 else "") +
                 f"0x{b:02X}," +
@@ -656,13 +808,14 @@ class HIDToolApp(tk.Tk):
         nb.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
         # --- Hex view ---
-        hex_frame = tk.Frame(nb)
-        nb.add(hex_frame, text="  Hex 檢視  ")
+        hex_frame = ttk.Frame(nb)
+        nb.add(hex_frame, text="Hex 檢視")
 
         hex_text = scrolledtext.ScrolledText(
             hex_frame, font=("Consolas", 10), wrap=tk.NONE,
             state=tk.NORMAL, relief=tk.FLAT,
         )
+        self._style_log_text(hex_text)
         hex_text.pack(fill=tk.BOTH, expand=True)
 
         # 16 bytes per line: offset | hex | ascii
@@ -676,13 +829,14 @@ class HIDToolApp(tk.Tk):
         hex_text.config(state=tk.DISABLED)
 
         # --- Parsed view ---
-        parsed_frame = tk.Frame(nb)
-        nb.add(parsed_frame, text="  解析檢視  ")
+        parsed_frame = ttk.Frame(nb)
+        nb.add(parsed_frame, text="解析檢視")
 
         parsed_text = scrolledtext.ScrolledText(
             parsed_frame, font=("Consolas", 10), wrap=tk.NONE,
             state=tk.NORMAL, relief=tk.FLAT,
         )
+        self._style_log_text(parsed_text)
         parsed_text.pack(fill=tk.BOTH, expand=True)
         parsed_text.tag_configure("offset", foreground="gray")
         parsed_text.tag_configure("main",   foreground="#0055cc", font=("Consolas", 10, "bold"))
@@ -1216,7 +1370,7 @@ class HIDToolApp(tk.Tk):
         self._raw_thread._ready_event.wait(timeout=3.0)
 
         self._listening = True
-        self._listen_btn.config(text="停止監聽", bg="#f44336")
+        self._listen_btn.config(text="停止監聽", style="Stop.TButton")
         self._status_var.set("監聽中...")
 
     def _stop_listen(self):
@@ -1224,7 +1378,7 @@ class HIDToolApp(tk.Tk):
             self._raw_thread.stop()
             self._raw_thread = None
         self._listening = False
-        self._listen_btn.config(text="開始監聽", bg="#4CAF50")
+        self._listen_btn.config(text="開始監聽", style="Start.TButton")
         self._status_var.set("已停止監聽")
 
     # ------------------------------------------------------------------
@@ -1445,6 +1599,9 @@ class HIDToolApp(tk.Tk):
             return
         pending, self._table_pending = self._table_pending, []
         for row, row_tags in pending:
+            self._table_row_seq += 1
+            if not row_tags and self._table_row_seq % 2 == 0:
+                row_tags = ("stripe",)
             self._table.insert("", 0, values=row, tags=row_tags)
         try:
             max_rows = max(50, int(self._max_rows_var.get()))
@@ -1704,6 +1861,7 @@ class HIDToolApp(tk.Tk):
         for iid in self._table.get_children():
             self._table.delete(iid)
         self._frame_seq = 0
+        self._table_row_seq = 0
         self._error_count = 0
         self._error_var.set("")
 
@@ -1920,20 +2078,20 @@ class HIDToolApp(tk.Tk):
     ]
 
     def _build_canvas_tab(self, parent):
-        info_row = tk.Frame(parent)
-        info_row.pack(side=tk.TOP, fill=tk.X, padx=4, pady=2)
+        info_row = ttk.Frame(parent)
+        info_row.pack(side=tk.TOP, fill=tk.X, padx=4, pady=4)
 
         self._canvas_info_var = tk.StringVar(value="（尚未載入裝置）")
-        tk.Label(info_row, textvariable=self._canvas_info_var,
-                 font=("Consolas", 9), fg="#555").pack(side=tk.LEFT)
+        ttk.Label(info_row, textvariable=self._canvas_info_var,
+                  font=("Consolas", 9), style="Muted.TLabel").pack(side=tk.LEFT)
 
-        tk.Button(info_row, text="清除", command=self._clear_canvas).pack(side=tk.RIGHT, padx=4)
-        tk.Button(info_row, text="Export Excel",
-                  command=self._export_monitor_to_excel).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(info_row, text="清除", command=self._clear_canvas).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(info_row, text="Export Excel",
+                   command=self._export_monitor_to_excel).pack(side=tk.RIGHT, padx=4)
 
         self._touch_canvas = tk.Canvas(
             parent, bg="white", cursor="crosshair",
-            highlightthickness=1, highlightbackground="#aaaaaa",
+            highlightthickness=1, highlightbackground=self._BORDER,
         )
         self._touch_canvas.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
         self._touch_canvas.bind("<Configure>", lambda *_: self._redraw_canvas())
@@ -1955,13 +2113,13 @@ class HIDToolApp(tk.Tk):
 
         self._stress_feature_dir = tk.StringVar(value="Set")
         self._stress_dir_lbl = ttk.Label(cmd_frame, text="方向:")
-        self._stress_dir_lbl.grid(row=0, column=3, sticky="w", padx=(20, 4))
+        self._stress_dir_lbl.grid(row=0, column=4, sticky="w", padx=(20, 4))
         self._stress_dir_set_rb = ttk.Radiobutton(cmd_frame, text="Set", variable=self._stress_feature_dir,
                                                    value="Set", command=self._stress_update_cmd_ui)
-        self._stress_dir_set_rb.grid(row=0, column=4, sticky="w")
+        self._stress_dir_set_rb.grid(row=0, column=5, sticky="w")
         self._stress_dir_get_rb = ttk.Radiobutton(cmd_frame, text="Get", variable=self._stress_feature_dir,
                                                    value="Get", command=self._stress_update_cmd_ui)
-        self._stress_dir_get_rb.grid(row=0, column=5, sticky="w")
+        self._stress_dir_get_rb.grid(row=0, column=6, sticky="w")
 
         ttk.Label(cmd_frame, text="Report ID (hex):").grid(row=1, column=0, sticky="w", padx=4, pady=4)
         self._stress_report_id_var = tk.StringVar(value="01")
@@ -2030,15 +2188,14 @@ class HIDToolApp(tk.Tk):
         self._poll_count_var = tk.StringVar(value="1")
         ttk.Spinbox(poll_frame, from_=1, to=100, textvariable=self._poll_count_var, width=5).grid(row=2, column=3, sticky="w", pady=(4, 0))
 
-        ctrl_row = tk.Frame(parent)
+        ctrl_row = ttk.Frame(parent)
         ctrl_row.pack(fill=tk.X, padx=8, pady=4)
-        self._stress_start_btn = tk.Button(
-            ctrl_row, text="開始壓測", command=self._stress_toggle,
-            bg="#4CAF50", fg="white", font=("Arial", 10, "bold"), padx=12, pady=4,
+        self._stress_start_btn = ttk.Button(
+            ctrl_row, text="開始壓測", command=self._stress_toggle, style="Start.TButton",
         )
         self._stress_start_btn.pack(side=tk.LEFT, padx=4)
-        tk.Button(ctrl_row, text="清除記錄", command=self._stress_log_clear).pack(side=tk.LEFT, padx=4)
-        tk.Button(ctrl_row, text="Export CSV", command=self._stress_export_csv).pack(side=tk.LEFT, padx=4)
+        ttk.Button(ctrl_row, text="清除記錄", command=self._stress_log_clear).pack(side=tk.LEFT, padx=4)
+        ttk.Button(ctrl_row, text="Export CSV", command=self._stress_export_csv).pack(side=tk.LEFT, padx=4)
 
         stats_frame = ttk.LabelFrame(parent, text="統計", padding=6)
         stats_frame.pack(fill=tk.X, padx=8, pady=2)
@@ -2072,6 +2229,7 @@ class HIDToolApp(tk.Tk):
         log_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 8))
         self._stress_log = scrolledtext.ScrolledText(
             log_frame, height=12, state="disabled", font=("Consolas", 9))
+        self._style_log_text(self._stress_log)
         self._stress_log.pack(fill=tk.BOTH, expand=True)
 
         self._stress_update_cmd_ui()
@@ -2365,7 +2523,7 @@ class HIDToolApp(tk.Tk):
         self._stress_touch_had_no_conf = False
         self._stress_pending           = False
         self._stress_records           = []
-        self._stress_start_btn.config(text="停止壓測", bg="#e74c3c")
+        self._stress_start_btn.config(text="停止壓測", style="Stop.TButton")
         self._stress_status_var.set("運行中")
         self._stress_log_clear()
         self._stress_log_append("=== 壓測開始 ===")
@@ -2397,7 +2555,7 @@ class HIDToolApp(tk.Tk):
             f"=== 壓測結束 === 共 {self._stress_count} 次  "
             f"通過 {pass_count}  失敗 {self._stress_fail_count}  耗時 {elapsed:.1f}s"
         )
-        self._stress_start_btn.config(text="開始壓測", bg="#4CAF50")
+        self._stress_start_btn.config(text="開始壓測", style="Start.TButton")
         self._stress_status_var.set("已停止")
         self._stress_update_stats()
         if self._stress_post_var.get():
@@ -2668,6 +2826,9 @@ class HIDToolApp(tk.Tk):
     def destroy(self):
         self._hide_dev_tooltip()
         self._stop_listen()
+        if getattr(self, "_devchange_thread", None):
+            self._devchange_thread.stop()
+            self._devchange_thread = None
         super().destroy()
 
 
