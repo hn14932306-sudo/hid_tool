@@ -158,7 +158,7 @@ class HIDToolApp(tk.Tk):
         self._hm_frames:        List           = []
         self._hm_used_tx:       Optional[int]  = None
         self._hm_cur_frame:     int            = 0
-        self._hm_lut:           List           = heatmap_frame.build_lut("coolwarm")
+        self._hm_lut:           List           = heatmap_frame.build_lut("seismic")
         self._hm_worker:        Optional[threading.Thread] = None
         self._hm_cancel:        Optional[threading.Event]  = None
         self._hm_progress_q:    queue.Queue    = queue.Queue()
@@ -3154,7 +3154,7 @@ class HIDToolApp(tk.Tk):
         e_vmax.pack(side=tk.LEFT, padx=(2, 12))
 
         ttk.Label(param_row, text="colormap:").pack(side=tk.LEFT)
-        self._hm_cmap_var = tk.StringVar(value="coolwarm")
+        self._hm_cmap_var = tk.StringVar(value="seismic")
         cmap_cb = ttk.Combobox(param_row, textvariable=self._hm_cmap_var, width=12,
                                state="readonly", values=heatmap_frame.CMAP_NAMES)
         cmap_cb.pack(side=tk.LEFT, padx=(2, 12))
@@ -3597,16 +3597,15 @@ class HIDToolApp(tk.Tk):
         self._digi_frame_lbl = tk.StringVar(value="Frame - / -")
         ttk.Label(nav, textvariable=self._digi_frame_lbl, width=16,
                   font=("Consolas", 9)).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(nav, text="設目前幀", width=8,
+                   command=self._digi_set_start_to_cur).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Label(nav, text="起始幀:").pack(side=tk.LEFT, padx=(8, 2))
         self._digi_start_var = tk.StringVar(value="0")
         self._digi_start_spin = ttk.Spinbox(nav, from_=0, to=0, width=6,
-                                            textvariable=self._digi_start_var,
-                                            command=self._digi_on_start_changed)
+                                            textvariable=self._digi_start_var)
         self._digi_start_spin.pack(side=tk.LEFT)
-        self._digi_start_spin.bind("<Return>", lambda _e: self._digi_on_start_changed())
-        self._digi_start_spin.bind("<FocusOut>", lambda _e: self._digi_on_start_changed())
-        ttk.Button(nav, text="設目前幀", width=8,
-                   command=self._digi_set_start_to_cur).pack(side=tk.LEFT, padx=(4, 0))
+        # 打字/按箭頭即時套用，不必按 Enter
+        self._digi_start_var.trace_add("write", lambda *_a: self._digi_on_start_changed())
         self._digi_play_btn = ttk.Button(nav, text="▶ 播放", width=8,
                                          command=self._digi_toggle_play)
         self._digi_play_btn.pack(side=tk.LEFT, padx=(8, 0))
@@ -3785,8 +3784,9 @@ class HIDToolApp(tk.Tk):
         self._digi_request_redraw()
 
     def _digi_set_start_to_cur(self):
-        self._digi_start_var.set(str(self._digi_cur))
-        self._digi_on_start_changed()
+        # 播放中先暫停，擷取目前顯示的那一幀（避免抓到正在跑的幀）
+        self._digi_stop_play()
+        self._digi_start_var.set(str(self._digi_cur))   # trace 會套用
 
     # ---- 導覽 / 播放 ----
 
