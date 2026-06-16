@@ -462,7 +462,7 @@ class HIDToolApp(tk.Tk):
         self._canvas_toggle_btn = ttk.Button(ctrl_row, text="顯示畫布 ▶",
                                              command=self._toggle_monitor_canvas)
         self._canvas_toggle_btn.pack(side=tk.LEFT, padx=8)
-        ttk.Button(ctrl_row, text="清除", command=self._clear_log).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(ctrl_row, text="清除", command=self._clear_monitor_all).pack(side=tk.RIGHT, padx=4)
         ttk.Button(ctrl_row, text="Export Excel", command=self._export_monitor_to_excel).pack(side=tk.RIGHT, padx=4)
 
         # FF01 usage filter row
@@ -490,7 +490,7 @@ class HIDToolApp(tk.Tk):
         self._record_status_var = tk.StringVar(value="錄製 0")
         replay_row = ttk.Frame(parent)
         replay_row.pack(side=tk.TOP, fill=tk.X, padx=4, pady=(0, 2))
-        self._build_replay_controls(replay_row, with_clear=True)
+        self._build_replay_controls(replay_row)
 
         # 表格 | 畫布 水平分割（畫布預設收合，可由「顯示畫布」展開）
         self._monitor_split = tk.PanedWindow(parent, orient=tk.HORIZONTAL,
@@ -1967,11 +1967,16 @@ class HIDToolApp(tk.Tk):
         self._error_count = 0
         self._error_var.set("")
 
+    def _clear_monitor_all(self):
+        """單一清除：監聽表格、畫布、錄製緩衝一次全部清空。"""
+        self._replay_clear()                  # 結束回放 + 清空錄製緩衝/時間軸
+        self._reset_monitor_runtime_state()   # 清空表格 + 畫布 + 執行期狀態
+
     # ------------------------------------------------------------------
     # Monitor: Record / Replay（記憶體回放）
     # ------------------------------------------------------------------
 
-    def _build_replay_controls(self, parent, with_clear=False):
+    def _build_replay_controls(self, parent):
         """在指定列建立一組回放控制（監聽與畫布分頁共用同一回放引擎）。"""
         btn = ttk.Button(parent, text="▶ 回放", width=8, command=self._replay_toggle)
         btn.pack(side=tk.LEFT)
@@ -1987,9 +1992,6 @@ class HIDToolApp(tk.Tk):
                   font=("Consolas", 9)).pack(side=tk.LEFT)
         ttk.Label(parent, textvariable=self._record_status_var, style="Muted.TLabel",
                   width=10, anchor=tk.E).pack(side=tk.LEFT, padx=(6, 0))
-        if with_clear:
-            ttk.Button(parent, text="清除錄製",
-                       command=self._replay_clear).pack(side=tk.LEFT, padx=(6, 0))
 
     def _replay_set_btn_text(self, text):
         for b in self._replay_btns:
@@ -2376,8 +2378,6 @@ class HIDToolApp(tk.Tk):
         ttk.Label(info_row, textvariable=self._canvas_info_var,
                   font=("Consolas", 9), style="Muted.TLabel").pack(side=tk.LEFT)
 
-        ttk.Button(info_row, text="清除", command=self._clear_canvas).pack(side=tk.RIGHT, padx=4)
-
         self._touch_canvas = tk.Canvas(
             parent, bg="white", cursor="crosshair",
             highlightthickness=1, highlightbackground=self._BORDER,
@@ -2681,10 +2681,12 @@ class HIDToolApp(tk.Tk):
                     flat.append(pad + (pt_x - x_min) * xs)
                     flat.append(pad + (pt_y - y_min) * ys)
                 line_id = self._canvas_trail_line_ids.get(track_key)
-                if line_id is not None:
+                try:
+                    if line_id is None:
+                        raise tk.TclError
                     c.coords(line_id, flat)
                     c.itemconfig(line_id, width=line_width)
-                else:
+                except tk.TclError:
                     line_id = c.create_line(
                         flat, fill=color, width=line_width,
                         capstyle=tk.ROUND, joinstyle=tk.ROUND,
@@ -2693,11 +2695,13 @@ class HIDToolApp(tk.Tk):
                     self._canvas_trail_line_ids[track_key] = line_id
 
             ids = self._canvas_item_ids.get(track_key)
-            if ids:
+            try:
+                if not ids:
+                    raise tk.TclError
                 oval_id, text_id = ids
                 c.coords(oval_id, new_cx - r, new_cy - r, new_cx + r, new_cy + r)
                 c.coords(text_id, new_cx, new_cy)
-            else:
+            except tk.TclError:
                 contact_tag = f"contact_{track_key}"
                 oval_id = c.create_oval(
                     new_cx - r, new_cy - r, new_cx + r, new_cy + r,
@@ -2783,6 +2787,10 @@ class HIDToolApp(tk.Tk):
         self._canvas_prev_active.clear()
         self._canvas_item_ids.clear()
         self._canvas_trail_line_ids.clear()
+        # 一併清掉待處理的 key，避免 pending flush 動到已清除的舊狀態
+        self._canvas_dirty_keys.clear()
+        self._canvas_circle_del_keys.clear()
+        self._canvas_trail_reset_keys.clear()
         self._redraw_canvas()
 
     # ------------------------------------------------------------------
