@@ -33,6 +33,7 @@ from hid_rawinput import RawInputThread, DeviceChangeThread
 from hid_device import (
     enumerate_hid_devices,
     format_device_label,
+    device_collection,
     read_descriptor_via_hidapi,
     send_output_report,
     send_feature_report,
@@ -594,7 +595,7 @@ class HIDToolApp(tk.Tk):
             self._raw_descriptors.clear()
         self._hidapi_devices = sorted(
             enumerate_hid_devices(),
-            key=lambda d: (d.get("vendor_id", 0), d.get("product_id", 0)),
+            key=lambda d: (d.get("vendor_id", 0), d.get("product_id", 0), device_collection(d)),
         )
         labels = [format_device_label(d) for d in self._hidapi_devices]
         paths  = [self._get_dev_path_str(d) for d in self._hidapi_devices]

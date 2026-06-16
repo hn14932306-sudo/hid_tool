@@ -113,6 +113,15 @@ def enumerate_hid_devices() -> List[dict]:
 _COL_RE = re.compile(r"&Col(\d+)", re.IGNORECASE)
 
 
+def device_collection(dev: dict) -> int:
+    """從裝置 path 取出 collection 編號（&ColNN）；無則回傳 -1（TLC）。"""
+    path = dev.get("path", b"")
+    if isinstance(path, bytes):
+        path = path.decode("utf-8", errors="replace")
+    m = _COL_RE.search(path)
+    return int(m.group(1)) if m else -1
+
+
 def format_device_label(dev: dict) -> str:
     vid  = dev.get("vendor_id",  0)
     pid  = dev.get("product_id", 0)
