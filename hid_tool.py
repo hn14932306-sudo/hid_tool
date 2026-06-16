@@ -11,10 +11,13 @@ import queue
 import threading
 import time
 import tkinter as tk
+import webbrowser
 import zipfile
 from tkinter import filedialog, messagebox, ttk, scrolledtext
 from typing import Dict, List, Optional, Tuple
 from xml.sax.saxutils import escape
+
+import heatmap_frame
 
 from hid_descriptor import (
     HIDField,
@@ -133,6 +136,20 @@ class HIDToolApp(tk.Tk):
         self._stress_delay_id:         Optional[str] = None
         self._stress_poll_id:          Optional[str] = None
         self._stress_records:          List[dict]    = []
+
+        # Heatmap tab state
+        self._hm_frames:        List           = []
+        self._hm_used_tx:       Optional[int]  = None
+        self._hm_cur_frame:     int            = 0
+        self._hm_lut:           List           = heatmap_frame.build_lut("coolwarm")
+        self._hm_worker:        Optional[threading.Thread] = None
+        self._hm_cancel:        Optional[threading.Event]  = None
+        self._hm_progress_q:    queue.Queue    = queue.Queue()
+        self._hm_drain_id:      Optional[str]  = None
+        self._hm_output_files:  List[str]      = []
+        self._hm_redraw_pending: bool          = False
+        self._hm_playing:       bool           = False
+        self._hm_play_id:       Optional[str]  = None
 
         self._build_ui()
         self._refresh_devices()
@@ -356,6 +373,10 @@ class HIDToolApp(tk.Tk):
         stress_tab = ttk.Frame(self._notebook)
         self._notebook.add(stress_tab, text="壓測")
         self._build_stress_tab(stress_tab)
+
+        heatmap_tab = ttk.Frame(self._notebook)
+        self._notebook.add(heatmap_tab, text="熱圖")
+        self._build_heatmap_tab(heatmap_tab)
 
     def _build_monitor_tab(self, parent):
         ctrl_row = ttk.Frame(parent)
@@ -2824,6 +2845,424 @@ class HIDToolApp(tk.Tk):
             messagebox.showerror("錯誤", f"匯出失敗: {e}")
 
     # ------------------------------------------------------------------
+    # Heatmap tab — 韌體觸控矩陣 TXT 轉熱圖
+    # ------------------------------------------------------------------
+
+    def _build_heatmap_tab(self, parent):
+        pad = {"padx": 8, "pady": 4}
+
+        # 檔案選擇
+        file_row = ttk.Frame(parent)
+        file_row.pack(fill=tk.X, **pad)
+        ttk.Label(file_row, text="TXT 檔案:", width=8, anchor="e").pack(side=tk.LEFT)
+        self._hm_path_var = tk.StringVar()
+        ttk.Entry(file_row, textvariable=self._hm_path_var).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 6))
+        ttk.Button(file_row, text="瀏覽…", command=self._hm_browse).pack(side=tk.LEFT)
+
+        # 參數
+        param_row = ttk.Frame(parent)
+        param_row.pack(fill=tk.X, **pad)
+        ttk.Label(param_row, text="vmin:").pack(side=tk.LEFT)
+        self._hm_vmin_var = tk.StringVar(value="-1000")
+        e_vmin = ttk.Entry(param_row, textvariable=self._hm_vmin_var, width=8)
+        e_vmin.pack(side=tk.LEFT, padx=(2, 12))
+        ttk.Label(param_row, text="vmax:").pack(side=tk.LEFT)
+        self._hm_vmax_var = tk.StringVar(value="1000")
+        e_vmax = ttk.Entry(param_row, textvariable=self._hm_vmax_var, width=8)
+        e_vmax.pack(side=tk.LEFT, padx=(2, 12))
+
+        ttk.Label(param_row, text="colormap:").pack(side=tk.LEFT)
+        self._hm_cmap_var = tk.StringVar(value="coolwarm")
+        cmap_cb = ttk.Combobox(param_row, textvariable=self._hm_cmap_var, width=12,
+                               state="readonly", values=heatmap_frame.CMAP_NAMES)
+        cmap_cb.pack(side=tk.LEFT, padx=(2, 12))
+
+        ttk.Label(param_row, text="每檔 Frames:").pack(side=tk.LEFT, padx=(8, 0))
+        self._hm_chunk_var = tk.StringVar(value="500")
+        ttk.Spinbox(param_row, from_=10, to=99999, increment=50,
+                    textvariable=self._hm_chunk_var, width=7).pack(side=tk.LEFT, padx=(2, 0))
+
+        for w in (e_vmin, e_vmax):
+            w.bind("<Return>", lambda _e: self._hm_on_range_changed())
+            w.bind("<FocusOut>", lambda _e: self._hm_on_range_changed())
+        cmap_cb.bind("<<ComboboxSelected>>", lambda _e: self._hm_on_cmap_changed())
+
+        # colormap 預覽色帶
+        self._hm_cmap_canvas = tk.Canvas(parent, height=38, bg=self._SURFACE,
+                                         highlightthickness=1, highlightbackground=self._BORDER)
+        self._hm_cmap_canvas.pack(fill=tk.X, padx=8, pady=(0, 2))
+        self._hm_cmap_canvas.bind("<Configure>", lambda _e: self._hm_redraw_cmap_preview())
+
+        # frame 導覽
+        nav_row = ttk.Frame(parent)
+        nav_row.pack(fill=tk.X, **pad)
+        ttk.Button(nav_row, text="◀", width=3,
+                   command=lambda: self._hm_step_frame(-1)).pack(side=tk.LEFT)
+        self._hm_frame_var = tk.IntVar(value=0)
+        self._hm_scale = ttk.Scale(nav_row, from_=0, to=0, orient=tk.HORIZONTAL,
+                                   command=self._hm_on_scale)
+        self._hm_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        ttk.Button(nav_row, text="▶", width=3,
+                   command=lambda: self._hm_step_frame(1)).pack(side=tk.LEFT)
+        self._hm_frame_lbl = tk.StringVar(value="Frame - / -")
+        ttk.Label(nav_row, textvariable=self._hm_frame_lbl, width=18,
+                  font=("Consolas", 9)).pack(side=tk.LEFT, padx=(8, 0))
+
+        self._hm_play_btn = ttk.Button(nav_row, text="▶ 播放", width=8,
+                                       command=self._hm_toggle_play)
+        self._hm_play_btn.pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(nav_row, text="速度:").pack(side=tk.LEFT, padx=(8, 2))
+        self._hm_speed_var = tk.StringVar(value="10 fps")
+        ttk.Combobox(nav_row, textvariable=self._hm_speed_var, width=8, state="readonly",
+                     values=("2 fps", "5 fps", "10 fps", "15 fps", "20 fps", "30 fps"),
+                     ).pack(side=tk.LEFT)
+        self._hm_loop_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(nav_row, text="循環", variable=self._hm_loop_var).pack(side=tk.LEFT, padx=(8, 0))
+
+        # frame 熱圖畫布
+        self._hm_canvas = tk.Canvas(parent, bg=self._SURFACE, highlightthickness=1,
+                                    highlightbackground=self._BORDER)
+        self._hm_canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
+        self._hm_canvas.bind("<Configure>", lambda _e: self._hm_request_redraw())
+
+        # 匯出 / 進度
+        bottom = ttk.Frame(parent)
+        bottom.pack(fill=tk.X, **pad)
+        self._hm_export_btn = ttk.Button(bottom, text="匯出 HTML", command=self._hm_export)
+        self._hm_export_btn.pack(side=tk.LEFT)
+        self._hm_cancel_btn = ttk.Button(bottom, text="取消", command=self._hm_cancel_export,
+                                         state="disabled")
+        self._hm_cancel_btn.pack(side=tk.LEFT, padx=6)
+        ttk.Button(bottom, text="開啟輸出資料夾",
+                   command=self._hm_open_outdir).pack(side=tk.LEFT, padx=6)
+        self._hm_progress = tk.DoubleVar(value=0.0)
+        ttk.Progressbar(bottom, variable=self._hm_progress, maximum=100).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 6))
+        self._hm_status_var = tk.StringVar(value="尚未載入檔案")
+        ttk.Label(bottom, textvariable=self._hm_status_var, style="Muted.TLabel",
+                  width=22, anchor=tk.E).pack(side=tk.LEFT)
+
+        self._hm_redraw_cmap_preview()
+
+    def _hm_browse(self):
+        path = filedialog.askopenfilename(
+            title="選擇觸控矩陣 TXT",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if path:
+            self._hm_path_var.set(path)
+            self._hm_load_file(path)
+
+    def _hm_load_file(self, path: str):
+        self._hm_stop_play()
+        self._hm_status_var.set("解析中…")
+
+        def worker():
+            try:
+                frames, used_tx, stats = heatmap_frame.parse_frames(path)
+            except Exception as exc:
+                self.after(0, lambda: self._hm_status_var.set(f"解析失敗: {exc}"))
+                return
+
+            def apply():
+                self._hm_frames = frames
+                self._hm_used_tx = used_tx
+                self._hm_cur_frame = 0
+                self._hm_output_files = []
+                n = len(frames)
+                if n == 0:
+                    self._hm_scale.configure(to=0)
+                    self._hm_frame_lbl.set("Frame - / -")
+                    self._hm_canvas.delete("all")
+                    self._hm_status_var.set("檔案中沒有 frame")
+                    return
+                self._hm_scale.configure(to=n - 1)
+                self._hm_scale.set(0)
+                msg = f"{n} frames, Used_Tx={used_tx}"
+                if stats["skipped_lines"]:
+                    msg += f", 略過 {stats['skipped_lines']} 行"
+                self._hm_status_var.set(msg)
+                self._hm_redraw_frame()
+
+            self.after(0, apply)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _hm_parse_range(self) -> Optional[Tuple[float, float]]:
+        try:
+            vmin = float(self._hm_vmin_var.get())
+            vmax = float(self._hm_vmax_var.get())
+        except ValueError:
+            return None
+        if vmax <= vmin:
+            return None
+        return vmin, vmax
+
+    def _hm_on_range_changed(self):
+        self._hm_redraw_cmap_preview()
+        self._hm_request_redraw()
+
+    def _hm_on_cmap_changed(self):
+        self._hm_lut = heatmap_frame.build_lut(self._hm_cmap_var.get())
+        self._hm_redraw_cmap_preview()
+        self._hm_request_redraw()
+
+    def _hm_redraw_cmap_preview(self):
+        c = self._hm_cmap_canvas
+        c.delete("all")
+        w = c.winfo_width()
+        h = c.winfo_height()
+        if w <= 1 or h <= 1:
+            return
+        rng = self._hm_parse_range()
+        if rng is None:
+            c.create_text(8, h // 2, anchor="w", fill=self._RED,
+                          text="vmin / vmax 無效（需數值且 vmax > vmin）")
+            return
+        vmin, vmax = rng
+        pad_x = 8
+        bar_w = max(1, w - 2 * pad_x)
+        bar_h = 14
+        y0 = 4
+        lut = self._hm_lut
+        n = len(lut)
+        for i in range(bar_w):
+            bg = lut[int(i / bar_w * (n - 1))][0]
+            x = pad_x + i
+            c.create_line(x, y0, x, y0 + bar_h, fill=bg)
+        c.create_rectangle(pad_x, y0, pad_x + bar_w, y0 + bar_h, outline="#888")
+        ly = y0 + bar_h + 3
+        c.create_text(pad_x, ly, anchor="nw", fill=self._TEXT_MUTED,
+                      font=("Consolas", 8), text=f"{vmin:g}")
+        c.create_text(pad_x + bar_w // 2, ly, anchor="n", fill=self._TEXT_MUTED,
+                      font=("Consolas", 8), text=f"{(vmin + vmax) / 2:g}")
+        c.create_text(pad_x + bar_w, ly, anchor="ne", fill=self._TEXT_MUTED,
+                      font=("Consolas", 8), text=f"{vmax:g}")
+
+    def _hm_on_scale(self, _val):
+        idx = int(float(self._hm_scale.get()))
+        if idx != self._hm_cur_frame:
+            self._hm_cur_frame = idx
+            self._hm_request_redraw()
+
+    def _hm_step_frame(self, delta: int):
+        if not self._hm_frames:
+            return
+        idx = max(0, min(len(self._hm_frames) - 1, self._hm_cur_frame + delta))
+        if idx != self._hm_cur_frame:
+            self._hm_cur_frame = idx
+            self._hm_scale.set(idx)
+            self._hm_request_redraw()
+
+    def _hm_toggle_play(self):
+        if self._hm_playing:
+            self._hm_stop_play()
+        else:
+            self._hm_start_play()
+
+    def _hm_start_play(self):
+        if not self._hm_frames or len(self._hm_frames) < 2:
+            return
+        # 已在最後一張且不循環 → 從頭播
+        if not self._hm_loop_var.get() and self._hm_cur_frame >= len(self._hm_frames) - 1:
+            self._hm_cur_frame = 0
+            self._hm_scale.set(0)
+            self._hm_request_redraw()
+        self._hm_playing = True
+        self._hm_play_btn.config(text="⏸ 暫停")
+        self._hm_play_tick()
+
+    def _hm_stop_play(self):
+        self._hm_playing = False
+        if self._hm_play_id:
+            self.after_cancel(self._hm_play_id)
+            self._hm_play_id = None
+        self._hm_play_btn.config(text="▶ 播放")
+
+    def _hm_play_tick(self):
+        self._hm_play_id = None
+        if not self._hm_playing or not self._hm_frames:
+            return
+        last = len(self._hm_frames) - 1
+        nxt = self._hm_cur_frame + 1
+        if nxt > last:
+            if self._hm_loop_var.get():
+                nxt = 0
+            else:
+                self._hm_stop_play()
+                return
+        self._hm_cur_frame = nxt
+        self._hm_scale.set(nxt)
+        self._hm_request_redraw()
+        try:
+            fps = int(self._hm_speed_var.get().split()[0])
+        except (ValueError, IndexError):
+            fps = 10
+        self._hm_play_id = self.after(max(16, int(1000 / max(1, fps))), self._hm_play_tick)
+
+    def _hm_request_redraw(self):
+        """節流：合併連續的重畫請求到 idle 時做一次。"""
+        if not self._hm_redraw_pending:
+            self._hm_redraw_pending = True
+            self.after_idle(self._hm_redraw_frame)
+
+    def _hm_redraw_frame(self):
+        self._hm_redraw_pending = False
+        c = self._hm_canvas
+        c.delete("all")
+        if not self._hm_frames:
+            return
+        idx = self._hm_cur_frame
+        self._hm_frame_lbl.set(f"Frame {idx} / {len(self._hm_frames) - 1}")
+        frame = self._hm_frames[idx]
+        rows = len(frame)
+        cols = max((len(r) for r in frame), default=0)
+        if rows == 0 or cols == 0:
+            return
+        rng = self._hm_parse_range()
+        if rng is None:
+            c.create_text(10, 10, anchor="nw", fill=self._RED,
+                          text="vmin / vmax 無效")
+            return
+        vmin, vmax = rng
+
+        w = c.winfo_width()
+        h = c.winfo_height()
+        if w <= 1 or h <= 1:
+            return
+        pad = 6
+        gap = 4 if (self._hm_used_tx is not None and 0 < self._hm_used_tx < rows) else 0
+        cell_w = (w - 2 * pad) / cols
+        cell_h = (h - 2 * pad - gap) / rows
+        if cell_w <= 0 or cell_h <= 0:
+            return
+        show_text = cell_w >= 22 and cell_h >= 13
+        lut = self._hm_lut
+
+        for r in range(rows):
+            row = frame[r]
+            y_off = gap if (gap and r >= self._hm_used_tx) else 0
+            y0 = pad + r * cell_h + y_off
+            for col in range(cols):
+                val = row[col] if col < len(row) else None
+                bg, txt = heatmap_frame.cell_color(val, vmin, vmax, lut)
+                x0 = pad + col * cell_w
+                c.create_rectangle(x0, y0, x0 + cell_w, y0 + cell_h,
+                                   fill=bg, outline=bg)
+                if show_text and val is not None:
+                    c.create_text(x0 + cell_w - 2, y0 + cell_h / 2, anchor="e",
+                                  text=str(val), fill=txt, font=("Consolas", 8))
+
+    def _hm_compute_workers(self) -> int:
+        cores = os.cpu_count() or 4
+        return max(1, min(4, cores - 1))
+
+    def _hm_export(self):
+        if self._hm_worker and self._hm_worker.is_alive():
+            return
+        if not self._hm_frames:
+            messagebox.showinfo("匯出 HTML", "請先載入有資料的 TXT 檔。")
+            return
+        rng = self._hm_parse_range()
+        if rng is None:
+            messagebox.showerror("匯出 HTML", "vmin / vmax 無效（需數值且 vmax > vmin）。")
+            return
+        try:
+            chunk = max(1, int(self._hm_chunk_var.get()))
+        except ValueError:
+            messagebox.showerror("匯出 HTML", "每檔 Frames 需為正整數。")
+            return
+        vmin, vmax = rng
+        path = self._hm_path_var.get().strip()
+        lut = self._hm_lut
+        frames = self._hm_frames
+        used_tx = self._hm_used_tx
+        workers = self._hm_compute_workers()
+
+        self._hm_set_running(True)
+        self._hm_progress.set(0)
+        self._hm_status_var.set("匯出中… 0%")
+        self._hm_cancel = threading.Event()
+        cancel = self._hm_cancel
+
+        def progress_cb(done, total):
+            self._hm_progress_q.put(("progress", done, total))
+
+        def worker():
+            try:
+                outs = heatmap_frame.export_html(
+                    frames, used_tx, vmin, vmax, lut, path,
+                    chunk_size=chunk, progress_cb=progress_cb,
+                    cancel_event=cancel, max_workers=workers,
+                )
+                if cancel.is_set():
+                    self._hm_progress_q.put(("done", False, "已取消", []))
+                else:
+                    self._hm_progress_q.put(("done", True, f"完成 {len(outs)} 個檔", outs))
+            except Exception as exc:
+                self._hm_progress_q.put(("done", False, f"失敗: {exc}", []))
+
+        self._hm_worker = threading.Thread(target=worker, daemon=True)
+        self._hm_worker.start()
+        self._hm_schedule_drain()
+
+    def _hm_cancel_export(self):
+        if self._hm_cancel:
+            self._hm_cancel.set()
+            self._hm_status_var.set("取消中…")
+
+    def _hm_schedule_drain(self):
+        if self._hm_drain_id is None:
+            self._hm_drain_id = self.after(100, self._hm_drain_queue)
+
+    def _hm_drain_queue(self):
+        self._hm_drain_id = None
+        try:
+            while True:
+                kind, *rest = self._hm_progress_q.get_nowait()
+                if kind == "progress":
+                    done, total = rest
+                    pct = done * 100.0 / max(1, total)
+                    self._hm_progress.set(pct)
+                    self._hm_status_var.set(f"匯出中… {pct:.0f}%")
+                elif kind == "done":
+                    ok, msg, outs = rest
+                    self._hm_output_files = outs
+                    self._hm_set_running(False)
+                    self._hm_progress.set(100 if ok else 0)
+                    self._hm_status_var.set(msg)
+                    if ok and outs:
+                        try:
+                            webbrowser.open(outs[0])
+                        except Exception:
+                            pass
+        except queue.Empty:
+            pass
+        if self._hm_worker and self._hm_worker.is_alive():
+            self._hm_schedule_drain()
+
+    def _hm_open_outdir(self):
+        if not self._hm_output_files:
+            messagebox.showinfo("提示", "尚未匯出任何 HTML。")
+            return
+        outdir = os.path.dirname(self._hm_output_files[0])
+        try:
+            webbrowser.open(outdir)
+        except Exception:
+            messagebox.showwarning("警告", f"無法開啟資料夾：{outdir}")
+
+    def _hm_set_running(self, running: bool):
+        if running:
+            self._hm_export_btn.configure(state="disabled")
+            self._hm_cancel_btn.configure(state="normal")
+        else:
+            self._hm_export_btn.configure(state="normal")
+            self._hm_cancel_btn.configure(state="disabled")
+            self._hm_cancel = None
+            self._hm_worker = None
+
+    # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------
 
@@ -2833,6 +3272,8 @@ class HIDToolApp(tk.Tk):
         if getattr(self, "_devchange_thread", None):
             self._devchange_thread.stop()
             self._devchange_thread = None
+        if getattr(self, "_hm_cancel", None):
+            self._hm_cancel.set()
         super().destroy()
 
 
@@ -2841,4 +3282,6 @@ class HIDToolApp(tk.Tk):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()   # 熱圖匯出用 ProcessPool；打包後必要，否則子行程會重開視窗
     HIDToolApp().mainloop()
