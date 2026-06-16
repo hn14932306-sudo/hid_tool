@@ -18,6 +18,7 @@ from typing import Dict, List, Optional, Tuple
 from xml.sax.saxutils import escape
 
 import heatmap_frame
+import digiinfo_parse
 
 from hid_descriptor import (
     HIDField,
@@ -65,6 +66,8 @@ class HIDToolApp(tk.Tk):
     _FONT_UI      = ("Microsoft JhengHei UI", 9)
     _FONT_UI_BOLD = ("Microsoft JhengHei UI", 9, "bold")
     _FONT_MONO    = ("Consolas", 9)
+
+    _RECORD_MAX   = 50000   # 監聽回放的封包環形緩衝上限（約數 MB）
 
     def __init__(self):
         super().__init__()
@@ -122,6 +125,20 @@ class HIDToolApp(tk.Tk):
         self._scan_delta_suppress: bool                  = False  # 觸控中斷後下一個 frame 的 Δ 不列入錯誤
         self._error_count:      int                      = 0
 
+        # Record / replay state（監聽回放）
+        self._record_buf:       collections.deque        = collections.deque(maxlen=self._RECORD_MAX)
+        self._replay_active:    bool                     = False
+        self._replay_data:      List[dict]               = []
+        self._replay_idx:       int                      = 0
+        self._replay_wall0:     float                    = 0.0   # 回放開始的牆鐘時間
+        self._replay_t0:        float                    = 0.0   # 對應的虛擬 rx_time 起點
+        self._replay_after_id:  Optional[str]            = None
+        self._replay_speed:     float                    = 1.0
+        self._replay_paused_at: int                      = 0
+        self._replay_sync:      bool                     = False  # 程式設定滑桿時，忽略 on_scale
+        self._replay_btns:      List                     = []     # 監聽/畫布分頁的回放按鈕（同步）
+        self._replay_scales:    List                     = []     # 監聽/畫布分頁的時間軸滑桿（同步）
+
         # Command device (separate from monitor device)
         self._cmd_dev:           Optional[dict] = None  # None = use _selected_dev
 
@@ -150,6 +167,22 @@ class HIDToolApp(tk.Tk):
         self._hm_redraw_pending: bool          = False
         self._hm_playing:       bool           = False
         self._hm_play_id:       Optional[str]  = None
+
+        # DigiInfo XML 軌跡分頁 state
+        self._digi_frames:      List[dict]     = []
+        self._digi_wide_rows:   List[dict]     = []
+        self._digi_wide_cols:   List[str]      = []
+        self._digi_long_rows:   List[dict]     = []
+        self._digi_long_cols:   List[str]      = []
+        self._digi_stats:       dict           = {}
+        self._digi_cur:         int            = 0
+        self._digi_start:       int            = 0   # 起始幀（之前的不顯示）
+        self._digi_bounds:      Tuple[float, float, float, float] = (0.0, 1.0, 0.0, 1.0)
+        self._digi_playing:     bool           = False
+        self._digi_play_id:     Optional[str]  = None
+        self._digi_redraw_pending: bool        = False
+        self._digi_table_visible:  bool        = False
+        self._digi_render_token:   int         = 0
 
         self._build_ui()
         self._refresh_devices()
@@ -366,17 +399,23 @@ class HIDToolApp(tk.Tk):
         self._notebook.add(send_tab, text="發送")
         self._build_send_tab(send_tab)
 
-        canvas_tab = ttk.Frame(self._notebook)
-        self._notebook.add(canvas_tab, text="畫布")
-        self._build_canvas_tab(canvas_tab)
-
         stress_tab = ttk.Frame(self._notebook)
         self._notebook.add(stress_tab, text="壓測")
         self._build_stress_tab(stress_tab)
 
-        heatmap_tab = ttk.Frame(self._notebook)
-        self._notebook.add(heatmap_tab, text="熱圖")
-        self._build_heatmap_tab(heatmap_tab)
+        # 回放分頁：內含 Differ / DigiInfo 兩個子分頁
+        replay_tab = ttk.Frame(self._notebook)
+        self._notebook.add(replay_tab, text="回放")
+        replay_nb = ttk.Notebook(replay_tab)
+        replay_nb.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+
+        heatmap_sub = ttk.Frame(replay_nb)
+        replay_nb.add(heatmap_sub, text="Differ")
+        self._build_heatmap_tab(heatmap_sub)
+
+        digi_sub = ttk.Frame(replay_nb)
+        replay_nb.add(digi_sub, text="DigiInfo")
+        self._build_digi_tab(digi_sub)
 
     def _build_monitor_tab(self, parent):
         ctrl_row = ttk.Frame(parent)
@@ -420,6 +459,9 @@ class HIDToolApp(tk.Tk):
         ttk.Checkbutton(ctrl_row, text="顯示 RAW 欄位",
                         variable=self._show_raw,
                         command=self._rebuild_table_columns).pack(side=tk.LEFT, padx=8)
+        self._canvas_toggle_btn = ttk.Button(ctrl_row, text="顯示畫布 ▶",
+                                             command=self._toggle_monitor_canvas)
+        self._canvas_toggle_btn.pack(side=tk.LEFT, padx=8)
         ttk.Button(ctrl_row, text="清除", command=self._clear_log).pack(side=tk.RIGHT, padx=4)
         ttk.Button(ctrl_row, text="Export Excel", command=self._export_monitor_to_excel).pack(side=tk.RIGHT, padx=4)
 
@@ -442,8 +484,22 @@ class HIDToolApp(tk.Tk):
         self._ff01_check_frame = ttk.Frame(self._ff01_filter_frame)
         self._ff01_check_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        tbl_frame = ttk.Frame(parent)
-        tbl_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
+        # 回放控制列
+        self._replay_speed_var = tk.StringVar(value="1x")
+        self._replay_pos_var = tk.StringVar(value="0 / 0")
+        self._record_status_var = tk.StringVar(value="錄製 0")
+        replay_row = ttk.Frame(parent)
+        replay_row.pack(side=tk.TOP, fill=tk.X, padx=4, pady=(0, 2))
+        self._build_replay_controls(replay_row, with_clear=True)
+
+        # 表格 | 畫布 水平分割（畫布預設收合，可由「顯示畫布」展開）
+        self._monitor_split = tk.PanedWindow(parent, orient=tk.HORIZONTAL,
+                                             sashrelief=tk.FLAT, sashwidth=6, bd=0,
+                                             bg=self._BG)
+        self._monitor_split.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
+
+        tbl_frame = ttk.Frame(self._monitor_split)
+        self._monitor_split.add(tbl_frame, minsize=300, stretch="always")
 
         self._table = ttk.Treeview(tbl_frame, show="headings", selectmode="browse",
                                    style="Mono.Treeview")
@@ -455,6 +511,11 @@ class HIDToolApp(tk.Tk):
         self._table.pack(fill=tk.BOTH, expand=True)
         self._table.tag_configure("scan_error", background="#ffd6d6")
         self._table.tag_configure("stripe", background=self._STRIPE)
+
+        # 畫布面板（建立但預設不加入分割視窗 = 收合）
+        self._canvas_panel = ttk.Frame(self._monitor_split)
+        self._canvas_shown = False
+        self._build_canvas_panel(self._canvas_panel)
 
 
     def _build_send_tab(self, parent):
@@ -1377,6 +1438,10 @@ class HIDToolApp(tk.Tk):
         if self._raw_thread and self._raw_thread.is_alive():
             return
 
+        # 開始即時監聽前先結束回放
+        if self._replay_active or self._replay_paused_at:
+            self._replay_finish()
+
         if self._selected_dev:
             path_str = self._get_dev_path_str(self._selected_dev)
             self._descriptors.pop(path_str, None)
@@ -1430,6 +1495,28 @@ class HIDToolApp(tk.Tk):
                     return False
         return rx_time - self._last_pkt_rx_time >= gap_threshold
 
+    def _gap_threshold(self) -> float:
+        try:
+            return float(self._gap_ms_var.get()) / 1000.0
+        except ValueError:
+            return 0.004
+
+    def _ingest_packet(self, pkt: dict, gap_threshold: float):
+        """單一封包進管線：判斷新幀、更新狀態、填表格與畫布。
+        即時監聽與回放共用，確保兩者行為完全一致。"""
+        rx_time = pkt.get("rx_time", time.monotonic())
+        is_new_frame = self._is_new_frame(pkt, rx_time, gap_threshold)
+        if is_new_frame:
+            self._frame_deque.append(rx_time)
+        self._last_pkt_rx_time = rx_time
+        self._handle_packet(pkt, is_new_frame=is_new_frame)
+
+    def _update_scan_rate(self, now: float):
+        cutoff = now - 1.0
+        while self._frame_deque and self._frame_deque[0] < cutoff:
+            self._frame_deque.popleft()
+        self._rate_var.set(f"{len(self._frame_deque):4d} scan/s")
+
     def _poll_queue(self):
         pkts = []
         try:
@@ -1438,28 +1525,18 @@ class HIDToolApp(tk.Tk):
         except queue.Empty:
             pass
 
-        if pkts:
-            try:
-                gap_threshold = float(self._gap_ms_var.get()) / 1000.0
-            except ValueError:
-                gap_threshold = 0.004
-
+        if pkts and not self._replay_active:
+            gap_threshold = self._gap_threshold()
             for pkt in pkts:
-                rx_time = pkt.get("rx_time", time.monotonic())
-                is_new_frame = self._is_new_frame(pkt, rx_time, gap_threshold)
-                if is_new_frame:
-                    self._frame_deque.append(rx_time)
-                self._last_pkt_rx_time = rx_time
-                self._handle_packet(
-                    pkt,
-                    is_new_frame=is_new_frame,
-                )
-
-            now    = time.monotonic()
-            cutoff = now - 1.0
-            while self._frame_deque and self._frame_deque[0] < cutoff:
-                self._frame_deque.popleft()
-            self._rate_var.set(f"{len(self._frame_deque):4d} scan/s")
+                if self._listening:
+                    self._record_buf.append({
+                        "data": pkt.get("data", b""),
+                        "rx_time": pkt.get("rx_time", time.monotonic()),
+                        "device_name": pkt.get("device_name", ""),
+                    })
+                self._ingest_packet(pkt, gap_threshold)
+            self._update_scan_rate(time.monotonic())
+            self._update_record_status()
 
         self.after(20, self._poll_queue)
 
@@ -1891,6 +1968,194 @@ class HIDToolApp(tk.Tk):
         self._error_var.set("")
 
     # ------------------------------------------------------------------
+    # Monitor: Record / Replay（記憶體回放）
+    # ------------------------------------------------------------------
+
+    def _build_replay_controls(self, parent, with_clear=False):
+        """在指定列建立一組回放控制（監聽與畫布分頁共用同一回放引擎）。"""
+        btn = ttk.Button(parent, text="▶ 回放", width=8, command=self._replay_toggle)
+        btn.pack(side=tk.LEFT)
+        self._replay_btns.append(btn)
+        ttk.Label(parent, text="速度:").pack(side=tk.LEFT, padx=(8, 2))
+        ttk.Combobox(parent, textvariable=self._replay_speed_var, width=6, state="readonly",
+                     values=("0.25x", "0.5x", "1x", "2x", "4x", "8x")).pack(side=tk.LEFT)
+        scale = ttk.Scale(parent, from_=0, to=max(0, len(self._replay_data) - 1),
+                          orient=tk.HORIZONTAL, command=self._replay_on_scale)
+        scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+        self._replay_scales.append(scale)
+        ttk.Label(parent, textvariable=self._replay_pos_var, width=16,
+                  font=("Consolas", 9)).pack(side=tk.LEFT)
+        ttk.Label(parent, textvariable=self._record_status_var, style="Muted.TLabel",
+                  width=10, anchor=tk.E).pack(side=tk.LEFT, padx=(6, 0))
+        if with_clear:
+            ttk.Button(parent, text="清除錄製",
+                       command=self._replay_clear).pack(side=tk.LEFT, padx=(6, 0))
+
+    def _replay_set_btn_text(self, text):
+        for b in self._replay_btns:
+            b.config(text=text)
+
+    def _replay_config_to(self, n):
+        for s in self._replay_scales:
+            s.configure(to=n)
+
+    def _update_record_status(self):
+        n = len(self._record_buf)
+        self._record_status_var.set(f"錄製 {n}")
+
+    def _reset_monitor_runtime_state(self):
+        """回放前重置與封包處理相關的執行期狀態（不動欄位定義）。"""
+        self._monitor_log_rows.clear()
+        self._table_pending.clear()
+        for iid in self._table.get_children():
+            self._table.delete(iid)
+        self._frame_seq = 0
+        self._table_row_seq = 0
+        self._error_count = 0
+        self._error_var.set("")
+        self._last_pkt_rx_time = 0.0
+        self._last_scan_time = -1
+        self._scan_time_delta = 0
+        self._scan_delta_suppress = False
+        self._last_contact_count = -1
+        self._last_touch_active = False
+        self._frame_deque.clear()
+        self._clear_canvas()
+
+    def _replay_toggle(self):
+        if self._replay_active:
+            self._replay_pause()
+        else:
+            self._replay_start()
+
+    def _replay_start(self):
+        if self._replay_active:
+            return
+        if self._listening:
+            messagebox.showinfo("回放", "請先停止監聽再回放。")
+            return
+        if not self._record_buf:
+            messagebox.showinfo("回放", "目前沒有錄製資料。")
+            return
+
+        resuming = 0 < self._replay_paused_at < len(self._replay_data)
+        if not resuming:
+            # 全新回放：快照緩衝、重置畫面、回到起點
+            self._replay_data = list(self._record_buf)
+            self._replay_idx = 0
+            self._reset_monitor_runtime_state()
+            self._replay_config_to(max(0, len(self._replay_data) - 1))
+            self._replay_set_scale(0)
+        # 倍速
+        try:
+            self._replay_speed = float(self._replay_speed_var.get().rstrip("x"))
+        except ValueError:
+            self._replay_speed = 1.0
+
+        self._replay_active = True
+        self._replay_set_btn_text("⏸ 暫停")
+        self._status_var.set("回放中…")
+        base = self._replay_data[self._replay_idx].get("rx_time", 0.0)
+        self._replay_t0 = base
+        self._replay_wall0 = time.monotonic()
+        self._replay_tick()
+
+    def _replay_pause(self):
+        self._replay_active = False
+        if self._replay_after_id:
+            self.after_cancel(self._replay_after_id)
+            self._replay_after_id = None
+        self._replay_paused_at = self._replay_idx
+        self._replay_set_btn_text("▶ 回放")
+        self._status_var.set("回放暫停")
+
+    def _replay_finish(self):
+        self._replay_active = False
+        if self._replay_after_id:
+            self.after_cancel(self._replay_after_id)
+            self._replay_after_id = None
+        self._replay_paused_at = 0
+        self._replay_set_btn_text("▶ 回放")
+        self._status_var.set("回放結束")
+
+    def _replay_tick(self):
+        self._replay_after_id = None
+        if not self._replay_active:
+            return
+        data = self._replay_data
+        n = len(data)
+        if self._replay_idx >= n:
+            self._replay_finish()
+            return
+        gap_threshold = self._gap_threshold()
+        virtual_now = self._replay_t0 + (time.monotonic() - self._replay_wall0) * self._replay_speed
+
+        fed = 0
+        while self._replay_idx < n:
+            pkt = data[self._replay_idx]
+            if pkt.get("rx_time", 0.0) > virtual_now and fed > 0:
+                break
+            self._ingest_packet(pkt, gap_threshold)
+            self._replay_idx += 1
+            fed += 1
+            if fed >= 512:          # 單次 tick 上限，避免大量積壓卡住 UI
+                break
+
+        self._update_scan_rate(virtual_now)
+        self._replay_set_scale(min(self._replay_idx, n - 1))
+        self._replay_pos_var.set(f"{self._replay_idx} / {n}")
+
+        if self._replay_idx >= n:
+            self._replay_finish()
+            return
+        self._replay_after_id = self.after(15, self._replay_tick)
+
+    def _replay_set_scale(self, value):
+        """程式設定滑桿位置（不觸發 on_scale 的拖曳跳轉）。"""
+        self._replay_sync = True
+        try:
+            for s in self._replay_scales:
+                s.set(value)
+        finally:
+            self._replay_sync = False
+
+    def _replay_on_scale(self, val):
+        if self._replay_sync or not self._replay_data:
+            return
+        target = int(float(val))
+        target = max(0, min(len(self._replay_data) - 1, target))
+        if target == self._replay_idx:
+            return
+        # 拖曳跳轉：暫停、重置、瞬間重餵到 target 重建畫面。
+        # 只重餵最近一段（畫布軌跡上限 500/指、scan rate 視窗 1 秒），
+        # 足以重建可見狀態又不會因大量插入卡死 UI。
+        was_active = self._replay_active
+        if was_active:
+            self._replay_pause()
+        self._reset_monitor_runtime_state()
+        gap_threshold = self._gap_threshold()
+        window = 4000
+        for i in range(max(0, target + 1 - window), target + 1):
+            self._ingest_packet(self._replay_data[i], gap_threshold)
+        self._replay_idx = target + 1
+        self._replay_paused_at = self._replay_idx
+        self._replay_set_scale(target)   # 同步另一個分頁的滑桿
+        self._replay_pos_var.set(f"{self._replay_idx} / {len(self._replay_data)}")
+        self._update_scan_rate(self._replay_data[target].get("rx_time", time.monotonic()))
+
+    def _replay_clear(self):
+        if self._replay_active:
+            self._replay_finish()
+        self._record_buf.clear()
+        self._replay_data = []
+        self._replay_idx = 0
+        self._replay_paused_at = 0
+        self._replay_config_to(0)
+        self._replay_set_scale(0)
+        self._replay_pos_var.set("0 / 0")
+        self._update_record_status()
+
+    # ------------------------------------------------------------------
     # Send tab
     # ------------------------------------------------------------------
 
@@ -2102,7 +2367,8 @@ class HIDToolApp(tk.Tk):
         "#1abc9c", "#e67e22", "#34495e", "#e91e63", "#00bcd4",
     ]
 
-    def _build_canvas_tab(self, parent):
+    def _build_canvas_panel(self, parent):
+        """觸控畫布面板，嵌在監聽分頁右側（可收合）。"""
         info_row = ttk.Frame(parent)
         info_row.pack(side=tk.TOP, fill=tk.X, padx=4, pady=4)
 
@@ -2111,8 +2377,6 @@ class HIDToolApp(tk.Tk):
                   font=("Consolas", 9), style="Muted.TLabel").pack(side=tk.LEFT)
 
         ttk.Button(info_row, text="清除", command=self._clear_canvas).pack(side=tk.RIGHT, padx=4)
-        ttk.Button(info_row, text="Export Excel",
-                   command=self._export_monitor_to_excel).pack(side=tk.RIGHT, padx=4)
 
         self._touch_canvas = tk.Canvas(
             parent, bg="white", cursor="crosshair",
@@ -2120,6 +2384,23 @@ class HIDToolApp(tk.Tk):
         )
         self._touch_canvas.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
         self._touch_canvas.bind("<Configure>", lambda *_: self._redraw_canvas())
+
+    def _toggle_monitor_canvas(self):
+        if self._canvas_shown:
+            self._monitor_split.forget(self._canvas_panel)
+            self._canvas_shown = False
+            self._canvas_toggle_btn.config(text="顯示畫布 ▶")
+        else:
+            self._monitor_split.add(self._canvas_panel, minsize=260, stretch="never")
+            self._canvas_shown = True
+            self._canvas_toggle_btn.config(text="隱藏畫布 ◀")
+            # 給畫布一個合理寬度並重繪
+            def place_sash():
+                total = self._monitor_split.winfo_width()
+                if total > 1:
+                    self._monitor_split.sash_place(0, max(300, total - 480), 0)
+                self._redraw_canvas()
+            self.after(30, place_sash)
 
     def _build_stress_tab(self, parent):
         pad = {"padx": 8, "pady": 4}
@@ -3263,6 +3544,538 @@ class HIDToolApp(tk.Tk):
             self._hm_worker = None
 
     # ------------------------------------------------------------------
+    # DigiInfo XML 軌跡分頁
+    # ------------------------------------------------------------------
+
+    def _build_digi_tab(self, parent):
+        pad = {"padx": 8, "pady": 4}
+
+        # 檔案載入
+        file_row = ttk.Frame(parent)
+        file_row.pack(fill=tk.X, **pad)
+        ttk.Label(file_row, text="XML 檔案:", width=8, anchor="e").pack(side=tk.LEFT)
+        self._digi_path_var = tk.StringVar()
+        ttk.Entry(file_row, textvariable=self._digi_path_var).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 6))
+        ttk.Button(file_row, text="瀏覽…", command=self._digi_browse).pack(side=tk.LEFT)
+        ttk.Button(file_row, text="載入", command=self._digi_load).pack(side=tk.LEFT, padx=(4, 0))
+
+        # 繪圖控制
+        ctrl = ttk.Frame(parent)
+        ctrl.pack(fill=tk.X, **pad)
+        self._digi_highlight = tk.BooleanVar(value=True)
+        ttk.Checkbutton(ctrl, text="標示 palm point", variable=self._digi_highlight,
+                        command=self._digi_request_redraw).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(ctrl, text="標示大小:").pack(side=tk.LEFT)
+        self._digi_marker_var = tk.StringVar(value="16")
+        ttk.Spinbox(ctrl, from_=6, to=60, increment=2, width=5,
+                    textvariable=self._digi_marker_var,
+                    command=self._digi_request_redraw).pack(side=tk.LEFT, padx=(2, 12))
+        ttk.Label(ctrl, text="X max:").pack(side=tk.LEFT)
+        self._digi_xmax_var = tk.StringVar()
+        e_x = ttk.Entry(ctrl, textvariable=self._digi_xmax_var, width=7)
+        e_x.pack(side=tk.LEFT, padx=(2, 8))
+        ttk.Label(ctrl, text="Y max:").pack(side=tk.LEFT)
+        self._digi_ymax_var = tk.StringVar()
+        e_y = ttk.Entry(ctrl, textvariable=self._digi_ymax_var, width=7)
+        e_y.pack(side=tk.LEFT, padx=(2, 8))
+        ttk.Button(ctrl, text="重設座標軸", command=self._digi_reset_axes).pack(side=tk.LEFT)
+        for w in (e_x, e_y):
+            w.bind("<Return>", lambda _e: self._digi_request_redraw())
+            w.bind("<FocusOut>", lambda _e: self._digi_request_redraw())
+
+        # 導覽 + 播放
+        nav = ttk.Frame(parent)
+        nav.pack(fill=tk.X, **pad)
+        ttk.Button(nav, text="◀", width=3,
+                   command=lambda: self._digi_step(-1)).pack(side=tk.LEFT)
+        self._digi_scale = ttk.Scale(nav, from_=0, to=0, orient=tk.HORIZONTAL,
+                                     command=self._digi_on_scale)
+        self._digi_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        ttk.Button(nav, text="▶", width=3,
+                   command=lambda: self._digi_step(1)).pack(side=tk.LEFT)
+        self._digi_frame_lbl = tk.StringVar(value="Frame - / -")
+        ttk.Label(nav, textvariable=self._digi_frame_lbl, width=16,
+                  font=("Consolas", 9)).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(nav, text="起始幀:").pack(side=tk.LEFT, padx=(8, 2))
+        self._digi_start_var = tk.StringVar(value="0")
+        self._digi_start_spin = ttk.Spinbox(nav, from_=0, to=0, width=6,
+                                            textvariable=self._digi_start_var,
+                                            command=self._digi_on_start_changed)
+        self._digi_start_spin.pack(side=tk.LEFT)
+        self._digi_start_spin.bind("<Return>", lambda _e: self._digi_on_start_changed())
+        self._digi_start_spin.bind("<FocusOut>", lambda _e: self._digi_on_start_changed())
+        ttk.Button(nav, text="設目前幀", width=8,
+                   command=self._digi_set_start_to_cur).pack(side=tk.LEFT, padx=(4, 0))
+        self._digi_play_btn = ttk.Button(nav, text="▶ 播放", width=8,
+                                         command=self._digi_toggle_play)
+        self._digi_play_btn.pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(nav, text="速度:").pack(side=tk.LEFT, padx=(8, 2))
+        self._digi_speed_var = tk.StringVar(value="30 fps")
+        ttk.Combobox(nav, textvariable=self._digi_speed_var, width=8, state="readonly",
+                     values=("5 fps", "10 fps", "20 fps", "30 fps", "60 fps",
+                             "120 fps", "240 fps", "480 fps"),
+                     ).pack(side=tk.LEFT)
+        self._digi_loop_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(nav, text="循環", variable=self._digi_loop_var).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(nav, text="顯示全部",
+                   command=self._digi_show_all).pack(side=tk.LEFT, padx=(8, 0))
+
+        # 底部：表格切換 / 匯出 / 進度
+        bottom = ttk.Frame(parent)
+        bottom.pack(side=tk.BOTTOM, fill=tk.X, **pad)
+        self._digi_table_btn = ttk.Button(bottom, text="顯示表格 ▼",
+                                          command=self._digi_toggle_table)
+        self._digi_table_btn.pack(side=tk.LEFT)
+        self._digi_preview_mode = tk.StringVar(value="wide")
+        ttk.Radiobutton(bottom, text="frame(寬)", value="wide", variable=self._digi_preview_mode,
+                        command=self._digi_refresh_table).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Radiobutton(bottom, text="log(長)", value="long", variable=self._digi_preview_mode,
+                        command=self._digi_refresh_table).pack(side=tk.LEFT)
+        ttk.Button(bottom, text="匯出 CSV", command=self._digi_export_csv).pack(side=tk.LEFT, padx=10)
+        self._digi_progress = tk.DoubleVar(value=0.0)
+        ttk.Progressbar(bottom, variable=self._digi_progress, maximum=100).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 6))
+        self._digi_status_var = tk.StringVar(value="尚未載入檔案")
+        ttk.Label(bottom, textvariable=self._digi_status_var, style="Muted.TLabel",
+                  width=26, anchor=tk.E).pack(side=tk.LEFT)
+
+        # 表格（預設隱藏，想看再開）
+        self._digi_table_frame = ttk.Frame(parent)
+        tbl_inner = ttk.Frame(self._digi_table_frame)
+        tbl_inner.pack(fill=tk.BOTH, expand=True)
+        self._digi_tree = ttk.Treeview(tbl_inner, show="headings", selectmode="browse",
+                                       style="Mono.Treeview", height=8)
+        dvsb = ttk.Scrollbar(tbl_inner, orient=tk.VERTICAL, command=self._digi_tree.yview)
+        dhsb = ttk.Scrollbar(self._digi_table_frame, orient=tk.HORIZONTAL, command=self._digi_tree.xview)
+        self._digi_tree.configure(yscrollcommand=dvsb.set, xscrollcommand=dhsb.set)
+        dvsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._digi_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        dhsb.pack(side=tk.BOTTOM, fill=tk.X)
+        self._digi_tree.bind("<<TreeviewSelect>>", self._digi_on_tree_select)
+        # 注意：_digi_table_frame 尚未 pack（隱藏狀態）
+
+        # 軌跡畫布
+        self._digi_canvas = tk.Canvas(parent, bg=self._SURFACE, highlightthickness=1,
+                                      highlightbackground=self._BORDER)
+        self._digi_canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
+        self._digi_canvas.bind("<Configure>", lambda _e: self._digi_request_redraw())
+
+    # ---- 載入 / 解析 ----
+
+    def _digi_browse(self):
+        path = filedialog.askopenfilename(
+            title="選擇 DigiInfo XML",
+            filetypes=[("All files", "*.*"), ("XML files", "*.xml")],
+        )
+        if path:
+            self._digi_path_var.set(path)
+            self._digi_load()
+
+    def _digi_load(self):
+        path = self._digi_path_var.get().strip()
+        if not path or not os.path.isfile(path):
+            messagebox.showerror("載入", "請先選擇有效的 XML 檔。")
+            return
+        self._digi_stop_play()
+        self._digi_status_var.set("解析中… 0%")
+        self._digi_progress.set(0)
+
+        def pcb(pct):
+            self.after(0, lambda: (self._digi_progress.set(pct),
+                                   self._digi_status_var.set(f"解析中… {pct}%")))
+
+        def worker():
+            try:
+                res = digiinfo_parse.parse_digiinfo_xml(path, progress_cb=pcb)
+            except Exception as exc:
+                self.after(0, lambda: self._digi_status_var.set(f"解析失敗: {exc}"))
+                return
+            self.after(0, lambda: self._digi_apply(res))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _digi_apply(self, res: dict):
+        self._digi_frames = res["frames"]
+        self._digi_wide_rows = res["wide_rows"]
+        self._digi_wide_cols = res["wide_cols"]
+        self._digi_long_rows = res["long_rows"]
+        self._digi_long_cols = res["long_cols"]
+        self._digi_stats = res["stats"]
+        self._digi_cur = 0
+        n = len(self._digi_frames)
+        self._digi_progress.set(100)
+        if n == 0:
+            self._digi_scale.configure(to=0)
+            self._digi_frame_lbl.set("Frame - / -")
+            self._digi_canvas.delete("all")
+            self._digi_status_var.set("沒有解析到觸控資料")
+            return
+        self._digi_compute_bounds()
+        self._digi_scale.configure(to=n - 1)
+        self._digi_scale.set(0)
+        self._digi_start = 0
+        self._digi_start_var.set("0")
+        self._digi_start_spin.configure(to=n - 1)
+        st = self._digi_stats
+        self._digi_status_var.set(
+            f"{n} frames | 點數 {st['total_points']} | 觸控 ID 數 {self._digi_contact_count()}"
+        )
+        self._digi_cur = 0   # 載入後從第一幀開始（不直接顯示全部）
+        self._digi_scale.set(0)
+        self._digi_redraw()
+        if self._digi_table_visible:
+            self._digi_refresh_table()
+
+    def _digi_contact_count(self) -> int:
+        cids = set()
+        for fr in self._digi_frames:
+            cids.update(fr["contacts"].keys())
+        return len(cids)
+
+    def _digi_compute_bounds(self):
+        xs, ys = [], []
+        for fr in self._digi_frames:
+            for c in fr["contacts"].values():
+                xs.append(c["x"])
+                ys.append(c["y"])
+        if not xs:
+            self._digi_bounds = (0.0, 1.0, 0.0, 1.0)
+            return
+        # 從 0 起算、上界留 5% 邊
+        self._digi_bounds = (0.0, max(1.0, max(xs) * 1.05), 0.0, max(1.0, max(ys) * 1.05))
+
+    def _digi_axis(self) -> Tuple[float, float, float, float]:
+        x0, x1, y0, y1 = self._digi_bounds
+        try:
+            ux = float(self._digi_xmax_var.get())
+            if ux > 0:
+                x1 = ux
+        except ValueError:
+            pass
+        try:
+            uy = float(self._digi_ymax_var.get())
+            if uy > 0:
+                y1 = uy
+        except ValueError:
+            pass
+        return x0, x1, y0, y1
+
+    def _digi_reset_axes(self):
+        self._digi_xmax_var.set("")
+        self._digi_ymax_var.set("")
+        self._digi_request_redraw()
+
+    def _digi_get_start(self) -> int:
+        n = len(self._digi_frames)
+        if n == 0:
+            return 0
+        try:
+            s = int(float(self._digi_start_var.get()))
+        except ValueError:
+            s = 0
+        return max(0, min(n - 1, s))
+
+    def _digi_on_start_changed(self):
+        self._digi_start = self._digi_get_start()
+        # 目前幀若落在起點之前，拉到起點
+        if self._digi_cur < self._digi_start:
+            self._digi_cur = self._digi_start
+            self._digi_scale.set(self._digi_cur)
+        self._digi_request_redraw()
+
+    def _digi_set_start_to_cur(self):
+        self._digi_start_var.set(str(self._digi_cur))
+        self._digi_on_start_changed()
+
+    # ---- 導覽 / 播放 ----
+
+    def _digi_on_scale(self, _val):
+        idx = int(float(self._digi_scale.get()))
+        if idx != self._digi_cur:
+            self._digi_cur = idx
+            self._digi_request_redraw()
+
+    def _digi_step(self, delta: int):
+        if not self._digi_frames:
+            return
+        idx = max(0, min(len(self._digi_frames) - 1, self._digi_cur + delta))
+        if idx != self._digi_cur:
+            self._digi_cur = idx
+            self._digi_scale.set(idx)
+            self._digi_request_redraw()
+
+    def _digi_show_all(self):
+        if not self._digi_frames:
+            return
+        self._digi_stop_play()
+        self._digi_cur = len(self._digi_frames) - 1
+        self._digi_scale.set(self._digi_cur)
+        self._digi_request_redraw()
+
+    def _digi_toggle_play(self):
+        if self._digi_playing:
+            self._digi_stop_play()
+        else:
+            self._digi_start_play()
+
+    def _digi_start_play(self):
+        if not self._digi_frames or len(self._digi_frames) < 2:
+            return
+        # 從起始幀開始播放，逐幀累積軌跡
+        start = self._digi_get_start()
+        self._digi_cur = start
+        self._digi_scale.set(start)
+        self._digi_request_redraw()
+        self._digi_playing = True
+        self._digi_play_btn.config(text="⏸ 暫停")
+        self._digi_play_tick()
+
+    def _digi_stop_play(self):
+        self._digi_playing = False
+        if self._digi_play_id:
+            self.after_cancel(self._digi_play_id)
+            self._digi_play_id = None
+        self._digi_play_btn.config(text="▶ 播放")
+
+    def _digi_play_tick(self):
+        self._digi_play_id = None
+        if not self._digi_playing or not self._digi_frames:
+            return
+        try:
+            fps = int(self._digi_speed_var.get().split()[0])
+        except (ValueError, IndexError):
+            fps = 30
+        # tkinter 計時器約 60fps 是實務上限：超過就改成一次跳多幀，
+        # interval 固定 16ms，step 隨速度放大
+        if fps <= 60:
+            step, interval = 1, max(16, int(1000 / max(1, fps)))
+        else:
+            step, interval = max(1, round(fps / 60)), 16
+
+        last = len(self._digi_frames) - 1
+        start = self._digi_get_start()
+        nxt = self._digi_cur + step
+        if nxt > last:
+            if self._digi_loop_var.get():
+                nxt = start   # 循環回到起始幀
+            else:
+                self._digi_cur = last
+                self._digi_scale.set(last)
+                self._digi_request_redraw()
+                self._digi_stop_play()
+                return
+        self._digi_cur = nxt
+        self._digi_scale.set(nxt)
+        self._digi_request_redraw()
+        self._digi_play_id = self.after(interval, self._digi_play_tick)
+
+    # ---- 繪圖 ----
+
+    def _digi_request_redraw(self):
+        if not self._digi_redraw_pending:
+            self._digi_redraw_pending = True
+            self.after_idle(self._digi_redraw)
+
+    def _digi_data_to_canvas(self, x, y, geo):
+        w, h, pad, x0, x1, y0, y1 = geo
+        cx = pad + (x - x0) / (x1 - x0) * (w - 2 * pad)
+        cy = pad + (y - y0) / (y1 - y0) * (h - 2 * pad)   # y 不反轉：data 原點在左上
+        return cx, cy
+
+    def _digi_redraw(self):
+        self._digi_redraw_pending = False
+        c = self._digi_canvas
+        c.delete("all")
+        if not self._digi_frames:
+            return
+        cur = self._digi_cur
+        self._digi_frame_lbl.set(f"Frame {cur} / {len(self._digi_frames) - 1}")
+
+        w = c.winfo_width()
+        h = c.winfo_height()
+        if w <= 1 or h <= 1:
+            return
+        pad = 18
+        x0, x1, y0, y1 = self._digi_axis()
+        if x1 <= x0 or y1 <= y0:
+            return
+        geo = (w, h, pad, x0, x1, y0, y1)
+
+        # 外框 + 角落座標
+        c.create_rectangle(pad, pad, w - pad, h - pad,
+                           outline="#cccccc", width=1, dash=(3, 3))
+        c.create_text(pad + 2, pad + 2, text=f"({x0:g},{y0:g})", anchor="nw",
+                      font=("Consolas", 7), fill="#aaaaaa")
+        c.create_text(w - pad - 2, h - pad - 2, text=f"({x1:g},{y1:g})", anchor="se",
+                      font=("Consolas", 7), fill="#aaaaaa")
+
+        # 收集每個 contact 在 起始幀..cur 範圍的軌跡點（之前的不顯示）
+        # tuple = (frame_idx, x, y, down, conf)
+        lo = self._digi_get_start()
+        per_cid: Dict[int, List[Tuple[int, float, float, bool, bool]]] = {}
+        for i in range(lo, cur + 1):
+            for cid, ct in self._digi_frames[i]["contacts"].items():
+                per_cid.setdefault(cid, []).append(
+                    (i, ct["x"], ct["y"], bool(ct["down"]), bool(ct["conf"])))
+
+        total_pts = sum(len(v) for v in per_cid.values())
+        draw_dots = total_pts <= 1500   # 點太多時略過每點小圓，只留線與重點
+        try:
+            hsize = max(6, min(60, int(self._digi_marker_var.get())))
+        except ValueError:
+            hsize = 16
+        highlight = self._digi_highlight.get()
+
+        for cid in sorted(per_cid.keys()):
+            pts = per_cid[cid]
+            color = self._SLOT_COLORS[cid % len(self._SLOT_COLORS)]
+
+            # 軌跡線：只連續接「down=True 且幀連續」的點；抬起(down=False)或
+            # 缺幀就斷筆，避免抬起後又按下被連成一條直線
+            segment: List[float] = []
+            last_idx: Optional[int] = None
+
+            def flush_segment(seg=segment):
+                if len(seg) >= 4:   # 至少兩點（每點 2 座標）
+                    c.create_line(list(seg), fill=color, width=1.5,
+                                  capstyle=tk.ROUND, joinstyle=tk.ROUND)
+
+            for idx, x, y, d, _cf in pts:
+                if not d:
+                    flush_segment()
+                    segment.clear()
+                    last_idx = idx
+                    continue
+                if last_idx is not None and idx != last_idx + 1 and segment:
+                    flush_segment()
+                    segment.clear()
+                cx, cy = self._digi_data_to_canvas(x, y, geo)
+                segment += [cx, cy]
+                last_idx = idx
+            flush_segment()
+
+            # 每點小圓
+            if draw_dots:
+                for _idx, x, y, _d, _cf in pts:
+                    cx, cy = self._digi_data_to_canvas(x, y, geo)
+                    c.create_oval(cx - 2, cy - 2, cx + 2, cy + 2,
+                                  fill=color, outline=color)
+            # palm point 標示：down=True 但 confidence 非 True
+            if highlight:
+                r = hsize / 2
+                for _idx, x, y, d, cf in pts:
+                    if d and not cf:
+                        cx, cy = self._digi_data_to_canvas(x, y, geo)
+                        c.create_oval(cx - r, cy - r, cx + r, cy + r,
+                                      outline="black", width=1.5, fill=color)
+
+        # 目前這一幀的點：加大強調 + ID 標籤（起點之前不顯示）
+        cur_contacts = self._digi_frames[cur]["contacts"] if cur >= lo else {}
+        for cid, ct in sorted(cur_contacts.items()):
+            color = self._SLOT_COLORS[cid % len(self._SLOT_COLORS)]
+            cx, cy = self._digi_data_to_canvas(ct["x"], ct["y"], geo)
+            c.create_oval(cx - 6, cy - 6, cx + 6, cy + 6,
+                          fill=color, outline="white", width=2)
+            c.create_text(cx, cy - 12, text=str(cid), fill=color,
+                          font=("Arial", 8, "bold"))
+
+    # ---- 表格（按需顯示）----
+
+    def _digi_toggle_table(self):
+        if self._digi_table_visible:
+            self._digi_table_frame.pack_forget()
+            self._digi_table_visible = False
+            self._digi_table_btn.config(text="顯示表格 ▼")
+        else:
+            # 插在 canvas 之前、底部列之後
+            self._digi_table_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(0, 4))
+            self._digi_table_visible = True
+            self._digi_table_btn.config(text="隱藏表格 ▲")
+            self._digi_refresh_table()
+
+    def _digi_refresh_table(self):
+        if not self._digi_table_visible:
+            return
+        mode = self._digi_preview_mode.get()
+        cols = self._digi_wide_cols if mode == "wide" else self._digi_long_cols
+        rows = self._digi_wide_rows if mode == "wide" else self._digi_long_rows
+        tree = self._digi_tree
+        for iid in tree.get_children():
+            tree.delete(iid)
+        tree["columns"] = cols
+        for col in cols:
+            tree.heading(col, text=col)
+            tree.column(col, width=70, anchor="center", stretch=False)
+        if not rows:
+            return
+
+        self._digi_render_token += 1
+        token = self._digi_render_token
+        total = len(rows)
+        CHUNK = 500
+
+        def insert_chunk(start=0):
+            if token != self._digi_render_token:
+                return
+            end = min(start + CHUNK, total)
+            for r in range(start, end):
+                row = rows[r]
+                tree.insert("", "end", values=[
+                    digiinfo_parse._fmt_cell(c, row.get(c)) for c in cols])
+            if end < total:
+                self.after(1, lambda: insert_chunk(end))
+            else:
+                self._digi_status_var.set(f"表格 {total} 列 × {len(cols)} 欄")
+
+        insert_chunk(0)
+
+    def _digi_on_tree_select(self, _event=None):
+        sel = self._digi_tree.selection()
+        if not sel:
+            return
+        cols = list(self._digi_tree["columns"])
+        if "row_id" not in cols:
+            return
+        idx = cols.index("row_id")
+        vals = self._digi_tree.item(sel[0], "values")
+        if idx >= len(vals):
+            return
+        rid = digiinfo_parse._to_int(vals[idx])
+        if rid is None:
+            return
+        # 跳到該 row_id 對應的 frame
+        for i, fr in enumerate(self._digi_frames):
+            if fr["row_id"] == rid:
+                self._digi_stop_play()
+                self._digi_cur = i
+                self._digi_scale.set(i)
+                self._digi_request_redraw()
+                break
+
+    def _digi_export_csv(self):
+        mode = self._digi_preview_mode.get()
+        cols = self._digi_wide_cols if mode == "wide" else self._digi_long_cols
+        rows = self._digi_wide_rows if mode == "wide" else self._digi_long_rows
+        if not rows:
+            messagebox.showinfo("匯出 CSV", "沒有可匯出的資料，請先載入 XML。")
+            return
+        default_name = f"digiinfo_{mode}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        path = filedialog.asksaveasfilename(
+            title="匯出 CSV", defaultextension=".csv", initialfile=default_name,
+            filetypes=[("CSV", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            digiinfo_parse.write_csv(path, rows, cols)
+        except Exception as exc:
+            messagebox.showerror("匯出失敗", f"無法匯出 CSV:\n{exc}")
+            return
+        self._digi_status_var.set(f"已匯出 {len(rows)} 列到 {os.path.basename(path)}")
+        messagebox.showinfo("匯出 CSV", f"已匯出 {len(rows)} 列（{mode}）。")
+
+    # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------
 
@@ -3274,6 +4087,11 @@ class HIDToolApp(tk.Tk):
             self._devchange_thread = None
         if getattr(self, "_hm_cancel", None):
             self._hm_cancel.set()
+        if getattr(self, "_replay_after_id", None):
+            try:
+                self.after_cancel(self._replay_after_id)
+            except Exception:
+                pass
         super().destroy()
 
 
