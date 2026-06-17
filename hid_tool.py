@@ -1177,6 +1177,10 @@ class HIDToolApp(tk.Tk):
         usage_keys = {
             "Confidence": (0x0D, 0x47),
             "TipSwitch": (0x0D, 0x42),
+            "InRange": (0x0D, 0x32),
+            "Invert": (0x0D, 0x3C),
+            "Eraser": (0x0D, 0x45),
+            "BarrelSwitch": (0x0D, 0x44),
             "ContactID": (0x0D, 0x51),
             "X": (0x01, 0x30),
             "Y": (0x01, 0x31),
@@ -1242,6 +1246,10 @@ class HIDToolApp(tk.Tk):
                 "slot": idx,
                 "Confidence": pick("Confidence", idx),
                 "TipSwitch": pick("TipSwitch", idx),
+                "InRange": pick("InRange", idx),
+                "Invert": pick("Invert", idx),
+                "Eraser": pick("Eraser", idx),
+                "BarrelSwitch": pick("BarrelSwitch", idx),
                 "ContactID": pick("ContactID", idx),
                 "X": pick("X", idx),
                 "CenterX": pick("CenterX", idx),
@@ -1306,8 +1314,9 @@ class HIDToolApp(tk.Tk):
                 if key not in self._hybrid_common:
                     self._hybrid_common[key] = (hf, i)
 
-        # ConfTip column goes here — after touch/common fields, before FF01
-        col_defs.append({"col_id": "ConfTip", "label": "Conf/Tip", "width": 130, "kind": "group", "field_ref": None, "value_index": -1, "byte_index": -1})
+        # Status column goes here — after touch/common fields, before FF01
+        # 合併 InRange / Tip / Eraser / Invert / BarrelSwitch，僅列出值為 1 的旗標名稱
+        col_defs.append({"col_id": "Status", "label": "Status", "width": 180, "kind": "group", "field_ref": None, "value_index": -1, "byte_index": -1})
 
         _vu_col_w = {"Hex": 58, "Dec": 42, "Bin": 78}.get(self._ff01_fmt.get(), 58)
         for hf in input_fields:
@@ -1340,24 +1349,62 @@ class HIDToolApp(tk.Tk):
             return self._combine_field_parts(vals, hf.per_bit_size, hf.logical_min) if vals else ""
         return vals[idx] if idx < len(vals) else ""
 
-    def _merge_conf_tip(self, conf, tip, btn=None) -> str:
+    # Status 欄位顯示用：旗標 col_id -> 顯示名稱（依序）
+    _STATUS_FLAGS = [
+        ("Confidence", "Confidence"),
+        ("InRange", "InRange"),
+        ("TipSwitch", "Tip"),
+        ("Eraser", "Eraser"),
+        ("Invert", "Invert"),
+        ("BarrelSwitch", "BarrelSwitch"),
+        ("phyButton", "phyButton"),
+    ]
+
+    def _merge_status(self, flags: dict) -> str:
+        """flags: {col_id: value}，把值為 1 的旗標名稱以空白串接。"""
         parts = []
-        try:
-            if int(conf):
-                parts.append("Confidence")
-        except (TypeError, ValueError):
-            pass
-        try:
-            if int(tip):
-                parts.append("Tip")
-        except (TypeError, ValueError):
-            pass
-        try:
-            if btn is not None and int(btn):
-                parts.append("phyButton")
-        except (TypeError, ValueError):
-            pass
+        for key, label in self._STATUS_FLAGS:
+            try:
+                if int(flags.get(key, 0)):
+                    parts.append(label)
+            except (TypeError, ValueError):
+                pass
         return " ".join(parts)
+
+    # 個別欄位（非 hybrid／手寫筆）路徑用：usage -> Status 顯示名稱
+    _STATUS_USAGE_LABELS = {
+        (0x0D, 0x47): "Confidence",
+        (0x0D, 0x32): "InRange",
+        (0x0D, 0x42): "Tip",
+        (0x0D, 0x45): "Eraser",
+        (0x0D, 0x3C): "Invert",
+        (0x0D, 0x44): "BarrelSwitch",
+    }
+
+    def _status_label_for(self, usage_page: int, usage: int) -> Optional[str]:
+        """回傳該 usage 對應的 Status 旗標名稱；非狀態旗標回傳 None。"""
+        lbl = self._STATUS_USAGE_LABELS.get((usage_page, usage))
+        if lbl:
+            return lbl
+        # 實體按鍵（UP=0x09，排除 FF01-like 與 padding）→ phyButton
+        if usage_page == 0x09 and usage != 0 and (usage_page, usage) not in self._FF01_LIKE:
+            return "phyButton"
+        return None
+
+    def _merge_status_entries(self, entries, value_reader) -> str:
+        """entries: [(HIDField, value_index, label)]，把值為 1 的旗標名稱依固定順序串接。"""
+        order = [lbl for _, lbl in self._STATUS_FLAGS]
+        active = []
+        for hf, vidx, label in entries:
+            vals = value_reader(hf)
+            try:
+                v = int(vals[vidx]) if vidx < len(vals) else 0
+            except (TypeError, ValueError):
+                v = 0
+            if v and label not in active:
+                active.append(label)
+        active.sort(key=lambda l: order.index(l) if l in order else len(order))
+        return " ".join(active)
 
     def _fmt_ff01_byte(self, val: int) -> str:
         fmt = self._ff01_fmt.get()
@@ -1452,6 +1499,11 @@ class HIDToolApp(tk.Tk):
         byte_field_idx:  int = 0
         _vu_col_w = {"Hex": 58, "Dec": 42, "Bin": 78}.get(self._ff01_fmt.get(), 58)
 
+        # 把 Confidence/InRange/Tip/Eraser/Invert/BarrelSwitch/實體按鍵
+        # 合併成單一 Status 欄位（插入在第一個狀態旗標出現的位置）
+        status_entries: List[Tuple[HIDField, int, str]] = []
+        status_added = False
+
         for hf in input_fields:
             if self._is_vendor_usage_byte_expanded_field(hf):
                 usage = hf.usages[0] if hf.usages else 0
@@ -1513,6 +1565,22 @@ class HIDToolApp(tk.Tk):
             else:
                 for i in range(hf.report_count):
                     u   = hf.usages[i] if i < len(hf.usages) else (hf.usages[-1] if hf.usages else 0)
+                    slabel = self._status_label_for(hf.usage_page, u)
+                    if slabel is not None:
+                        status_entries.append((hf, i, slabel))
+                        if not status_added:
+                            col_defs.append({
+                                "col_id":      "Status",
+                                "label":       "Status",
+                                "width":       180,
+                                "field_ref":   None,
+                                "value_index": -1,
+                                "byte_index":  -1,
+                                "combine_parts": False,
+                                "status_entries": status_entries,
+                            })
+                            status_added = True
+                        continue
                     k   = (hf.usage_page, u)
                     occ = usage_seen.get(k, 0)
                     usage_seen[k] = occ + 1
@@ -1921,7 +1989,7 @@ class HIDToolApp(tk.Tk):
                 return self._get_field_display_value(payload, hf, idx)
 
             common_values = {name: read_entry(entry) for name, entry in self._hybrid_common.items()}
-            _btn1_val = next(
+            _btn_active = next(
                 (v for k, v in common_values.items() if k.startswith("btn_") and v not in ("", 0, None)),
                 None,
             )
@@ -1966,11 +2034,20 @@ class HIDToolApp(tk.Tk):
                 ):
                     continue
 
+                status_val = self._merge_status({
+                    "Confidence": confidence,
+                    "InRange": read_entry(group.get("InRange")),
+                    "TipSwitch": tip,
+                    "Eraser": read_entry(group.get("Eraser")),
+                    "Invert": read_entry(group.get("Invert")),
+                    "BarrelSwitch": read_entry(group.get("BarrelSwitch")),
+                    "phyButton": _btn_active,
+                })
                 row_map = {
                     "__frame__": self._frame_seq,
                     "__rid__": f"0x{report_id:02X}",
                     "__slot__": group["slot"],
-                    "ConfTip": self._merge_conf_tip(confidence, tip, _btn1_val),
+                    "Status": status_val,
                     "ContactID": cid_val,
                     "X": x,
                     "CenterX": read_entry(group.get("CenterX")),
@@ -2029,7 +2106,7 @@ class HIDToolApp(tk.Tk):
                     "__rid__": f"0x{report_id:02X}",
                     "__slot__": "",
                     "__raw__": raw_hex,
-                    "ConfTip": self._merge_conf_tip("", "", _btn1_val),
+                    "Status": self._merge_status({"phyButton": _btn_active}),
                 }
                 row_map.update(common_values)
                 row = []
@@ -2056,6 +2133,8 @@ class HIDToolApp(tk.Tk):
                 row.append(f"0x{report_id:02X}")
             elif cid == "__raw__":
                 row.append(" ".join(f"{b:02X}" for b in data))
+            elif col.get("status_entries") is not None:
+                row.append(self._merge_status_entries(col["status_entries"], get_vals))
             elif col["byte_index"] >= 0:
                 hf       = col["field_ref"]
                 byte_pos = (hf.bit_offset // 8) + col["byte_index"]
