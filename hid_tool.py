@@ -76,6 +76,10 @@ class HIDToolApp(tk.Tk):
     _FONT_UI_BOLD = ("Microsoft JhengHei UI", 9, "bold")
     _FONT_MONO    = ("Consolas", 9)
 
+    # 固定 tk scaling（pt→px 換算係數），讓字體像素大小不隨螢幕 DPI 改變
+    # → 不同解析度／縮放比例的螢幕字級一致。1.3333 ≈ 96 DPI（100%）
+    _TK_SCALING = 1.3333
+
     _RECORD_MAX   = 50000   # 監聽回放的封包環形緩衝上限（約數 MB）
 
     @staticmethod
@@ -95,17 +99,43 @@ class HIDToolApp(tk.Tk):
         except tk.TclError:
             pass
 
-    def __init__(self):
-        # 高 DPI 清晰度（必須在建立 Tk 視窗前設定）
+    @staticmethod
+    def _set_dpi_awareness():
+        """DPI 感知：優先 per-monitor v2（拖到不同 DPI 螢幕不被點陣拉伸），
+        失敗則逐步退回。必須在建立 Tk 視窗前呼叫。"""
         try:
-            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+            user32 = ctypes.windll.user32
+            user32.SetProcessDpiAwarenessContext.restype  = ctypes.c_bool
+            user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+            # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+            if user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+                return
         except Exception:
             pass
+        for level in (2, 1):   # PER_MONITOR_AWARE → SYSTEM_AWARE
+            try:
+                ctypes.windll.shcore.SetProcessDpiAwareness(level)
+                return
+            except Exception:
+                pass
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+    def __init__(self):
+        # 高 DPI 清晰度（必須在建立 Tk 視窗前設定）
+        self._set_dpi_awareness()
         try:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("RE024.TouchInspector")
         except Exception:
             pass
         super().__init__()
+        # 固定 tk scaling，讓 pt 字體像素大小不隨螢幕 DPI 改變（每台螢幕字級一致）
+        try:
+            self.tk.call("tk", "scaling", self._TK_SCALING)
+        except Exception:
+            pass
         self.withdraw()   # 立即隱藏，防止預設小視窗閃爍
         self.title(f"{self._APP_NAME} - {self._APP_VERSION_LABEL}")
         self._set_window_icon()
