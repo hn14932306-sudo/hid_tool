@@ -140,7 +140,10 @@ class RawInputThread(threading.Thread):
 
         self._wnd_proc_cb = WNDPROCTYPE(wnd_proc)
 
-        class_name = "HIDToolMsgWnd"
+        # 每個 instance 使用唯一的 class name，避免舊 callback 被 GC
+        # 後新 window 仍使用已失效的 lpfnWndProc（access violation）
+        class_name = f"HIDToolMsgWnd_{id(self)}"
+        self._class_name = class_name
         wc = WNDCLASSEXW()
         wc.cbSize        = ctypes.sizeof(WNDCLASSEXW)
         wc.style         = 0
@@ -149,9 +152,8 @@ class RawInputThread(threading.Thread):
         wc.lpszClassName = class_name
 
         if not user32.RegisterClassExW(ctypes.byref(wc)):
-            if kernel32.GetLastError() != 1410:   # ERROR_CLASS_ALREADY_EXISTS
-                self._ready_event.set()
-                return
+            self._ready_event.set()
+            return
 
         hwnd = user32.CreateWindowExW(
             0, class_name, "HIDTool", 0,
@@ -192,6 +194,9 @@ class RawInputThread(threading.Thread):
                 break
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
+
+        user32.DestroyWindow(self._hwnd)
+        user32.UnregisterClassW(class_name, hInstance)
 
     def _handle_wm_input(self, hwnd, lparam):
         user32    = ctypes.windll.user32
