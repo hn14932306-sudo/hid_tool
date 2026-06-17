@@ -145,9 +145,12 @@ class HIDToolApp(tk.Tk):
         self._canvas_x_logical: Tuple[int, int]          = (0, 4096)
         self._canvas_y_logical: Tuple[int, int]          = (0, 4096)
         self._canvas_contacts:         Dict[int, dict]              = {}
+        # 單點（手寫筆）畫布欄位參照：{"X":(hf,idx), "Y":..., "TipSwitch":..., "InRange":..., "Confidence":...}
+        self._pen_canvas:              Optional[dict]               = None
         self._canvas_trails:           Dict[int, collections.deque] = {}
         self._canvas_prev_active:      set                          = set()
         self._canvas_item_ids:         Dict[int, Tuple[int, int]]   = {}
+        self._canvas_item_shape:       Dict[int, str]               = {}
         self._canvas_trail_line_ids:   Dict[int, int]               = {}
         self._table_pending:           List[tuple]                   = []   # (row, tags, errs)
         self._table_flush_pending:     bool                         = False
@@ -1464,6 +1467,7 @@ class HIDToolApp(tk.Tk):
             self._top_error_var.set("ERR 0")
 
         if self._view_mode.get() == "Hybrid" and self._setup_hybrid_columns(input_fields):
+            self._pen_canvas = None   # 多點由 hybrid 路徑處理畫布
             ids = [c["col_id"] for c in self._col_defs]
             self._table["columns"] = ids
             self._table["show"] = "headings"
@@ -1472,6 +1476,22 @@ class HIDToolApp(tk.Tk):
                 self._table.column(c["col_id"], width=c["width"],
                                    stretch=(c["col_id"] == "__raw__"), anchor="center")
             return
+
+        # 單點（手寫筆）：descriptor 沒有 ContactID，hybrid 不成立，
+        # 在此建立畫布欄位參照，讓畫布也能畫筆（即時監聽與回放共用）
+        pen_entries = self._build_touch_usage_entries(input_fields)
+        if pen_entries["X"] and pen_entries["Y"] and not pen_entries["ContactID"]:
+            self._pen_canvas = {
+                "X":          pen_entries["X"][0],
+                "Y":          pen_entries["Y"][0],
+                "TipSwitch":  pen_entries["TipSwitch"][0]  if pen_entries["TipSwitch"]  else None,
+                "InRange":    pen_entries["InRange"][0]    if pen_entries["InRange"]    else None,
+                "Eraser":     pen_entries["Eraser"][0]     if pen_entries["Eraser"]     else None,
+                "Invert":     pen_entries["Invert"][0]     if pen_entries["Invert"]     else None,
+                "Confidence": pen_entries["Confidence"][0] if pen_entries["Confidence"] else None,
+            }
+        else:
+            self._pen_canvas = None
 
         col_defs: List[dict] = [
             {"col_id": "__rid__", "label": "RID", "width": 50,
@@ -2126,6 +2146,10 @@ class HIDToolApp(tk.Tk):
                 self._append_monitor_row(pkt, headers, row, row_tags, error_reasons)
             return
 
+        # 單點（手寫筆）畫布：下筆畫軌跡、懸空顯示游標點
+        if self._pen_canvas is not None:
+            self._feed_pen_canvas(get_vals, is_new_frame)
+
         row = []
         for col in self._col_defs:
             cid = col["col_id"]
@@ -2774,6 +2798,7 @@ class HIDToolApp(tk.Tk):
         self._canvas_trails.clear()
         self._canvas_prev_active.clear()
         self._canvas_item_ids.clear()
+        self._canvas_item_shape.clear()
         self._canvas_trail_line_ids.clear()
         self._redraw_canvas()
 
@@ -2789,15 +2814,24 @@ class HIDToolApp(tk.Tk):
         cy = pad + (ly - y_min) / y_range * (h - 2 * pad)
         return cx, cy
 
-    def _canvas_update_slot(self, track_key: int, tip, lx, ly, cid_val, confidence=""):
-        """純資料更新，不呼叫任何 tkinter — 畫面由 _canvas_flush 統一處理。"""
+    def _canvas_update_slot(self, track_key: int, tip, lx, ly, cid_val, confidence="",
+                            draw_trail=True, color=None, shape="circle"):
+        """純資料更新，不呼叫任何 tkinter — 畫面由 _canvas_flush 統一處理。
+        draw_trail=False 時只更新圓點不畫軌跡（手寫筆懸空游標用）。
+        color/shape 可覆寫顏色與形狀（circle / square），給手寫筆橡皮擦與懸空游標用。"""
         if tip and lx is not None and ly is not None:
-            if track_key not in self._canvas_prev_active:
+            if draw_trail:
+                if track_key not in self._canvas_prev_active:
+                    self._canvas_trails.pop(track_key, None)
+                    self._canvas_trail_reset_keys.add(track_key)
+                trail = self._canvas_trails.setdefault(track_key, collections.deque(maxlen=500))
+                if not trail or lx != trail[-1][0] or ly != trail[-1][1]:
+                    trail.append((lx, ly))
+                self._canvas_dirty_keys.add(track_key)
+            else:
+                # 懸空游標：不留軌跡，但圓點仍要更新位置
                 self._canvas_trails.pop(track_key, None)
                 self._canvas_trail_reset_keys.add(track_key)
-            trail = self._canvas_trails.setdefault(track_key, collections.deque(maxlen=500))
-            if not trail or lx != trail[-1][0] or ly != trail[-1][1]:
-                trail.append((lx, ly))
                 self._canvas_dirty_keys.add(track_key)
             try:
                 conf_val = int(confidence)
@@ -2805,12 +2839,55 @@ class HIDToolApp(tk.Tk):
                 conf_val = 1
             self._canvas_contacts[track_key] = {
                 "x": lx, "y": ly, "cid": cid_val, "conf": conf_val,
+                "color": color, "shape": shape,
             }
         else:
             self._canvas_contacts.pop(track_key, None)
             self._canvas_circle_del_keys.add(track_key)
             self._canvas_dirty_keys.discard(track_key)
         self._schedule_canvas_flush()
+
+    _PEN_SLOT = 0   # 手寫筆固定使用的畫布 slot（無 ContactID）
+
+    def _feed_pen_canvas(self, get_vals, is_new_frame: bool):
+        """單點手寫筆畫布更新：TipSwitch=1 下筆畫軌跡，InRange=1 懸空顯示游標點。"""
+        pc = self._pen_canvas
+        if not pc:
+            return
+
+        def rd(entry):
+            if not entry:
+                return None
+            hf, idx = entry
+            vals = get_vals(hf)
+            return vals[idx] if idx < len(vals) else None
+
+        if is_new_frame:
+            self._canvas_prev_active = set(self._canvas_contacts.keys())
+
+        tip = rd(pc.get("TipSwitch"))
+        inr = rd(pc.get("InRange"))
+        lx  = rd(pc.get("X"))
+        ly  = rd(pc.get("Y"))
+        conf = rd(pc.get("Confidence"))
+        conf = conf if conf is not None else ""
+        eraser = bool(rd(pc.get("Eraser"))) or bool(rd(pc.get("Invert")))
+
+        pen_down = bool(tip)
+        hover    = (not pen_down) and bool(inr)
+        if pen_down and eraser:
+            # 橡皮擦：方形 + 軌跡（不同色）
+            self._canvas_update_slot(self._PEN_SLOT, 1, lx, ly, 0, conf,
+                                     draw_trail=True, color="#9b59b6", shape="square")
+        elif pen_down:
+            # 一般筆尖：圓形 + 軌跡
+            self._canvas_update_slot(self._PEN_SLOT, 1, lx, ly, 0, conf, draw_trail=True)
+        elif hover:
+            # 懸空：綠色圓點，不留軌跡
+            self._canvas_update_slot(self._PEN_SLOT, 1, lx, ly, 0, conf,
+                                     draw_trail=False, color="#2ecc71")
+        else:
+            self._canvas_update_slot(self._PEN_SLOT, 0, lx, ly, 0, "", draw_trail=True)
 
     def _schedule_canvas_flush(self):
         if not self._canvas_flush_pending:
@@ -2843,6 +2920,7 @@ class HIDToolApp(tk.Tk):
         # 刪除 tip=0 的圓圈
         for key in self._canvas_circle_del_keys:
             ids = self._canvas_item_ids.pop(key, None)
+            self._canvas_item_shape.pop(key, None)
             if ids:
                 for item_id in ids:
                     c.delete(item_id)
@@ -2874,7 +2952,8 @@ class HIDToolApp(tk.Tk):
             ly   = contact["y"]
             cid  = contact["cid"]
             conf = contact.get("conf", 1)
-            color  = self._SLOT_COLORS[track_key % len(self._SLOT_COLORS)]
+            color  = contact.get("color") or self._SLOT_COLORS[track_key % len(self._SLOT_COLORS)]
+            shape  = contact.get("shape", "circle")
             new_cx = pad + (lx - x_min) * xs
             new_cy = pad + (ly - y_min) * ys
 
@@ -2893,7 +2972,7 @@ class HIDToolApp(tk.Tk):
                     if line_id is None:
                         raise tk.TclError
                     c.coords(line_id, flat)
-                    c.itemconfig(line_id, width=line_width)
+                    c.itemconfig(line_id, width=line_width, fill=color)
                 except tk.TclError:
                     line_id = c.create_line(
                         flat, fill=color, width=line_width,
@@ -2903,15 +2982,22 @@ class HIDToolApp(tk.Tk):
                     self._canvas_trail_line_ids[track_key] = line_id
 
             ids = self._canvas_item_ids.get(track_key)
+            # 形狀改變（圓⇄方）時需重建，無法只改 coords
+            if ids and self._canvas_item_shape.get(track_key) != shape:
+                for item_id in ids:
+                    c.delete(item_id)
+                ids = None
             try:
                 if not ids:
                     raise tk.TclError
                 oval_id, text_id = ids
                 c.coords(oval_id, new_cx - r, new_cy - r, new_cx + r, new_cy + r)
                 c.coords(text_id, new_cx, new_cy)
+                c.itemconfig(oval_id, fill=color)
             except tk.TclError:
                 contact_tag = f"contact_{track_key}"
-                oval_id = c.create_oval(
+                _maker = c.create_rectangle if shape == "square" else c.create_oval
+                oval_id = _maker(
                     new_cx - r, new_cy - r, new_cx + r, new_cy + r,
                     fill=color, outline="white", width=2,
                     tags=(contact_tag, "contact"),
@@ -2923,6 +3009,7 @@ class HIDToolApp(tk.Tk):
                     tags=(contact_tag, "contact"),
                 )
                 self._canvas_item_ids[track_key] = (oval_id, text_id)
+                self._canvas_item_shape[track_key] = shape
 
         c.tag_raise("contact")
 
@@ -2953,7 +3040,8 @@ class HIDToolApp(tk.Tk):
             pts = list(trail)
             if len(pts) < 2:
                 continue
-            color = self._SLOT_COLORS[slot % len(self._SLOT_COLORS)]
+            _ct = self._canvas_contacts.get(slot)
+            color = (_ct.get("color") if _ct else None) or self._SLOT_COLORS[slot % len(self._SLOT_COLORS)]
             flat: List[float] = []
             for lx_t, ly_t in pts:
                 flat.append(pad + (lx_t - x_min) * xs)
@@ -2969,6 +3057,7 @@ class HIDToolApp(tk.Tk):
         # Redraw active contact circles on top，重建 item ID 對照表
         r = 20
         new_ids: Dict[int, Tuple[int, int]] = {}
+        new_shapes: Dict[int, str] = {}
         for slot, contact in self._canvas_contacts.items():
             try:
                 lx = float(contact["x"])
@@ -2977,23 +3066,28 @@ class HIDToolApp(tk.Tk):
                 continue
             cx = pad + (lx - x_min) * xs
             cy = pad + (ly - y_min) * ys
-            color = self._SLOT_COLORS[slot % len(self._SLOT_COLORS)]
+            color = contact.get("color") or self._SLOT_COLORS[slot % len(self._SLOT_COLORS)]
+            shape = contact.get("shape", "circle")
             contact_tag = f"contact_{slot}"
-            oval_id = c.create_oval(cx - r, cy - r, cx + r, cy + r,
-                                    fill=color, outline="white", width=2,
-                                    tags=(contact_tag, "contact"))
+            _maker = c.create_rectangle if shape == "square" else c.create_oval
+            oval_id = _maker(cx - r, cy - r, cx + r, cy + r,
+                             fill=color, outline="white", width=2,
+                             tags=(contact_tag, "contact"))
             cid_label = str(contact.get("cid", slot))
             text_id = c.create_text(cx, cy, text=cid_label,
                                     fill="white", font=("Arial", 10, "bold"),
                                     tags=(contact_tag, "contact"))
             new_ids[slot] = (oval_id, text_id)
+            new_shapes[slot] = shape
         self._canvas_item_ids = new_ids
+        self._canvas_item_shape = new_shapes
 
     def _clear_canvas(self):
         self._canvas_contacts.clear()
         self._canvas_trails.clear()
         self._canvas_prev_active.clear()
         self._canvas_item_ids.clear()
+        self._canvas_item_shape.clear()
         self._canvas_trail_line_ids.clear()
         # 一併清掉待處理的 key，避免 pending flush 動到已清除的舊狀態
         self._canvas_dirty_keys.clear()
