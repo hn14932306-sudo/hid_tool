@@ -7,6 +7,7 @@ import collections
 import csv
 import ctypes
 import datetime
+import json
 import math
 import os
 import queue
@@ -906,16 +907,8 @@ class HIDToolApp(tk.Tk):
         was_all = self._all_digi_mode
         if idx == 0:
             # 「全部 digitizer」：不選裝置、自動解碼所有 digitizer
-            self._all_digi_mode = True
-            self._selected_dev = None
+            self._enter_all_digi_mode()
             self._adigi_entries = []          # 預載延後到開始監聽時才做，避免啟動卡頓
-            self._digi_rate_deques.clear()
-            self._digi_rate_var.set("")
-            self._clear_digi_canvas()
-            self._reset_monitor_runtime_state()
-            self._setup_all_digi_columns()
-            self._digi_rate_lbl.pack(side=tk.TOP, fill=tk.X, padx=2, pady=(0, 2),
-                                     before=self._tbl_wrap)
             self._hide_dev_tooltip()
             # 監聽中切入：重啟以註冊完整 digitizer TLC（含 Pen/Stylus）
             if self._listening:
@@ -2836,6 +2829,10 @@ class HIDToolApp(tk.Tk):
                   font=("Consolas", 9)).pack(side=tk.LEFT)
         ttk.Label(parent, textvariable=self._record_status_var, style="Muted.TLabel",
                   width=10, anchor=tk.E).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(parent, text="匯出錄製", width=9,
+                   command=self._export_recording).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(parent, text="載入錄製", width=9,
+                   command=self._import_recording).pack(side=tk.LEFT, padx=(4, 0))
 
     def _replay_set_btn_text(self, text):
         for b in self._replay_btns:
@@ -2850,6 +2847,128 @@ class HIDToolApp(tk.Tk):
         self._record_status_var.set(f"錄製 {n}")
         if hasattr(self, "_top_record_var"):
             self._top_record_var.set(f"REC {n}")
+
+    def _enter_all_digi_mode(self):
+        """進入全裝置模式的共用設定（不含 _adigi_entries 來源與監聽重啟）。"""
+        self._all_digi_mode = True
+        self._selected_dev = None
+        self._digi_rate_deques.clear()
+        self._digi_rate_var.set("")
+        self._clear_digi_canvas()
+        self._reset_monitor_runtime_state()
+        self._setup_all_digi_columns()
+        if not self._digi_rate_lbl.winfo_ismapped():
+            self._digi_rate_lbl.pack(side=tk.TOP, fill=tk.X, padx=2, pady=(0, 2),
+                                     before=self._tbl_wrap)
+
+    # ------------------------------------------------------------------
+    # 監聽錄製：匯出 / 載入（自包含檔，含 descriptor，之後沒接裝置也能回放）
+    # ------------------------------------------------------------------
+
+    def _raw_descriptor_for_name(self, device_name: str):
+        key = self._dev_match_key(device_name)
+        dev = next((d for d in self._hidapi_devices
+                    if self._dev_match_key(self._get_dev_path_str(d)) == key), None)
+        if dev is None:
+            return None
+        try:
+            raw = read_descriptor_via_hidapi(dev.get("path", b""))
+            return bytes(raw) if raw else None
+        except Exception:
+            return None
+
+    def _export_recording(self):
+        if not self._record_buf:
+            messagebox.showinfo("匯出錄製", "目前沒有錄製資料。")
+            return
+        path = filedialog.asksaveasfilename(
+            title="匯出錄製", defaultextension=".hidrec",
+            filetypes=[("HID 錄製檔", "*.hidrec"), ("所有檔案", "*.*")])
+        if not path:
+            return
+        try:
+            recs = list(self._record_buf)
+            descs = {}
+            for r in recs:
+                k = self._dev_match_key(r.get("device_name", ""))
+                if not k or k in descs:
+                    continue
+                raw = self._raw_descriptor_for_name(r.get("device_name", ""))
+                if raw:
+                    descs[k] = raw.hex()
+            out = {
+                "format": "hidrec", "version": 1,
+                "descriptors": descs,
+                "records": [{"t": r.get("rx_time", 0.0),
+                             "d": (r.get("data", b"") or b"").hex(),
+                             "n": r.get("device_name", "")} for r in recs],
+            }
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(out, f)
+            messagebox.showinfo("匯出錄製",
+                                f"已匯出 {len(recs)} 筆封包、{len(descs)} 個裝置 descriptor\n{path}")
+        except Exception as exc:
+            messagebox.showerror("匯出錄製", f"匯出失敗:\n{exc}")
+
+    def _import_recording(self):
+        if self._listening:
+            messagebox.showinfo("載入錄製", "請先停止監聽再載入。")
+            return
+        path = filedialog.askopenfilename(
+            title="載入錄製",
+            filetypes=[("HID 錄製檔", "*.hidrec"), ("所有檔案", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+        except Exception as exc:
+            messagebox.showerror("載入錄製", f"讀取失敗:\n{exc}")
+            return
+
+        recs  = obj.get("records", []) if isinstance(obj, dict) else (obj or [])
+        descs = obj.get("descriptors", {}) if isinstance(obj, dict) else {}
+
+        # 切到全裝置模式，用檔案內 descriptor 解碼（裝置沒接也能回放）
+        self._replay_finish()
+        try:
+            self._dev_combo.current(0)
+        except Exception:
+            pass
+        self._enter_all_digi_mode()
+
+        self._adigi_entries = []
+        for k, hexdesc in (descs or {}).items():
+            try:
+                fields = parse_report_descriptor(bytes.fromhex(hexdesc))
+                ctx = self._build_digi_ctx(fields)
+                if ctx:
+                    vp, col = self._parse_vidpid_col(k)
+                    self._adigi_entries.append((k, vp, col, ctx))
+            except Exception:
+                continue
+
+        self._record_buf.clear()
+        for r in recs:
+            try:
+                data = bytes.fromhex(r.get("d", ""))
+            except (ValueError, AttributeError):
+                continue
+            self._record_buf.append({
+                "data": data,
+                "rx_time": float(r.get("t", 0.0)),
+                "device_name": r.get("n", ""),
+            })
+        self._update_record_status()
+        self._replay_data = list(self._record_buf)
+        self._replay_idx = 0
+        self._replay_paused_at = 0
+        self._replay_config_to(max(0, len(self._replay_data) - 1))
+        self._replay_set_scale(0)
+        self._replay_pos_var.set(f"0 / {len(self._replay_data)}")
+        messagebox.showinfo(
+            "載入錄製",
+            f"已載入 {len(self._record_buf)} 筆封包、{len(self._adigi_entries)} 個裝置。\n按「回放」播放。")
 
     def _reset_monitor_runtime_state(self):
         """回放前重置與封包處理相關的執行期狀態（不動欄位定義）。"""
