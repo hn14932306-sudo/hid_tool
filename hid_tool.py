@@ -171,6 +171,15 @@ class HIDToolApp(tk.Tk):
         """把基準（96 DPI）的像素值依目前 DPI 倍率（sf=dpi/96）縮放，用於欄寬等固定像素。"""
         return int(round(px * (getattr(self, "_cur_dpi", 96) or 96) / 96.0))
 
+    def _col_width(self, base, label) -> int:
+        """欄寬取「基準寬度」與「標題實際文字寬度」較大者（避免長名稱被截斷），皆含 DPI 縮放。"""
+        try:
+            # SunValleyCaptionFont 是 Treeview 標題字體，已依 DPI 縮放，measure 即為實際像素
+            needed = tkfont.nametofont("SunValleyCaptionFont").measure(str(label)) + self._sx(18)
+        except Exception:
+            needed = self._sx(len(str(label)) * 8 + 18)
+        return max(self._sx(base), needed)
+
     def _apply_font_scaling(self):
         """把 sv_ttk 像素字體與 Treeview 列高依 DPI 倍率（sf=dpi/96）放大。"""
         sf = (getattr(self, "_cur_dpi", 96) or 96) / 96.0
@@ -1589,7 +1598,7 @@ class HIDToolApp(tk.Tk):
             self._table["show"] = "headings"
             for c in self._col_defs:
                 self._table.heading(c["col_id"], text=c["label"])
-                self._table.column(c["col_id"], width=self._sx(c["width"]),
+                self._table.column(c["col_id"], width=self._col_width(c["width"], c["label"]),
                                    stretch=(c["col_id"] == "__raw__"), anchor="center")
             return
 
@@ -1739,7 +1748,7 @@ class HIDToolApp(tk.Tk):
         self._table["show"]    = "headings"
         for c in col_defs:
             self._table.heading(c["col_id"], text=c["label"])
-            self._table.column(c["col_id"], width=self._sx(c["width"]),
+            self._table.column(c["col_id"], width=self._col_width(c["width"], c["label"]),
                                stretch=(c["col_id"] == "__raw__"), anchor="center")
 
     # ------------------------------------------------------------------
