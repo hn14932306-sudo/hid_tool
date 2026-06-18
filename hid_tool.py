@@ -200,9 +200,17 @@ class HIDToolApp(tk.Tk):
             pass
 
     def _on_possible_dpi_change(self, event):
-        """視窗被拖到不同 DPI 螢幕時，動態重算字體縮放。"""
+        """視窗被拖到不同 DPI 螢幕時，動態重算字體縮放。
+        防抖：縮放/移動過程會連續觸發 <Configure>，等停下來再檢查一次，
+        避免縮放途中反覆重設字體縮放造成卡頓。"""
         if event.widget is not self:
             return
+        if getattr(self, "_dpi_check_after_id", None):
+            self.after_cancel(self._dpi_check_after_id)
+        self._dpi_check_after_id = self.after(250, self._do_dpi_check)
+
+    def _do_dpi_check(self):
+        self._dpi_check_after_id = None
         dpi = self._current_dpi()
         if dpi and dpi != self._cur_dpi:
             self._cur_dpi = dpi
@@ -853,8 +861,8 @@ class HIDToolApp(tk.Tk):
         prefix = "偵測到裝置變更，" if auto else ""
         self._status_var.set(f"{prefix}找到 {len(self._hidapi_devices)} 個 HID 裝置")
 
-        if self._all_digi_mode:
-            self._preload_digi_ctx()   # 全裝置模式：裝置清單變更後重新預載 ctx
+        if self._all_digi_mode and self._listening:
+            self._preload_digi_ctx()   # 監聽中裝置清單變更才重新預載（啟動時不做，避免卡頓）
 
     # ------------------------------------------------------------------
     # Hot-plug detection
@@ -881,7 +889,7 @@ class HIDToolApp(tk.Tk):
             # 「全部 digitizer」：不選裝置、自動解碼所有 digitizer
             self._all_digi_mode = True
             self._selected_dev = None
-            self._preload_digi_ctx()          # 先讀好所有 digitizer 的 descriptor
+            self._adigi_entries = []          # 預載延後到開始監聽時才做，避免啟動卡頓
             self._digi_rate_deques.clear()
             self._digi_rate_var.set("")
             self._clear_digi_canvas()
@@ -1848,6 +1856,8 @@ class HIDToolApp(tk.Tk):
             self._descriptors.pop(path_str, None)
             self._raw_descriptors.pop(path_str, None)
             self._load_descriptor(self._selected_dev)
+        elif self._all_digi_mode:
+            self._preload_digi_ctx()   # 全裝置模式：監聽開始時才預載所有 digitizer descriptor
 
         extra_up = self._selected_dev.get("usage_page", 0) if self._selected_dev else 0
         extra_u  = self._selected_dev.get("usage",      0) if self._selected_dev else 0
@@ -3208,7 +3218,7 @@ class HIDToolApp(tk.Tk):
 
     def _on_touch_canvas_configure(self, *_):
         if self._all_digi_mode:
-            self._redraw_digi_canvas()
+            self._schedule_digi_canvas_redraw()   # 節流，縮放時不會每次都全重繪
         else:
             self._redraw_canvas()
 
