@@ -922,6 +922,19 @@ class HIDToolApp(tk.Tk):
             return path.decode("utf-8", errors="replace")
         return str(path)
 
+    @staticmethod
+    def _dev_match_key(name: str) -> str:
+        """把 hidapi path 與 RawInput device_name 正規化成可比對的裝置 key
+        （取 HID# 之後、去掉結尾的 interface class GUID，含 VID/PID/MI/Col/實例）。"""
+        s = (name or "").lower()
+        i = s.find("hid#")
+        if i >= 0:
+            s = s[i:]
+        j = s.rfind("#{")          # 結尾的 {GUID}，所有 HID 介面都一樣
+        if j >= 0:
+            s = s[:j]
+        return s
+
     def _load_descriptor(self, dev: dict):
         path_str = self._get_dev_path_str(dev)
         if path_str in self._descriptors:
@@ -1855,7 +1868,14 @@ class HIDToolApp(tk.Tk):
 
         if pkts and not self._replay_active:
             gap_threshold = self._gap_threshold()
+            # 只處理「選定監聽裝置」的封包；RawInput 會收到所有同 usage page 裝置
+            listen_key = (self._dev_match_key(self._get_dev_path_str(self._selected_dev))
+                          if self._selected_dev else "")
             for pkt in pkts:
+                if listen_key:
+                    dn = pkt.get("device_name", "")
+                    if dn and self._dev_match_key(dn) != listen_key:
+                        continue   # 非選定裝置，忽略（不錄製/不計數/不顯示）
                 if self._listening:
                     self._record_buf.append({
                         "data": pkt.get("data", b""),
