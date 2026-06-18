@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 import webbrowser
 import zipfile
 from tkinter import filedialog, messagebox, ttk, scrolledtext
@@ -76,9 +77,9 @@ class HIDToolApp(tk.Tk):
     _FONT_UI_BOLD = ("Microsoft JhengHei UI", 9, "bold")
     _FONT_MONO    = ("Consolas", 9)
 
-    # 固定 tk scaling（pt→px 換算係數），讓字體像素大小不隨螢幕 DPI 改變
-    # → 不同解析度／縮放比例的螢幕字級一致。1.3333 ≈ 96 DPI（100%）
-    _TK_SCALING = 1.3333
+    # UI 在 96 DPI（100%）下的基準視窗尺寸；實際依螢幕 DPI 動態放大
+    _BASE_W, _BASE_H       = 1400, 820
+    _BASE_MIN_W, _BASE_MIN_H = 1120, 680
 
     _RECORD_MAX   = 50000   # 監聽回放的封包環形緩衝上限（約數 MB）
 
@@ -123,6 +124,79 @@ class HIDToolApp(tk.Tk):
         except Exception:
             pass
 
+    def _current_dpi(self) -> int:
+        """取得視窗目前所在螢幕的 DPI（per-monitor）。失敗則退回 Tk 量測。"""
+        try:
+            user32 = ctypes.windll.user32
+            user32.GetDpiForWindow.restype  = ctypes.c_uint
+            user32.GetDpiForWindow.argtypes = [ctypes.c_void_p]
+            dpi = user32.GetDpiForWindow(ctypes.c_void_p(self.winfo_id()))
+            if dpi:
+                return int(dpi)
+        except Exception:
+            pass
+        try:
+            return int(round(self.winfo_fpixels("1i")))
+        except Exception:
+            return 96
+
+    def _apply_dpi_scaling(self) -> int:
+        """依目前螢幕 DPI 設定 tk scaling（pt→px），讓字體在 4K/2K 自動放大。"""
+        dpi = self._current_dpi() or 96
+        self._cur_dpi = dpi
+        try:
+            self.tk.call("tk", "scaling", dpi / 72.0)
+        except Exception:
+            pass
+        self._apply_font_scaling()
+        return dpi
+
+    # sv_ttk 用負值（像素）定義的具名字體，不吃 tk scaling，需手動依倍率放大
+    _SV_FONTS = (
+        "SunValleyCaptionFont", "SunValleyBodyFont", "SunValleyBodyStrongFont",
+        "SunValleyBodyLargeFont", "SunValleySubtitleFont", "SunValleyTitleFont",
+        "SunValleyTitleLargeFont", "SunValleyDisplayFont",
+    )
+
+    def _capture_sv_font_sizes(self):
+        """記下 sv_ttk 具名字體的原始大小，之後依 DPI 倍率從原始值換算（避免疊加）。"""
+        self._sv_font_orig = {}
+        for name in self._SV_FONTS:
+            try:
+                self._sv_font_orig[name] = int(tkfont.nametofont(name).cget("size"))
+            except Exception:
+                pass
+
+    def _sx(self, px) -> int:
+        """把基準（96 DPI）的像素值依目前 DPI 倍率（sf=dpi/96）縮放，用於欄寬等固定像素。"""
+        return int(round(px * (getattr(self, "_cur_dpi", 96) or 96) / 96.0))
+
+    def _apply_font_scaling(self):
+        """把 sv_ttk 像素字體與 Treeview 列高依 DPI 倍率（sf=dpi/96）放大。"""
+        sf = (getattr(self, "_cur_dpi", 96) or 96) / 96.0
+        for name, orig in getattr(self, "_sv_font_orig", {}).items():
+            try:
+                tkfont.nametofont(name).configure(size=int(round(orig * sf)))
+            except Exception:
+                pass
+        try:
+            ttk.Style(self).configure("Treeview", rowheight=int(round(26 * sf)))
+        except Exception:
+            pass
+
+    def _on_possible_dpi_change(self, event):
+        """視窗被拖到不同 DPI 螢幕時，動態重算字體縮放。"""
+        if event.widget is not self:
+            return
+        dpi = self._current_dpi()
+        if dpi and dpi != self._cur_dpi:
+            self._cur_dpi = dpi
+            try:
+                self.tk.call("tk", "scaling", dpi / 72.0)
+            except Exception:
+                pass
+            self._apply_font_scaling()
+
     def __init__(self):
         # 高 DPI 清晰度（必須在建立 Tk 視窗前設定）
         self._set_dpi_awareness()
@@ -131,16 +205,18 @@ class HIDToolApp(tk.Tk):
         except Exception:
             pass
         super().__init__()
-        # 固定 tk scaling，讓 pt 字體像素大小不隨螢幕 DPI 改變（每台螢幕字級一致）
-        try:
-            self.tk.call("tk", "scaling", self._TK_SCALING)
-        except Exception:
-            pass
         self.withdraw()   # 立即隱藏，防止預設小視窗閃爍
+        # 依螢幕 DPI 動態調整字體與視窗尺寸（4K/2K 高 DPI 自動放大）
+        self._cur_dpi = 96
+        dpi = self._apply_dpi_scaling()
         self.title(f"{self._APP_NAME} - {self._APP_VERSION_LABEL}")
         self._set_window_icon()
-        self.geometry("1400x820")
-        self.minsize(1120, 680)
+        sf = dpi / 96.0
+        gw = min(int(self._BASE_W * sf), self.winfo_screenwidth())
+        gh = min(int(self._BASE_H * sf), self.winfo_screenheight() - 60)
+        self.geometry(f"{gw}x{gh}")
+        self.minsize(min(int(self._BASE_MIN_W * sf), gw),
+                     min(int(self._BASE_MIN_H * sf), gh))
         self._setup_style()
 
         # Shared state
@@ -271,6 +347,7 @@ class HIDToolApp(tk.Tk):
     def _setup_style(self):
         # Windows 11 風主題；大部分元件外觀交給 sv-ttk
         sv_ttk.set_theme("light")
+        self._capture_sv_font_sizes()   # 記下 sv_ttk 原始字體大小（供 DPI 縮放）
         self.option_add("*Font", self._FONT_UI)   # 影響 tk（非 ttk）元件
 
         style = ttk.Style(self)
@@ -299,6 +376,9 @@ class HIDToolApp(tk.Tk):
                         font=("Consolas", 9, "bold"), padding=(8, 2))
         style.configure("TopChipErr.TLabel", background="#fdeaea", foreground="#c92a2a",
                         font=("Consolas", 9, "bold"), padding=(8, 2))
+
+        # sv_ttk 像素字體 + Treeview 列高依目前 DPI 放大
+        self._apply_font_scaling()
 
     def _mk_color_button(self, parent, text, command, color, color_dark):
         """彩色扁平按鈕（sv-ttk 的 ttk 按鈕吃不到背景色，故用 tk.Button）。"""
@@ -352,6 +432,11 @@ class HIDToolApp(tk.Tk):
             pass
         self.deiconify()
         self.update_idletasks()
+        # 視窗顯示到實際螢幕後重算 DPI（開在非主螢幕時才正確）
+        if self._current_dpi() != self._cur_dpi:
+            self._apply_dpi_scaling()
+        # 拖到不同 DPI 螢幕時動態重算字體
+        self.bind("<Configure>", self._on_possible_dpi_change, add="+")
         # 預熱各分頁（此時視窗透明，不會閃爍）
         self._warmup_tabs()
         # 一切就緒，顯示視窗
@@ -464,9 +549,9 @@ class HIDToolApp(tk.Tk):
         self._desc_tree.heading("#0",            text="欄位 / 名稱")
         self._desc_tree.heading("bit_size",      text="位元大小")
         self._desc_tree.heading("logical_range", text="Logical 範圍")
-        self._desc_tree.column("#0",            width=200, stretch=True)
-        self._desc_tree.column("bit_size",      width=70,  stretch=False)
-        self._desc_tree.column("logical_range", width=100, stretch=False)
+        self._desc_tree.column("#0",            width=self._sx(200), stretch=True)
+        self._desc_tree.column("bit_size",      width=self._sx(70),  stretch=False)
+        self._desc_tree.column("logical_range", width=self._sx(100), stretch=False)
 
         ttk.Button(left_frame, text="原始 Descriptor Bytes",
                    command=self._show_raw_descriptor).pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
@@ -1145,8 +1230,9 @@ class HIDToolApp(tk.Tk):
     # Monitor: Table columns
     # ------------------------------------------------------------------
 
-    # Usage Page 0x09 / Usage 0xC5 以外、UP=0xFF01 以外的特殊展開欄位
-    _FF01_LIKE = {(0x09, 0xC5)}
+    # 比照 FF01 逐 byte 展開的欄位（非真的 FF01）：
+    #   (0x09, 0xC5) 廠商資料、(0x0D, 0x1F) 手寫筆 debug 資訊
+    _FF01_LIKE = {(0x09, 0xC5), (0x0D, 0x1F)}
 
     # 這些 usage 重複出現時代表「多個實例」（多接點 / 多軸），
     # 不可當成一個寬位元值合併（例如 Usage(X) Report Count 2 = 兩個 X）
@@ -1503,7 +1589,7 @@ class HIDToolApp(tk.Tk):
             self._table["show"] = "headings"
             for c in self._col_defs:
                 self._table.heading(c["col_id"], text=c["label"])
-                self._table.column(c["col_id"], width=c["width"],
+                self._table.column(c["col_id"], width=self._sx(c["width"]),
                                    stretch=(c["col_id"] == "__raw__"), anchor="center")
             return
 
@@ -1653,7 +1739,7 @@ class HIDToolApp(tk.Tk):
         self._table["show"]    = "headings"
         for c in col_defs:
             self._table.heading(c["col_id"], text=c["label"])
-            self._table.column(c["col_id"], width=c["width"],
+            self._table.column(c["col_id"], width=self._sx(c["width"]),
                                stretch=(c["col_id"] == "__raw__"), anchor="center")
 
     # ------------------------------------------------------------------
@@ -4351,7 +4437,7 @@ class HIDToolApp(tk.Tk):
         tree["columns"] = cols
         for col in cols:
             tree.heading(col, text=col)
-            tree.column(col, width=70, anchor="center", stretch=False)
+            tree.column(col, width=self._sx(70), anchor="center", stretch=False)
         if not rows:
             return
 

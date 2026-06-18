@@ -319,7 +319,11 @@ _USAGE_NAME: Dict[Tuple[int, int], str] = {
     (0x0D, 0x56): "ScanTime",
     (0x0D, 0x3D): "XTilt",
     (0x0D, 0x3E): "YTilt",
+    (0x0D, 0x3F): "Azimuth",
     (0x0D, 0x41): "Twist",
+    (0x0D, 0x3B): "BatteryStrength",
+    (0x0D, 0x5B): "SerialNumber",
+    (0x0D, 0x91): "VendorID",
 }
 
 
