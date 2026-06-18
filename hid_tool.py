@@ -7,9 +7,12 @@ import collections
 import csv
 import ctypes
 import datetime
+import math
 import os
 import queue
+import re
 import sys
+import traceback
 import threading
 import time
 import tkinter as tk
@@ -80,6 +83,9 @@ class HIDToolApp(tk.Tk):
     # UI 在 96 DPI（100%）下的基準視窗尺寸；實際依螢幕 DPI 動態放大
     _BASE_W, _BASE_H       = 1400, 820
     _BASE_MIN_W, _BASE_MIN_H = 1120, 680
+
+    # 監聽裝置下拉的第一個哨兵：不選裝置、自動解所有 digitizer
+    _ALL_DIGI_LABEL = "（全部 digitizer — 不選裝置，自動解碼）"
 
     _RECORD_MAX   = 50000   # 監聽回放的封包環形緩衝上限（約數 MB）
 
@@ -233,6 +239,17 @@ class HIDToolApp(tk.Tk):
         self._selected_dev:      Optional[dict]            = None
         self._descriptors:       Dict[str, List[HIDField]] = {}
         self._raw_descriptors:   Dict[str, bytes]          = {}  # path_str -> raw descriptor bytes
+
+        # 「全部 digitizer」自動模式
+        self._all_digi_mode:     bool                      = False
+        self._adigi_entries:     List[tuple]               = []   # (vidpid, col, ctx_by_rid) 預載清單
+        self._digi_headers:      List[str]                 = []
+        self._digi_rate_deques:  Dict[str, collections.deque] = {}  # 來源 label -> rx_time deque
+        # 每裝置畫布（grid）：label -> {order,color,xr,yr,contacts,trails}
+        # 注意：DigiInfo 分頁已用 self._digi_canvas 當畫布元件，這裡務必用別名避免衝突
+        self._adigi_devs:        Dict[str, dict]           = {}
+        self._digi_dev_next:     int                       = 0
+        self._digi_canvas_redraw_pending: bool             = False
 
         # Monitor state
         self._raw_thread:       Optional[RawInputThread] = None
@@ -699,10 +716,17 @@ class HIDToolApp(tk.Tk):
                                    padding=(4, 4), style="Section.TLabelframe")
         self._monitor_split.add(tbl_frame, minsize=300, stretch="always")
 
-        self._table = ttk.Treeview(tbl_frame, show="headings", selectmode="browse",
+        # 全裝置模式：每個來源裝置（各觸控裝置與筆）各自的 scan/s（單一裝置模式隱藏）
+        self._digi_rate_var = tk.StringVar(value="")
+        self._digi_rate_lbl = ttk.Label(tbl_frame, textvariable=self._digi_rate_var,
+                                        style="Muted.TLabel", anchor="w", font=self._FONT_MONO)
+
+        self._tbl_wrap = ttk.Frame(tbl_frame)
+        self._tbl_wrap.pack(fill=tk.BOTH, expand=True)
+        self._table = ttk.Treeview(self._tbl_wrap, show="headings", selectmode="browse",
                                    style="Mono.Treeview")
-        vsb = ttk.Scrollbar(tbl_frame, orient=tk.VERTICAL,   command=self._table.yview)
-        hsb = ttk.Scrollbar(tbl_frame, orient=tk.HORIZONTAL, command=self._table.xview)
+        vsb = ttk.Scrollbar(self._tbl_wrap, orient=tk.VERTICAL,   command=self._table.yview)
+        hsb = ttk.Scrollbar(self._tbl_wrap, orient=tk.HORIZONTAL, command=self._table.xview)
         self._table.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
         vsb.pack(side=tk.RIGHT,  fill=tk.Y)
         hsb.pack(side=tk.BOTTOM, fill=tk.X)
@@ -799,20 +823,21 @@ class HIDToolApp(tk.Tk):
         )
         labels = [format_device_label(d) for d in self._hidapi_devices]
         paths  = [self._get_dev_path_str(d) for d in self._hidapi_devices]
-        self._dev_combo["values"] = labels
+        # 第一個是「全部 digitizer」哨兵，其餘裝置往後位移 1
+        self._dev_combo["values"] = [self._ALL_DIGI_LABEL] + labels
         self._hide_dev_tooltip()
-        if labels:
-            if prev_path in paths:
-                idx = paths.index(prev_path)
-                self._dev_combo.current(idx)
-                self._selected_dev = self._hidapi_devices[idx]
-                if not auto:
-                    self._on_device_selected(None)   # 手動重整：重新載入 descriptor
-            else:
-                self._dev_combo.current(0)
-                self._on_device_selected(None)
+        if self._all_digi_mode:
+            self._dev_combo.current(0)            # 維持全部 digitizer 模式
+        elif labels and prev_path in paths:
+            idx = paths.index(prev_path)
+            self._dev_combo.current(idx + 1)
+            self._selected_dev = self._hidapi_devices[idx]
+            if not auto:
+                self._on_device_selected(None)   # 手動重整：重新載入 descriptor
         else:
-            self._dev_var.set("")
+            # 預設選「全部 digitizer」（沒有先前選擇 / 沒有裝置時）
+            self._dev_combo.current(0)
+            self._on_device_selected(None)
             self._selected_dev = None
 
         cmd_labels = [self._CMD_SAME_LABEL] + labels
@@ -827,6 +852,9 @@ class HIDToolApp(tk.Tk):
 
         prefix = "偵測到裝置變更，" if auto else ""
         self._status_var.set(f"{prefix}找到 {len(self._hidapi_devices)} 個 HID 裝置")
+
+        if self._all_digi_mode:
+            self._preload_digi_ctx()   # 全裝置模式：裝置清單變更後重新預載 ctx
 
     # ------------------------------------------------------------------
     # Hot-plug detection
@@ -848,10 +876,37 @@ class HIDToolApp(tk.Tk):
 
     def _on_device_selected(self, event):
         idx = self._dev_combo.current()
-        if idx < 0 or idx >= len(self._hidapi_devices):
+        was_all = self._all_digi_mode
+        if idx == 0:
+            # 「全部 digitizer」：不選裝置、自動解碼所有 digitizer
+            self._all_digi_mode = True
+            self._selected_dev = None
+            self._preload_digi_ctx()          # 先讀好所有 digitizer 的 descriptor
+            self._digi_rate_deques.clear()
+            self._digi_rate_var.set("")
+            self._clear_digi_canvas()
+            self._reset_monitor_runtime_state()
+            self._setup_all_digi_columns()
+            self._digi_rate_lbl.pack(side=tk.TOP, fill=tk.X, padx=2, pady=(0, 2),
+                                     before=self._tbl_wrap)
+            self._hide_dev_tooltip()
+            # 監聽中切入：重啟以註冊完整 digitizer TLC（含 Pen/Stylus）
+            if self._listening:
+                self._stop_listen()
+                self._start_listen()
             return
-        self._selected_dev = self._hidapi_devices[idx]
+        self._all_digi_mode = False
+        dev_idx = idx - 1   # 哨兵位移
+        if dev_idx < 0 or dev_idx >= len(self._hidapi_devices):
+            return
+        self._selected_dev = self._hidapi_devices[dev_idx]
         self._hide_dev_tooltip()
+        if was_all:
+            self._digi_rate_lbl.pack_forget()
+            self._digi_rate_var.set("")
+            self._digi_rate_deques.clear()
+            self._clear_digi_canvas()
+            self._reset_monitor_runtime_state()
         self._load_descriptor(self._selected_dev)
 
     def _on_cmd_device_selected(self, event):
@@ -869,8 +924,11 @@ class HIDToolApp(tk.Tk):
 
     def _get_selected_device_label(self) -> str:
         idx = self._dev_combo.current()
-        if 0 <= idx < len(self._hidapi_devices):
-            return format_device_label(self._hidapi_devices[idx])
+        if idx == 0:
+            return self._ALL_DIGI_LABEL
+        dev_idx = idx - 1   # 哨兵位移
+        if 0 <= dev_idx < len(self._hidapi_devices):
+            return format_device_label(self._hidapi_devices[dev_idx])
         return self._dev_var.get().strip()
 
     def _show_dev_tooltip(self, event=None):
@@ -924,8 +982,8 @@ class HIDToolApp(tk.Tk):
 
     @staticmethod
     def _dev_match_key(name: str) -> str:
-        """把 hidapi path 與 RawInput device_name 正規化成可比對的裝置 key
-        （取 HID# 之後、去掉結尾的 interface class GUID，含 VID/PID/MI/Col/實例）。"""
+        """把 hidapi path 與 RawInput device_name 正規化成同一條裝置介面路徑 key
+        （取 HID# 之後、去掉結尾 interface GUID）。USB 與 I2C-HID 皆適用，不依賴 VID/PID。"""
         s = (name or "").lower()
         i = s.find("hid#")
         if i >= 0:
@@ -1556,6 +1614,9 @@ class HIDToolApp(tk.Tk):
         return f"{val:02X}"
 
     def _rebuild_table_columns(self):
+        if self._all_digi_mode:
+            self._setup_all_digi_columns()   # 全裝置模式：固定欄位，不被 View/RID/RAW 蓋掉
+            return
         path_str = self._get_dev_path_str(self._selected_dev) if self._selected_dev else ""
         self._setup_table_columns(self._descriptors.get(path_str, []))
 
@@ -1791,8 +1852,15 @@ class HIDToolApp(tk.Tk):
         extra_up = self._selected_dev.get("usage_page", 0) if self._selected_dev else 0
         extra_u  = self._selected_dev.get("usage",      0) if self._selected_dev else 0
 
+        # 全裝置模式：註冊整段 digitizer top-level collection（0x0D 0x01~0x0E），
+        # 涵蓋 Digitizer/Pen/LightPen/TouchScreen/TouchPad/Whiteboard/CMM/3D/Stylus/Finger…
+        extra_usages = None
+        if self._all_digi_mode:
+            extra_usages = [(0x0D, u) for u in range(0x01, 0x0F)]
+
         self._raw_thread = RawInputThread(
             self._packet_queue, extra_usage_page=extra_up, extra_usage=extra_u,
+            extra_usages=extra_usages,
         )
         self._raw_thread.start()
         self._raw_thread._ready_event.wait(timeout=3.0)
@@ -1844,6 +1912,9 @@ class HIDToolApp(tk.Tk):
     def _ingest_packet(self, pkt: dict, gap_threshold: float):
         """單一封包進管線：判斷新幀、更新狀態、填表格與畫布。
         即時監聽與回放共用，確保兩者行為完全一致。"""
+        if self._all_digi_mode:
+            self._handle_digi_packet(pkt)
+            return
         rx_time = pkt.get("rx_time", time.monotonic())
         is_new_frame = self._is_new_frame(pkt, rx_time, gap_threshold)
         if is_new_frame:
@@ -1857,36 +1928,56 @@ class HIDToolApp(tk.Tk):
             self._frame_deque.popleft()
         if hasattr(self, "_top_rate_var"):
             self._top_rate_var.set(f"{len(self._frame_deque)} scan/s")
+        if self._all_digi_mode:
+            self._update_digi_rate_detail(cutoff)
+
+    def _update_digi_rate_detail(self, cutoff: float):
+        """全裝置模式：算出每個來源裝置（各觸控裝置 / 筆）目前的 scan/s。"""
+        parts = []
+        for label in sorted(self._digi_rate_deques):
+            dq = self._digi_rate_deques[label]
+            while dq and dq[0] < cutoff:
+                dq.popleft()
+            if dq:
+                parts.append(f"{label}={len(dq)}/s")
+        self._digi_rate_var.set("scan/s   " + "   ".join(parts) if parts else "")
 
     def _poll_queue(self):
-        pkts = []
+        # 整段包 try/finally：單一封包/處理出錯也絕不讓 poll 迴圈停掉
         try:
-            while len(pkts) < 64:
-                pkts.append(self._packet_queue.get_nowait())
-        except queue.Empty:
-            pass
+            pkts = []
+            try:
+                while len(pkts) < 64:
+                    pkts.append(self._packet_queue.get_nowait())
+            except queue.Empty:
+                pass
 
-        if pkts and not self._replay_active:
-            gap_threshold = self._gap_threshold()
-            # 只處理「選定監聽裝置」的封包；RawInput 會收到所有同 usage page 裝置
-            listen_key = (self._dev_match_key(self._get_dev_path_str(self._selected_dev))
-                          if self._selected_dev else "")
-            for pkt in pkts:
-                if listen_key:
-                    dn = pkt.get("device_name", "")
-                    if dn and self._dev_match_key(dn) != listen_key:
-                        continue   # 非選定裝置，忽略（不錄製/不計數/不顯示）
-                if self._listening:
-                    self._record_buf.append({
-                        "data": pkt.get("data", b""),
-                        "rx_time": pkt.get("rx_time", time.monotonic()),
-                        "device_name": pkt.get("device_name", ""),
-                    })
-                self._ingest_packet(pkt, gap_threshold)
-            self._update_scan_rate(time.monotonic())
-            self._update_record_status()
-
-        self.after(20, self._poll_queue)
+            if pkts and not self._replay_active:
+                gap_threshold = self._gap_threshold()
+                # 只處理「選定監聽裝置」的封包；RawInput 會收到所有同 usage page 裝置
+                listen_key = (self._dev_match_key(self._get_dev_path_str(self._selected_dev))
+                              if self._selected_dev else "")
+                for pkt in pkts:
+                    try:
+                        if listen_key:
+                            dn = pkt.get("device_name", "")
+                            if dn and self._dev_match_key(dn) != listen_key:
+                                continue   # 非選定裝置，忽略（不錄製/不計數/不顯示）
+                        if self._listening:
+                            self._record_buf.append({
+                                "data": pkt.get("data", b""),
+                                "rx_time": pkt.get("rx_time", time.monotonic()),
+                                "device_name": pkt.get("device_name", ""),
+                            })
+                        self._ingest_packet(pkt, gap_threshold)
+                    except Exception:
+                        traceback.print_exc()
+                self._update_scan_rate(time.monotonic())
+                self._update_record_status()
+        except Exception:
+            traceback.print_exc()
+        finally:
+            self.after(20, self._poll_queue)
 
     _MAX_ROWS = 300
 
@@ -2062,6 +2153,361 @@ class HIDToolApp(tk.Tk):
         if len(children) > max_rows:
             for iid in children[max_rows:]:
                 self._table.delete(iid)
+
+    # ------------------------------------------------------------------
+    # 「全部 digitizer」自動模式：不選裝置，通用 HID digitizer 解碼
+    # ------------------------------------------------------------------
+
+    _ALL_DIGI_COLS = [
+        ("__dev__",      "裝置",      110),
+        ("ScanTime",     "ScanTime",   80),
+        ("ContactCount", "Cnt",        45),
+        ("__slot__",     "Slot",       42),
+        ("ContactID",    "CID",        55),
+        ("X",            "X",          70),
+        ("Y",            "Y",          70),
+        ("TipPressure",  "Press",      60),
+        ("Width",        "W",          48),
+        ("Height",       "H",          48),
+        ("XTilt",        "XTilt",      55),
+        ("YTilt",        "YTilt",      55),
+        ("Azimuth",      "Azim",       55),
+        ("Status",       "Status",    150),
+    ]
+
+    def _setup_all_digi_columns(self):
+        self._col_defs = []                          # 避免其他單一裝置路徑誤用
+        self._digi_headers = [c[1] for c in self._ALL_DIGI_COLS]
+        ids = [c[0] for c in self._ALL_DIGI_COLS]
+        self._table["columns"] = ids
+        self._table["show"] = "headings"
+        for cid_, lbl, w in self._ALL_DIGI_COLS:
+            self._table.heading(cid_, text=lbl)
+            self._table.column(cid_, width=self._col_width(w, lbl),
+                               stretch=(cid_ == "Status"), anchor="center")
+
+    @staticmethod
+    def _short_dev_label(dev: dict) -> str:
+        vid = dev.get("vendor_id", 0)
+        pid = dev.get("product_id", 0)
+        col = device_collection(dev)
+        tag = f" Col{col:02d}" if col >= 0 else ""
+        return f"{vid:04X}:{pid:04X}{tag}"
+
+    def _build_digi_ctx(self, fields: List[HIDField]) -> dict:
+        """為某裝置 descriptor 建立通用 digitizer 解碼 context：
+        {report_id: {"groups":[{usage:(hf,idx)}], "scan":entry, "count":entry}}，
+        僅含有 X 與 Y 的觸控 report。"""
+        input_fields = [f for f in fields if f.report_type == REPORT_TYPE_INPUT]
+        by_rid: dict = {}
+        keys = ("ContactID", "X", "Y", "Width", "Height", "TipSwitch",
+                "Confidence", "InRange", "Invert", "Eraser", "BarrelSwitch")
+        for rid in sorted(set(f.report_id for f in input_fields)):
+            rf = [f for f in input_fields if f.report_id == rid]
+            entries = self._build_touch_usage_entries(rf)
+            if not (entries["X"] and entries["Y"]):
+                continue
+            gc = max(len(entries["ContactID"]), len(entries["X"]),
+                     len(entries["Y"]), len(entries["TipSwitch"]), 1)
+            groups = [{k: (entries[k][i] if i < len(entries[k]) else None) for k in keys}
+                      for i in range(gc)]
+
+            def _find(page, usage, _rf=rf):
+                for hf in _rf:
+                    if hf.is_vendor:
+                        continue
+                    us = hf.usages[:hf.report_count] if hf.usages else []
+                    for idx, u in enumerate(us):
+                        if (hf.usage_page, u) == (page, usage):
+                            return (hf, idx)
+                return None
+
+            xhf = entries["X"][0][0]
+            yhf = entries["Y"][0][0]
+            by_rid[rid] = {"groups": groups,
+                           "scan":  _find(0x0D, 0x56),   # ScanTime
+                           "count": _find(0x0D, 0x54),   # ContactCount
+                           "press": _find(0x0D, 0x30),   # TipPressure（手寫筆）
+                           "xtilt": _find(0x0D, 0x3D),   # XTilt
+                           "ytilt": _find(0x0D, 0x3E),   # YTilt
+                           "azim":  _find(0x0D, 0x3F),   # Azimuth
+                           "xr": (xhf.logical_min, xhf.logical_max),
+                           "yr": (yhf.logical_min, yhf.logical_max)}
+        return by_rid
+
+    def _preload_digi_ctx(self):
+        """進入全裝置模式時，先把所有 digitizer 的 descriptor 讀好建 ctx，
+        避免封包到達時裝置正被使用而讀不到 descriptor。"""
+        self._adigi_entries = []
+        for dev in self._hidapi_devices:
+            if dev.get("usage_page") != 0x0D:
+                continue
+            try:
+                path_str = self._get_dev_path_str(dev)
+                fields = self._descriptors.get(path_str)
+                if fields is None:
+                    raw = read_descriptor_via_hidapi(dev.get("path", b""))
+                    fields = parse_report_descriptor(raw) if raw else []
+                    self._descriptors[path_str] = fields
+                ctx = self._build_digi_ctx(fields)
+                if not ctx:
+                    continue
+                key = self._dev_match_key(path_str)        # 完整路徑 key
+                vp, col = self._parse_vidpid_col(path_str)
+                self._adigi_entries.append((key, vp, col, ctx))
+            except Exception:
+                continue
+
+    @staticmethod
+    def _parse_vidpid_col(name: str):
+        s = (name or "").lower()
+        m = re.search(r"vid_([0-9a-f]{4}).*?pid_([0-9a-f]{4})", s)
+        if not m:
+            return None, None
+        col = re.search(r"&col([0-9a-f]+)", s)
+        return f"{m.group(1)}:{m.group(2)}", (col.group(1) if col else None)
+
+    def _get_digi_rid_ctx(self, device_name: str, report_id: int):
+        """為封包選出正確 collection 的 rid-ctx：
+        1) 先用完整裝置介面路徑精準比對（USB / I2C-HID 皆可，不需 VID/PID）
+        2) 退而用 VID:PID + report_id（優先 Col 相符）
+        回 (rid_ctx, label) 或 None。"""
+        label = self._label_from_name(device_name)
+        key = self._dev_match_key(device_name)
+        if key:
+            for k, vp, col, ctx in self._adigi_entries:
+                if k == key:
+                    rc = ctx.get(report_id)
+                    if rc is not None:
+                        return rc, label
+        pvp, pcol = self._parse_vidpid_col(device_name)
+        if pvp:
+            best = None
+            for k, vp, col, ctx in self._adigi_entries:
+                if vp != pvp:
+                    continue
+                rc = ctx.get(report_id)
+                if rc is None:
+                    continue
+                if col == pcol:
+                    return rc, label
+                if best is None:
+                    best = (rc, label)
+            if best:
+                return best
+        return None
+
+    @staticmethod
+    def _label_from_name(name: str) -> str:
+        s = (name or "").lower()
+        col = re.search(r"&col([0-9a-f]+)", s)
+        tag = f" Col{int(col.group(1), 16):02d}" if col else ""
+        m = re.search(r"vid_([0-9a-f]{4}).*?pid_([0-9a-f]{4})", s)
+        if m:
+            return f"{m.group(1).upper()}:{m.group(2).upper()}{tag}"
+        # I2C-HID / ACPI：沒有 VID/PID，改取 HID# 之後的硬體 ID 片段
+        i = s.find("hid#")
+        if i >= 0:
+            hwid = s[i + 4:].split("#")[0].split("&")[0].upper()
+            if hwid:
+                return f"{hwid}{tag}"
+        return "??"
+
+    def _decode_digi_rows(self, ctx: dict, payload: bytes, label: str) -> List[list]:
+        def rd(entry):
+            if not entry:
+                return ""
+            hf, idx = entry
+            if hf.per_bit_size <= 0:
+                return ""
+            vals = extract_field_value(payload, hf.bit_offset, hf.per_bit_size,
+                                       hf.report_count, hf.logical_min)
+            return vals[idx] if idx < len(vals) else ""
+
+        scan  = rd(ctx["scan"])
+        count = rd(ctx["count"])
+        press = rd(ctx.get("press"))
+        xtilt = rd(ctx.get("xtilt"))
+        ytilt = rd(ctx.get("ytilt"))
+        azim  = rd(ctx.get("azim"))
+        try:
+            active = int(count)
+        except (TypeError, ValueError):
+            active = -1
+
+        rows: List[list] = []
+        for slot, g in enumerate(ctx["groups"]):
+            x   = rd(g["X"]);   y   = rd(g["Y"])
+            tip = rd(g["TipSwitch"]); cid = rd(g["ContactID"])
+            w   = rd(g["Width"]); h = rd(g["Height"])
+            empty_core = (tip in ("", 0) and cid in ("", 0)
+                          and x in ("", 0) and y in ("", 0))
+            if active >= 0 and slot >= active and empty_core:
+                continue
+            if empty_core and w in ("", 0) and h in ("", 0):
+                continue
+            status = self._merge_status({
+                "Confidence": rd(g["Confidence"]), "InRange": rd(g["InRange"]),
+                "TipSwitch": tip, "Eraser": rd(g["Eraser"]),
+                "Invert": rd(g["Invert"]), "BarrelSwitch": rd(g["BarrelSwitch"]),
+            })
+            rows.append([label, scan, count, slot, cid, x, y,
+                         press, w, h, xtilt, ytilt, azim, status])
+        return rows
+
+    def _handle_digi_packet(self, pkt: dict):
+        data: bytes = pkt.get("data", b"")
+        if not data:
+            return
+        res = self._get_digi_rid_ctx(pkt.get("device_name", ""), data[0])
+        if not res:
+            return
+        ctx, label = res
+        payload = data[1:] if len(data) > 1 else b""
+        rx = pkt.get("rx_time", time.monotonic())
+        self._frame_deque.append(rx)
+        self._digi_rate_deques.setdefault(label, collections.deque()).append(rx)
+        self._frame_seq += 1
+        for row in self._decode_digi_rows(ctx, payload, label):
+            self._append_monitor_row(pkt, self._digi_headers, row, (), [])
+        self._feed_digi_canvas(label, ctx, payload)
+
+    # ---- 全裝置畫布（每裝置一格 grid）----
+
+    def _feed_digi_canvas(self, label: str, ctx: dict, payload: bytes):
+        def rd(entry):
+            if not entry:
+                return ""
+            hf, idx = entry
+            if hf.per_bit_size <= 0:
+                return ""
+            vals = extract_field_value(payload, hf.bit_offset, hf.per_bit_size,
+                                       hf.report_count, hf.logical_min)
+            return vals[idx] if idx < len(vals) else ""
+
+        dev = self._adigi_devs.get(label)
+        if dev is None:
+            order = self._digi_dev_next
+            self._digi_dev_next += 1
+            dev = {"order": order,
+                   "color": self._SLOT_COLORS[order % len(self._SLOT_COLORS)],
+                   "xr": ctx.get("xr", (0, 1)), "yr": ctx.get("yr", (0, 1)),
+                   "contacts": {}, "trails": {}}
+            self._adigi_devs[label] = dev
+
+        try:
+            active_count = int(rd(ctx.get("count")))
+        except (TypeError, ValueError):
+            active_count = -1
+
+        active_keys = set()
+        off_keys = set()
+        for slot, g in enumerate(ctx["groups"]):
+            # 有 ContactCount 時，超出數量的 slot 是 padding，直接略過避免誤判
+            if active_count >= 0 and slot >= active_count:
+                continue
+            cid = rd(g["ContactID"])
+            key = cid if cid not in ("", None) else f"s{slot}"
+            tip = rd(g["TipSwitch"]); inr = rd(g["InRange"])
+            down  = bool(tip) if tip != "" else False
+            hover = (not down) and (bool(inr) if inr != "" else False)
+            if down or hover:
+                try:
+                    xi = float(rd(g["X"])); yi = float(rd(g["Y"]))
+                except (TypeError, ValueError):
+                    continue
+                active_keys.add(key)
+                dev["contacts"][key] = {"x": xi, "y": yi, "down": down}
+                if down:
+                    tr = dev["trails"].setdefault(key, collections.deque(maxlen=500))
+                    if not tr or (xi, yi) != tr[-1]:
+                        tr.append((xi, yi))
+                # 懸空（tip off 但 inrange 還在）：保留既有軌跡，只是不再延伸；
+                # 依需求「inrange off 才清除」，所以這裡不 pop 軌跡
+            else:
+                # 明確 off：觸控 tip=0 / 筆 inrange=0（且非 padding）
+                off_keys.add(key)
+        # 只移除「明確回報 off」且本包沒有其他 slot 又報成 active 的接點；
+        # 純粹「這包沒出現」的接點保留，不清除（避免多裝置交錯 / 分包誤清）
+        for key in off_keys - active_keys:
+            dev["contacts"].pop(key, None)
+            dev["trails"].pop(key, None)
+
+        self._schedule_digi_canvas_redraw()
+
+    def _schedule_digi_canvas_redraw(self):
+        if self._digi_canvas_redraw_pending:
+            return
+        self._digi_canvas_redraw_pending = True
+        self.after(33, self._do_digi_canvas_redraw)   # ~30fps 節流
+
+    def _do_digi_canvas_redraw(self):
+        self._digi_canvas_redraw_pending = False
+        try:
+            if not self._touch_canvas.winfo_viewable():
+                return
+        except Exception:
+            return
+        self._redraw_digi_canvas()
+
+    def _redraw_digi_canvas(self):
+        c = self._touch_canvas
+        c.delete("all")
+        w = c.winfo_width(); h = c.winfo_height()
+        if w <= 1 or h <= 1:
+            return
+        devs = sorted(self._adigi_devs.items(), key=lambda kv: kv[1]["order"])
+        if not devs:
+            return
+        cols = math.ceil(math.sqrt(len(devs)))
+        rows = math.ceil(len(devs) / cols)
+        cw = w / cols; ch = h / rows
+        pad = 6; lbl_h = 16
+        for i, (label, dev) in enumerate(devs):
+            r = i // cols; col = i % cols
+            cx0 = col * cw; cy0 = r * ch
+            color = dev["color"]
+            c.create_rectangle(cx0 + 2, cy0 + 2, cx0 + cw - 2, cy0 + ch - 2,
+                               outline="#cccccc", dash=(3, 3))
+            c.create_text(cx0 + 6, cy0 + 3, anchor="nw", text=label,
+                          fill=color, font=("Consolas", 8, "bold"))
+            ax0 = cx0 + pad; ay0 = cy0 + pad + lbl_h
+            aw = cw - 2 * pad; ah = ch - 2 * pad - lbl_h
+            if aw <= 4 or ah <= 4:
+                continue
+            xmin, xmax = dev["xr"]; ymin, ymax = dev["yr"]
+            xspan = (xmax - xmin) or 1
+            yspan = (ymax - ymin) or 1
+
+            def _tx(vx, _a=ax0, _lo=xmin, _s=xspan, _w=aw):
+                return _a + (vx - _lo) / _s * _w
+
+            def _ty(vy, _a=ay0, _lo=ymin, _s=yspan, _h=ah):
+                return _a + (vy - _lo) / _s * _h
+
+            for tr in dev["trails"].values():
+                if len(tr) >= 2:
+                    flat = []
+                    for vx, vy in tr:
+                        flat += [_tx(vx), _ty(vy)]
+                    c.create_line(flat, fill=color, width=2,
+                                  capstyle=tk.ROUND, joinstyle=tk.ROUND)
+            for key, ct in dev["contacts"].items():
+                px = _tx(ct["x"]); py = _ty(ct["y"])
+                rr = 9 if ct["down"] else 6
+                fill = color if ct["down"] else ""
+                c.create_oval(px - rr, py - rr, px + rr, py + rr,
+                              fill=fill, outline=color, width=2)
+                c.create_text(px, py - rr - 6, text=str(key),
+                              fill=color, font=("Consolas", 7))
+
+    def _clear_digi_canvas(self):
+        self._adigi_devs.clear()
+        self._digi_dev_next = 0
+        try:
+            self._touch_canvas.delete("all")
+        except Exception:
+            pass
 
     def _handle_packet(
         self,
@@ -2396,6 +2842,8 @@ class HIDToolApp(tk.Tk):
         self._last_touch_active = False
         self._frame_deque.clear()
         self._clear_canvas()
+        if self._all_digi_mode:
+            self._clear_digi_canvas()
 
     def _replay_toggle(self):
         if self._replay_active:
@@ -2756,7 +3204,13 @@ class HIDToolApp(tk.Tk):
             highlightthickness=1, highlightbackground=self._BORDER,
         )
         self._touch_canvas.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
-        self._touch_canvas.bind("<Configure>", lambda *_: self._redraw_canvas())
+        self._touch_canvas.bind("<Configure>", self._on_touch_canvas_configure)
+
+    def _on_touch_canvas_configure(self, *_):
+        if self._all_digi_mode:
+            self._redraw_digi_canvas()
+        else:
+            self._redraw_canvas()
 
     def _toggle_monitor_canvas(self):
         if self._canvas_shown:

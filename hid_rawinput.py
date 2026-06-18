@@ -108,11 +108,14 @@ class RawInputThread(threading.Thread):
         packet_queue: queue.Queue,
         extra_usage_page: int = 0,
         extra_usage: int = 0,
+        extra_usages=None,
     ):
         super().__init__(daemon=True)
         self.packet_queue     = packet_queue
         self.extra_usage_page = extra_usage_page
         self.extra_usage      = extra_usage
+        # 額外要註冊的 (usage_page, usage) 清單（例如全裝置模式註冊所有 digitizer TLC）
+        self.extra_usages     = list(extra_usages) if extra_usages else []
         self._hwnd            = None
         self._stop_event      = threading.Event()
         self._ready_event     = threading.Event()
@@ -170,6 +173,9 @@ class RawInputThread(threading.Thread):
         usages = [(0x000D, 0x04), (0x000D, 0x05), (0x000D, 0x01)]
         if self.extra_usage_page and self.extra_usage:
             pair = (self.extra_usage_page, self.extra_usage)
+            if pair not in usages:
+                usages.append(pair)
+        for pair in self.extra_usages:
             if pair not in usages:
                 usages.append(pair)
 
