@@ -535,7 +535,7 @@ class HIDToolApp(tk.Tk):
 
         version_label = ttk.Label(
             sb_frame,
-            text=f"{self._APP_VERSION_LABEL} | by {self._APP_AUTHOR}",
+            text=f"by {self._APP_AUTHOR}",
             style="Version.TLabel",
             cursor="hand2",
         )
@@ -631,6 +631,25 @@ class HIDToolApp(tk.Tk):
         digi_sub = ttk.Frame(replay_nb, style="Surface.TFrame")
         replay_nb.add(digi_sub, text="DigiInfo")
         self._build_digi_tab(digi_sub)
+
+        # 切換分頁時，自動暫停已切走的回放（Differ / DigiInfo）
+        self._notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed, add="+")
+        self._replay_nb.bind("<<NotebookTabChanged>>", self._on_tab_changed, add="+")
+
+    def _on_tab_changed(self, event=None):
+        """切換主分頁或回放子分頁時，把已切走（不再顯示）的回放暫停。"""
+        differ_visible = digi_visible = False
+        try:
+            if self._notebook.tab(self._notebook.select(), "text") == "回放":
+                sub = self._replay_nb.tab(self._replay_nb.select(), "text")
+                differ_visible = (sub == "Differ")
+                digi_visible   = (sub == "DigiInfo")
+        except Exception:
+            pass
+        if not differ_visible and self._hm_playing:
+            self._hm_stop_play()
+        if not digi_visible and self._digi_playing:
+            self._digi_stop_play()
 
     def _build_monitor_tab(self, parent):
         ctrl_box = ttk.LabelFrame(parent, text="監聽顯示與篩選", padding=(8, 6),
