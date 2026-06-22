@@ -879,23 +879,31 @@ class HIDToolApp(tk.Tk):
         int_row = ttk.Frame(parent)
         int_row.pack(fill=tk.X, padx=12, pady=(0, 6))
         self._wait_int_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(int_row, text="等待 INT 回應", variable=self._wait_int_var).pack(side=tk.LEFT)
+        self._wait_int_cb = ttk.Checkbutton(int_row, text="等待 INT 回應", variable=self._wait_int_var)
+        self._wait_int_cb.pack(side=tk.LEFT)
         ttk.Label(int_row, text="Timeout (ms):").pack(side=tk.LEFT, padx=(12, 2))
         self._int_timeout_var = tk.StringVar(value="1000")
-        ttk.Spinbox(int_row, from_=50, to=10000, textvariable=self._int_timeout_var, width=6).pack(side=tk.LEFT)
+        self._int_timeout_spin = ttk.Spinbox(int_row, from_=50, to=10000,
+                                              textvariable=self._int_timeout_var, width=6)
+        self._int_timeout_spin.pack(side=tk.LEFT)
         ttk.Label(int_row, text="Length (payload bytes):").pack(side=tk.LEFT, padx=(12, 2))
         self._int_length_var = tk.StringVar(value="63")
-        ttk.Entry(int_row, textvariable=self._int_length_var, width=6).pack(side=tk.LEFT)
+        self._int_length_entry = ttk.Entry(int_row, textvariable=self._int_length_var, width=6)
+        self._int_length_entry.pack(side=tk.LEFT)
+        # 「等待 INT 回應」只在 Report 類型 = Output 時可用
+        self._on_report_type_changed()
 
         log_frame = ttk.LabelFrame(parent, text="操作記錄", padding=6,
                                    style="Section.TLabelframe")
         log_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 6))
 
-        log_ctrl = ttk.Frame(log_frame)
-        log_ctrl.pack(fill=tk.X, pady=(0, 4))
+        # 保留變數（預設關閉），相關顯示邏輯不會啟用
         self._pair_bytes_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(log_ctrl, text="2-byte 合併顯示（第一行32個，其他33個）",
-                        variable=self._pair_bytes_var).pack(side=tk.LEFT)
+        # 「2-byte 合併顯示」功能暫時隱藏，不刪除；要恢復把下面三行取消註解即可
+        # log_ctrl = ttk.Frame(log_frame)
+        # log_ctrl.pack(fill=tk.X, pady=(0, 4))
+        # ttk.Checkbutton(log_ctrl, text="2-byte 合併顯示（第一行32個，其他33個）",
+        #                 variable=self._pair_bytes_var).pack(side=tk.LEFT)
 
         self._send_log = scrolledtext.ScrolledText(
             log_frame, height=14, state="disabled", font=("Consolas", 9))
@@ -3210,6 +3218,18 @@ class HIDToolApp(tk.Tk):
             self._get_btn.pack(side=tk.LEFT, padx=4)
         else:
             self._get_btn.pack_forget()
+        # 「等待 INT 回應」綁定 Output：Output 預設打勾並可用；其他類型取消勾選並停用
+        is_output = (rtype == "Output")
+        state = "normal" if is_output else "disabled"
+        self._wait_int_var.set(is_output)
+        for w in (getattr(self, "_wait_int_cb", None),
+                  getattr(self, "_int_timeout_spin", None),
+                  getattr(self, "_int_length_entry", None)):
+            if w is not None:
+                try:
+                    w.configure(state=state)
+                except Exception:
+                    pass
 
     def _on_send(self):
         if not self._get_cmd_dev():
