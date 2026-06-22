@@ -6,6 +6,7 @@ Imports backend modules: hid_descriptor, hid_rawinput, hid_device
 import collections
 import csv
 import ctypes
+import hashlib
 import datetime
 import json
 import math
@@ -456,7 +457,80 @@ class HIDToolApp(tk.Tk):
         except tk.TclError:
             pass
 
+    # ------------------------------------------------------------------
+    # 登入（單一帳密；密碼以 SHA-256 雜湊存放）
+    # ------------------------------------------------------------------
+    _LOGIN_USER    = "RE024"
+    _LOGIN_PW_HASH = "b2b6556e1a83512fed0d4d1ff24c996e44494cd552132dd887058a8df77f3c03"
+    _LOGIN_MAX_TRY = 5
+
+    def _do_login(self) -> bool:
+        """開啟前的登入視窗。成功回 True；失敗 / 關閉回 False。"""
+        dlg = tk.Toplevel(self)
+        dlg.title("登入")
+        dlg.resizable(False, False)
+        try:
+            dlg.iconbitmap(self._icon_path) if getattr(self, "_icon_path", None) else None
+        except Exception:
+            pass
+
+        state = {"ok": False, "tries": 0}
+        frm = ttk.Frame(dlg, padding=(18, 14))
+        frm.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frm, text=self._APP_NAME, style="FieldLabel.TLabel").grid(
+            row=0, column=0, columnspan=2, pady=(0, 10))
+        ttk.Label(frm, text="帳號").grid(row=1, column=0, sticky="e", padx=(0, 8), pady=4)
+        user_var = tk.StringVar()
+        user_ent = ttk.Entry(frm, textvariable=user_var, width=22)
+        user_ent.grid(row=1, column=1, pady=4)
+        ttk.Label(frm, text="密碼").grid(row=2, column=0, sticky="e", padx=(0, 8), pady=4)
+        pw_var = tk.StringVar()
+        pw_ent = ttk.Entry(frm, textvariable=pw_var, width=22, show="●")
+        pw_ent.grid(row=2, column=1, pady=4)
+        msg_var = tk.StringVar(value="")
+        ttk.Label(frm, textvariable=msg_var, foreground=self._RED).grid(
+            row=3, column=0, columnspan=2, pady=(4, 0))
+
+        def attempt(*_):
+            u = user_var.get().strip()
+            p = pw_var.get()
+            ok = (u == self._LOGIN_USER and
+                  hashlib.sha256(p.encode("utf-8")).hexdigest() == self._LOGIN_PW_HASH)
+            if ok:
+                state["ok"] = True
+                dlg.destroy()
+                return
+            state["tries"] += 1
+            pw_var.set("")
+            left = self._LOGIN_MAX_TRY - state["tries"]
+            if left <= 0:
+                dlg.destroy()
+            else:
+                msg_var.set(f"帳號或密碼錯誤（剩 {left} 次）")
+                pw_ent.focus_set()
+
+        btn = ttk.Button(frm, text="登入", command=attempt)
+        btn.grid(row=4, column=0, columnspan=2, pady=(12, 0), sticky="ew")
+        dlg.bind("<Return>", attempt)
+        dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)   # 關閉視窗 = 失敗
+
+        # 置中於螢幕
+        dlg.update_idletasks()
+        w, h = dlg.winfo_width(), dlg.winfo_height()
+        sw, sh = dlg.winfo_screenwidth(), dlg.winfo_screenheight()
+        dlg.geometry(f"+{(sw - w) // 2}+{(sh - h) // 3}")
+
+        user_ent.focus_set()
+        dlg.attributes("-topmost", True)
+        dlg.grab_set()
+        dlg.wait_window()
+        return state["ok"]
+
     def _startup_finalize(self):
+        # 先登入；失敗就結束程式
+        if not self._do_login():
+            self.destroy()
+            return
         # Report Descriptor 側欄預設收合
         if hasattr(self, "_desc_collapsed") and not self._desc_collapsed:
             self._toggle_desc_panel()
