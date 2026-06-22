@@ -13,3 +13,4 @@ venv/
 # IDE
 .vscode/
 .idea/
+_edition.py

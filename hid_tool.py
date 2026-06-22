@@ -55,6 +55,15 @@ from hid_device import (
 
 
 # ---------------------------------------------------------------------------
+# Edition（版本）：由 build 時產生的 _edition.py 決定，預設 Engineer
+# ---------------------------------------------------------------------------
+try:
+    from _edition import EDITION as _BUILD_EDITION
+except Exception:
+    _BUILD_EDITION = "Engineer"
+
+
+# ---------------------------------------------------------------------------
 # Unified GUI Application
 # ---------------------------------------------------------------------------
 
@@ -63,6 +72,15 @@ class HIDToolApp(tk.Tk):
     _APP_AUTHOR        = "Shane.Lin"
     _APP_VERSION_LABEL = "v1.1"
     _APP_VERSION_TIME  = "2026-06-16"
+
+    # 版本(edition)：Engineer = 全功能；FAE / Customer = 閹割版
+    # 由 build 時產生的 _edition.py 決定（見 .spec），開發/沒有該檔時預設 Engineer。
+    # 工程專用功能用 if self._is_engineer(): ... 包起來即可。
+    _EDITION = _BUILD_EDITION
+
+    @classmethod
+    def _is_engineer(cls) -> bool:
+        return cls._EDITION == "Engineer"
 
     # ---- UI palette & fonts（配合 sv-ttk light 主題）----
     _BG          = "#fafafa"   # sv-ttk light 背景
@@ -234,7 +252,7 @@ class HIDToolApp(tk.Tk):
         # 依螢幕 DPI 動態調整字體與視窗尺寸（4K/2K 高 DPI 自動放大）
         self._cur_dpi = 96
         dpi = self._apply_dpi_scaling()
-        self.title(f"{self._APP_NAME} - {self._APP_VERSION_LABEL}")
+        self.title(f"{self._APP_NAME} - {self._APP_VERSION_LABEL} [{self._EDITION}]")
         self._set_window_icon()
         sf = dpi / 96.0
         gw = min(int(self._BASE_W * sf), self.winfo_screenwidth())
@@ -436,6 +454,7 @@ class HIDToolApp(tk.Tk):
             f"About {self._APP_NAME}",
             f"{self._APP_NAME}\n"
             f"{self._APP_VERSION_LABEL} ({self._APP_VERSION_TIME})\n"
+            f"Edition: {self._EDITION}\n"
             f"Author: {self._APP_AUTHOR}",
         )
 
@@ -527,8 +546,8 @@ class HIDToolApp(tk.Tk):
         return state["ok"]
 
     def _startup_finalize(self):
-        # 先登入；失敗就結束程式
-        if not self._do_login():
+        # 登入只在 Engineer 版要求；Customer/FAE 版免帳密
+        if self._is_engineer() and not self._do_login():
             self.destroy()
             return
         # Report Descriptor 側欄預設收合
@@ -684,32 +703,35 @@ class HIDToolApp(tk.Tk):
         self._notebook.add(monitor_tab, text="監聽")
         self._build_monitor_tab(monitor_tab)
 
-        send_tab = ttk.Frame(self._notebook, style="Surface.TFrame")
-        self._notebook.add(send_tab, text="發送")
-        self._build_send_tab(send_tab)
+        # 發送 / 壓測 / 回放分頁僅 Engineer 版（FAE/Customer 隱藏）
+        if self._is_engineer():
+            send_tab = ttk.Frame(self._notebook, style="Surface.TFrame")
+            self._notebook.add(send_tab, text="發送")
+            self._build_send_tab(send_tab)
 
-        stress_tab = ttk.Frame(self._notebook, style="Surface.TFrame")
-        self._notebook.add(stress_tab, text="壓測")
-        self._build_stress_tab(stress_tab)
+            stress_tab = ttk.Frame(self._notebook, style="Surface.TFrame")
+            self._notebook.add(stress_tab, text="壓測")
+            self._build_stress_tab(stress_tab)
 
-        # 回放分頁：內含 Differ / DigiInfo 兩個子分頁
-        replay_tab = ttk.Frame(self._notebook, style="Surface.TFrame")
-        self._notebook.add(replay_tab, text="回放")
-        replay_nb = ttk.Notebook(replay_tab)
-        replay_nb.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
-        self._replay_nb = replay_nb
+            # 回放分頁：內含 Differ / DigiInfo 兩個子分頁
+            replay_tab = ttk.Frame(self._notebook, style="Surface.TFrame")
+            self._notebook.add(replay_tab, text="回放")
+            replay_nb = ttk.Notebook(replay_tab)
+            replay_nb.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+            self._replay_nb = replay_nb
 
-        heatmap_sub = ttk.Frame(replay_nb, style="Surface.TFrame")
-        replay_nb.add(heatmap_sub, text="Differ")
-        self._build_heatmap_tab(heatmap_sub)
+            heatmap_sub = ttk.Frame(replay_nb, style="Surface.TFrame")
+            replay_nb.add(heatmap_sub, text="Differ")
+            self._build_heatmap_tab(heatmap_sub)
 
-        digi_sub = ttk.Frame(replay_nb, style="Surface.TFrame")
-        replay_nb.add(digi_sub, text="DigiInfo")
-        self._build_digi_tab(digi_sub)
+            digi_sub = ttk.Frame(replay_nb, style="Surface.TFrame")
+            replay_nb.add(digi_sub, text="DigiInfo")
+            self._build_digi_tab(digi_sub)
 
-        # 切換分頁時，自動暫停已切走的回放（Differ / DigiInfo）
+            # 切換分頁時，自動暫停已切走的回放（Differ / DigiInfo）
+            self._replay_nb.bind("<<NotebookTabChanged>>", self._on_tab_changed, add="+")
+
         self._notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed, add="+")
-        self._replay_nb.bind("<<NotebookTabChanged>>", self._on_tab_changed, add="+")
 
     def _on_tab_changed(self, event=None):
         """切換主分頁或回放子分頁時，把已切走（不再顯示）的回放暫停。"""
@@ -2896,25 +2918,31 @@ class HIDToolApp(tk.Tk):
     # ------------------------------------------------------------------
 
     def _build_replay_controls(self, parent):
-        """在指定列建立一組回放控制（監聽與畫布分頁共用同一回放引擎）。"""
-        btn = ttk.Button(parent, text="▶ 回放", width=8, command=self._replay_toggle)
-        btn.pack(side=tk.LEFT)
-        self._replay_btns.append(btn)
-        ttk.Label(parent, text="速度:").pack(side=tk.LEFT, padx=(8, 2))
-        ttk.Combobox(parent, textvariable=self._replay_speed_var, width=6, state="readonly",
-                     values=("0.25x", "0.5x", "1x", "2x", "4x", "8x")).pack(side=tk.LEFT)
-        scale = ttk.Scale(parent, from_=0, to=max(0, len(self._replay_data) - 1),
-                          orient=tk.HORIZONTAL, command=self._replay_on_scale)
-        scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
-        self._replay_scales.append(scale)
-        ttk.Label(parent, textvariable=self._replay_pos_var, width=16,
-                  font=("Consolas", 9)).pack(side=tk.LEFT)
+        """在指定列建立一組回放控制。FAE/Customer 版只保留 錄製 + 匯出錄製，
+        ▶回放播放 / 速度 / 進度條 / 載入錄製 為 Engineer 版限定。"""
+        if self._is_engineer():
+            btn = ttk.Button(parent, text="▶ 回放", width=8, command=self._replay_toggle)
+            btn.pack(side=tk.LEFT)
+            self._replay_btns.append(btn)
+            ttk.Label(parent, text="速度:").pack(side=tk.LEFT, padx=(8, 2))
+            ttk.Combobox(parent, textvariable=self._replay_speed_var, width=6, state="readonly",
+                         values=("0.25x", "0.5x", "1x", "2x", "4x", "8x")).pack(side=tk.LEFT)
+            scale = ttk.Scale(parent, from_=0, to=max(0, len(self._replay_data) - 1),
+                              orient=tk.HORIZONTAL, command=self._replay_on_scale)
+            scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+            self._replay_scales.append(scale)
+            ttk.Label(parent, textvariable=self._replay_pos_var, width=16,
+                      font=("Consolas", 9)).pack(side=tk.LEFT)
+        else:
+            ttk.Label(parent, text="錄製：", style="Muted.TLabel").pack(side=tk.LEFT)
         ttk.Label(parent, textvariable=self._record_status_var, style="Muted.TLabel",
-                  width=10, anchor=tk.E).pack(side=tk.LEFT, padx=(6, 0))
+                  width=10, anchor=tk.E if self._is_engineer() else tk.W).pack(
+                      side=tk.LEFT, padx=(6, 0))
         ttk.Button(parent, text="匯出錄製", width=9,
                    command=self._export_recording).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Button(parent, text="載入錄製", width=9,
-                   command=self._import_recording).pack(side=tk.LEFT, padx=(4, 0))
+        if self._is_engineer():
+            ttk.Button(parent, text="載入錄製", width=9,
+                       command=self._import_recording).pack(side=tk.LEFT, padx=(4, 0))
 
     def _replay_set_btn_text(self, text):
         for b in self._replay_btns:
