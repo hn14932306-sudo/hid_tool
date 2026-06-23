@@ -70,8 +70,8 @@ except Exception:
 class HIDToolApp(tk.Tk):
     _APP_NAME          = "RE024 Touch Inspector"
     _APP_AUTHOR        = "Shane.Lin"
-    _APP_VERSION_LABEL = "v1.1"
-    _APP_VERSION_TIME  = "2026-06-16"
+    _APP_VERSION_LABEL = "v1.2"
+    _APP_VERSION_TIME  = "2026-06-23"
 
     # 版本(edition)：Engineer = 全功能；FAE / Customer = 閹割版
     # 由 build 時產生的 _edition.py 決定（見 .spec），開發/沒有該檔時預設 Engineer。
@@ -2304,14 +2304,23 @@ class HIDToolApp(tk.Tk):
 
     def _setup_all_digi_columns(self):
         self._col_defs = []                          # 避免其他單一裝置路徑誤用
-        self._digi_headers = [c[1] for c in self._ALL_DIGI_COLS]
-        ids = [c[0] for c in self._ALL_DIGI_COLS]
+        cols = list(self._ALL_DIGI_COLS)
+        raw_on = self._show_raw.get()
+        if raw_on:
+            cols.append(("__raw__", "RAW", 260))     # 整包原始位元組（hex）
+        # 欄數改變時舊列會錯位，先清空
+        for iid in self._table.get_children():
+            self._table.delete(iid)
+        self._digi_headers = [c[1] for c in cols]
+        ids = [c[0] for c in cols]
         self._table["columns"] = ids
         self._table["show"] = "headings"
-        for cid_, lbl, w in self._ALL_DIGI_COLS:
+        for cid_, lbl, w in cols:
+            stretch = (cid_ == "__raw__") if raw_on else (cid_ == "Status")
+            anchor = "w" if cid_ == "__raw__" else "center"
             self._table.heading(cid_, text=lbl)
             self._table.column(cid_, width=self._col_width(w, lbl),
-                               stretch=(cid_ == "Status"), anchor="center")
+                               stretch=stretch, anchor=anchor)
 
     @staticmethod
     def _short_dev_label(dev: dict) -> str:
@@ -2495,7 +2504,12 @@ class HIDToolApp(tk.Tk):
         self._frame_deque.append(rx)
         self._digi_rate_deques.setdefault(label, collections.deque()).append(rx)
         self._frame_seq += 1
-        for row in self._decode_digi_rows(ctx, payload, label):
+        rows = self._decode_digi_rows(ctx, payload, label)
+        if self._show_raw.get():
+            raw_hex = " ".join(f"{b:02X}" for b in data)   # 整包（含 report id）
+            for row in rows:
+                row.append(raw_hex)
+        for row in rows:
             self._append_monitor_row(pkt, self._digi_headers, row, (), [])
         self._feed_digi_canvas(label, ctx, payload)
 
