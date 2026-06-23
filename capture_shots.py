@@ -62,14 +62,10 @@ def _write_sample():
         f.write(xml)
 
 
-def inject_fake(app):
-    """灌假資料到監聽畫布(_adigi_devs)與表格(_table)，讓截圖有內容。"""
+def fill_canvas(app):
+    """灌假資料到監聽畫布 _adigi_devs（多 ID 軌跡 + 一個 confidence=0 放大）。"""
     import collections
     import math
-    import random
-    rng = random.Random(7)
-
-    # ---- 畫布：2 裝置、多接點、軌跡，含一個 confidence=0（放大）----
     app._all_digi_mode = True
     devs = {}
     layout = [("Touch  vid_2575&pid_0401", (0, 4095), (0, 4095), 4),
@@ -86,55 +82,85 @@ def inject_fake(app):
                 pts.append((x, y))
             trails[key] = collections.deque(pts, maxlen=500)
             lx, ly = pts[-1]
-            conf = 0 if (di == 0 and c == 3) else 1   # 一個低信心 → 放大
+            conf = 0 if (di == 0 and c == 3) else 1
             contacts[key] = {"x": lx, "y": ly, "down": True, "conf": conf}
         devs[name] = {"order": di,
                       "color": app._SLOT_COLORS[di % len(app._SLOT_COLORS)],
                       "xr": xr, "yr": yr, "contacts": contacts, "trails": trails}
     app._adigi_devs = devs
 
-    # ---- 表格：插入假列（依目前欄位 heading 對應）----
+
+def fill_table(app, n=14):
+    """依目前欄位 heading 插入假列（含 RAW 欄位時填 hex）。"""
+    import random
+    rng = random.Random(7)
+    for iid in app._table.get_children():
+        app._table.delete(iid)
+    cols = list(app._table["columns"])
+    heads = [app._table.heading(c, "text").strip() for c in cols]
+    for r in range(n):
+        vals = []
+        for h in heads:
+            if "裝置" in h:
+                vals.append("Touch" if r % 3 else "Pen")
+            elif "ScanTime" in h or h.lower() == "scan":
+                vals.append(r * 83)
+            elif h == "Cnt":
+                vals.append(2)
+            elif h == "Slot":
+                vals.append(r % 4)
+            elif h in ("CID", "ContactID"):
+                vals.append(r % 4 + 1)
+            elif h == "X":
+                vals.append(420 + rng.randint(0, 1900))
+            elif h == "Y":
+                vals.append(310 + rng.randint(0, 1200))
+            elif "Press" in h:
+                vals.append(rng.choice([0, 0, 128, 512]))
+            elif h in ("W", "Width"):
+                vals.append(rng.randint(28, 42))
+            elif h in ("H", "Height"):
+                vals.append(rng.randint(18, 28))
+            elif h in ("XTilt", "YTilt"):
+                vals.append(rng.randint(-12, 12))
+            elif "Azim" in h:
+                vals.append(rng.randint(0, 3600))
+            elif "Status" in h:
+                vals.append(rng.choice(["Tip", "InRange", "Tip", "Tip Eraser"]))
+            elif h.startswith("Conf"):
+                vals.append(rng.choice([1, 1, 1, 0]))
+            elif "RAW" in h.upper():
+                vals.append(" ".join(f"{rng.randint(0, 255):02X}" for _ in range(12)))
+            else:
+                vals.append("")
+        app._table.insert("", "end", values=vals)
+
+
+def fill_differ(app):
+    """灌假矩陣到 Differ heatmap（_hm_frames）。"""
+    import random
+    import heatmap_frame
+    rng = random.Random(5)
+    R, C = 34, 46
+    m = [[rng.randint(18, 44) for _ in range(C)] for _ in range(R)]
+    for r in range(12, 20):           # 一塊高值區（差異/熱點）
+        for c in range(20, 30):
+            m[r][c] += rng.randint(28, 70)
+    app._hm_frames = [m]
+    app._hm_used_tx = None
+    app._hm_cur_frame = 0
     try:
-        cols = list(app._table["columns"])
-        heads = [app._table.heading(c, "text").strip() for c in cols]
-        for r in range(14):
-            cid = r % 4 + 1
-            vals = []
-            for h in heads:
-                if "裝置" in h:
-                    vals.append("Touch" if r % 3 else "Pen")
-                elif "ScanTime" in h or h.lower() == "scan":
-                    vals.append(r * 83)
-                elif h == "Cnt":
-                    vals.append(2)
-                elif h == "Slot":
-                    vals.append(r % 4)
-                elif h in ("CID", "ContactID"):
-                    vals.append(cid)
-                elif h == "X":
-                    vals.append(420 + rng.randint(0, 1900))
-                elif h == "Y":
-                    vals.append(310 + rng.randint(0, 1200))
-                elif "Press" in h:
-                    vals.append(rng.choice([0, 0, 128, 512]))
-                elif h in ("W", "Width"):
-                    vals.append(rng.randint(28, 42))
-                elif h in ("H", "Height"):
-                    vals.append(rng.randint(18, 28))
-                elif h in ("XTilt", "YTilt"):
-                    vals.append(rng.randint(-12, 12))
-                elif "Azim" in h:
-                    vals.append(rng.randint(0, 3600))
-                elif "Status" in h:
-                    vals.append(rng.choice(["Tip", "InRange", "Tip", "Tip Eraser"]))
-                elif h.startswith("Conf"):
-                    vals.append(rng.choice([1, 1, 1, 0]))
-                else:
-                    vals.append("")
-            app._table.insert("", "end", values=vals)
+        app._hm_vmin_var.set("0"); app._hm_vmax_var.set("120")
     except Exception:
-        import traceback
-        traceback.print_exc()
+        pass
+    try:
+        app._hm_lut = heatmap_frame.build_lut(app._hm_cmap_var.get())
+    except Exception:
+        pass
+    try:
+        app._hm_scale.configure(to=0)
+    except Exception:
+        pass
 
 
 def main():
@@ -217,27 +243,57 @@ def main():
 
     # 灌假資料（畫布 + 表格）
     select_tab("監聽")
-    inject_fake(app)
+    fill_canvas(app)
+    fill_table(app)
     pump(0.4)
 
-    # 監聽：先不開畫布（看表格），再開畫布（各佔一半）
+    def canvas_off():
+        try:
+            if getattr(app, "_canvas_shown", False):
+                app._toggle_monitor_canvas()
+        except Exception:
+            pass
+
+    def canvas_on():
+        try:
+            if not getattr(app, "_canvas_shown", False):
+                app._toggle_monitor_canvas()
+        except Exception:
+            pass
+        pump(0.6)
+        try:
+            app._redraw_digi_canvas()
+        except Exception:
+            pass
+
+    # ③ 表格（不開畫布）
+    canvas_off(); pump(0.5); ok_any |= grab("03_monitor_data")
+    # ⑤ 表格 + 畫布各佔一半
+    canvas_on(); pump(0.4); grab("05_canvas")
+
+    # ⑥ 畫布特寫（從 05 裁右半畫布區）
     try:
-        if getattr(app, "_canvas_shown", False):
-            app._toggle_monitor_canvas()
+        from PIL import Image as _Im
+        im = _Im.open(os.path.join(SHOTS, "05_canvas.png"))
+        W, H = im.size
+        im.crop((int(W * 0.51), int(H * 0.31), W - 6, H - 8)).save(
+            os.path.join(SHOTS, "06_canvas_detail.png"))
+        print("saved 06_canvas_detail.png (crop)")
     except Exception:
-        pass
-    pump(0.6); ok_any |= grab("03_monitor_data")
+        import traceback; traceback.print_exc()
+
+    # ④ RAW 欄位：開 RAW + 重建欄位 + 填表（不開畫布，看完整表）
+    canvas_off(); pump(0.3)
     try:
-        if not getattr(app, "_canvas_shown", False):
-            app._toggle_monitor_canvas()
+        app._show_raw.set(True)
+        app._rebuild_table_columns()
+        fill_table(app, n=12)
+        pump(0.5); grab("04_raw_ff01")
+        app._show_raw.set(False)
+        app._rebuild_table_columns()
+        fill_table(app)
     except Exception:
-        pass
-    pump(0.8)
-    try:
-        app._redraw_digi_canvas()    # 確保畫布畫出假資料
-    except Exception:
-        pass
-    pump(0.4); grab("05_canvas")
+        import traceback; traceback.print_exc()
 
     # 發送
     if select_tab("發送"):
@@ -270,6 +326,22 @@ def main():
             import traceback; traceback.print_exc()
             print("digiinfo load err:", e)
         grab("10_digiinfo")
+
+        # ⑦ Differ：切到 Differ 子分頁 + 灌假矩陣
+        if rnb is not None:
+            for tid in rnb.tabs():
+                if "Differ" in rnb.tab(tid, "text"):
+                    rnb.select(tid); break
+            pump(0.4)
+            try:
+                fill_differ(app)
+                pump(0.3)
+                app._hm_redraw_frame()
+                pump(0.5)
+                app._hm_redraw_frame()
+                grab("07_differ")
+            except Exception:
+                import traceback; traceback.print_exc()
 
     print("done. any-good:", ok_any)
     try:
