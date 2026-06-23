@@ -62,6 +62,81 @@ def _write_sample():
         f.write(xml)
 
 
+def inject_fake(app):
+    """灌假資料到監聽畫布(_adigi_devs)與表格(_table)，讓截圖有內容。"""
+    import collections
+    import math
+    import random
+    rng = random.Random(7)
+
+    # ---- 畫布：2 裝置、多接點、軌跡，含一個 confidence=0（放大）----
+    app._all_digi_mode = True
+    devs = {}
+    layout = [("Touch  vid_2575&pid_0401", (0, 4095), (0, 4095), 4),
+              ("Pen    vid_2575&pid_0402", (0, 23040), (0, 14400), 1)]
+    for di, (name, xr, yr, ncont) in enumerate(layout):
+        contacts, trails = {}, {}
+        for c in range(ncont):
+            key = c + 1
+            pts = []
+            for i in range(44):
+                t = i / 43
+                x = xr[1] * (0.18 + 0.64 * t)
+                y = yr[1] * (0.5 + 0.32 * math.sin(t * 5 + c * 1.4))
+                pts.append((x, y))
+            trails[key] = collections.deque(pts, maxlen=500)
+            lx, ly = pts[-1]
+            conf = 0 if (di == 0 and c == 3) else 1   # 一個低信心 → 放大
+            contacts[key] = {"x": lx, "y": ly, "down": True, "conf": conf}
+        devs[name] = {"order": di,
+                      "color": app._SLOT_COLORS[di % len(app._SLOT_COLORS)],
+                      "xr": xr, "yr": yr, "contacts": contacts, "trails": trails}
+    app._adigi_devs = devs
+
+    # ---- 表格：插入假列（依目前欄位 heading 對應）----
+    try:
+        cols = list(app._table["columns"])
+        heads = [app._table.heading(c, "text").strip() for c in cols]
+        for r in range(14):
+            cid = r % 4 + 1
+            vals = []
+            for h in heads:
+                if "裝置" in h:
+                    vals.append("Touch" if r % 3 else "Pen")
+                elif "ScanTime" in h or h.lower() == "scan":
+                    vals.append(r * 83)
+                elif h == "Cnt":
+                    vals.append(2)
+                elif h == "Slot":
+                    vals.append(r % 4)
+                elif h in ("CID", "ContactID"):
+                    vals.append(cid)
+                elif h == "X":
+                    vals.append(420 + rng.randint(0, 1900))
+                elif h == "Y":
+                    vals.append(310 + rng.randint(0, 1200))
+                elif "Press" in h:
+                    vals.append(rng.choice([0, 0, 128, 512]))
+                elif h in ("W", "Width"):
+                    vals.append(rng.randint(28, 42))
+                elif h in ("H", "Height"):
+                    vals.append(rng.randint(18, 28))
+                elif h in ("XTilt", "YTilt"):
+                    vals.append(rng.randint(-12, 12))
+                elif "Azim" in h:
+                    vals.append(rng.randint(0, 3600))
+                elif "Status" in h:
+                    vals.append(rng.choice(["Tip", "InRange", "Tip", "Tip Eraser"]))
+                elif h.startswith("Conf"):
+                    vals.append(rng.choice([1, 1, 1, 0]))
+                else:
+                    vals.append("")
+            app._table.insert("", "end", values=vals)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+
+
 def main():
     _write_sample()
     import hid_tool
@@ -140,8 +215,12 @@ def main():
             pass
         pump(0.3)
 
-    # 監聽：先不開畫布（看表格），再開畫布（各佔一半）
+    # 灌假資料（畫布 + 表格）
     select_tab("監聽")
+    inject_fake(app)
+    pump(0.4)
+
+    # 監聽：先不開畫布（看表格），再開畫布（各佔一半）
     try:
         if getattr(app, "_canvas_shown", False):
             app._toggle_monitor_canvas()
@@ -153,7 +232,12 @@ def main():
             app._toggle_monitor_canvas()
     except Exception:
         pass
-    pump(0.8); grab("05_canvas")
+    pump(0.8)
+    try:
+        app._redraw_digi_canvas()    # 確保畫布畫出假資料
+    except Exception:
+        pass
+    pump(0.4); grab("05_canvas")
 
     # 發送
     if select_tab("發送"):
