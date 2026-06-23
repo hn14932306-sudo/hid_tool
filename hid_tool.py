@@ -274,7 +274,7 @@ class HIDToolApp(tk.Tk):
         self._digi_headers:      List[str]                 = []
         self._digi_rate_deques:  Dict[str, collections.deque] = {}  # 來源 label -> rx_time deque
         # 每裝置畫布（grid）：label -> {order,color,xr,yr,contacts,trails}
-        # 注意：DigiInfo 分頁已用 self._digi_canvas 當畫布元件，這裡務必用別名避免衝突
+        # 注意：DigiInfo 分頁用 self._digi_canvas_touch / _digi_canvas_pen 當畫布元件，這裡用別名避免衝突
         self._adigi_devs:        Dict[str, dict]           = {}
         self._digi_dev_next:     int                       = 0
         self._digi_canvas_redraw_pending: bool             = False
@@ -377,7 +377,8 @@ class HIDToolApp(tk.Tk):
         self._digi_stats:       dict           = {}
         self._digi_cur:         int            = 0
         self._digi_start:       int            = 0   # 起始幀（之前的不顯示）
-        self._digi_bounds:      Tuple[float, float, float, float] = (0.0, 1.0, 0.0, 1.0)
+        self._digi_bounds_touch: Tuple[float, float, float, float] = (0.0, 1.0, 0.0, 1.0)
+        self._digi_bounds_pen:   Tuple[float, float, float, float] = (0.0, 1.0, 0.0, 1.0)
         self._digi_playing:     bool           = False
         self._digi_play_id:     Optional[str]  = None
         self._digi_redraw_pending: bool        = False
@@ -2534,8 +2535,9 @@ class HIDToolApp(tk.Tk):
                 continue
             cid = rd(g["ContactID"])
             key = cid if cid not in ("", None) else f"s{slot}"
-            tip = rd(g["TipSwitch"]); inr = rd(g["InRange"])
-            down  = bool(tip) if tip != "" else False
+            tip = rd(g["TipSwitch"]); inr = rd(g["InRange"]); era = rd(g["Eraser"])
+            # 筆的 eraser 與 tip 一樣算「接觸」→ 出線、實心點
+            down  = (bool(tip) if tip != "" else False) or (bool(era) if era != "" else False)
             hover = (not down) and (bool(inr) if inr != "" else False)
             if down or hover:
                 try:
@@ -2543,7 +2545,8 @@ class HIDToolApp(tk.Tk):
                 except (TypeError, ValueError):
                     continue
                 active_keys.add(key)
-                dev["contacts"][key] = {"x": xi, "y": yi, "down": down}
+                conf = rd(g["Confidence"])   # 描述子沒宣告 Confidence 時為 ""，宣告了則為 0/1
+                dev["contacts"][key] = {"x": xi, "y": yi, "down": down, "conf": conf}
                 if down:
                     tr = dev["trails"].setdefault(key, collections.deque(maxlen=500))
                     if not tr or (xi, yi) != tr[-1]:
@@ -2575,6 +2578,15 @@ class HIDToolApp(tk.Tk):
         except Exception:
             return
         self._redraw_digi_canvas()
+
+    def _digi_key_color(self, key) -> str:
+        """依接點 ID 取色：int 直接用，"s{slot}" 取數字，其他 hash。"""
+        if isinstance(key, int):
+            idx = key
+        else:
+            m = re.search(r"\d+", str(key))
+            idx = int(m.group()) if m else abs(hash(key))
+        return self._SLOT_COLORS[idx % len(self._SLOT_COLORS)]
 
     def _redraw_digi_canvas(self):
         c = self._touch_canvas
@@ -2611,21 +2623,33 @@ class HIDToolApp(tk.Tk):
             def _ty(vy, _a=ay0, _lo=ymin, _s=yspan, _h=ah):
                 return _a + (vy - _lo) / _s * _h
 
-            for tr in dev["trails"].values():
+            # 每個接點 ID 用不同顏色（裝置改用格子位置 + 標籤區分）
+            for key, tr in dev["trails"].items():
                 if len(tr) >= 2:
                     flat = []
                     for vx, vy in tr:
                         flat += [_tx(vx), _ty(vy)]
-                    c.create_line(flat, fill=color, width=2,
+                    c.create_line(flat, fill=self._digi_key_color(key), width=2,
                                   capstyle=tk.ROUND, joinstyle=tk.ROUND)
             for key, ct in dev["contacts"].items():
+                kcolor = self._digi_key_color(key)
                 px = _tx(ct["x"]); py = _ty(ct["y"])
                 rr = 9 if ct["down"] else 6
-                fill = color if ct["down"] else ""
+                lw = 2
+                # 描述子有宣告 Confidence 且 = 0（低信心 / palm）→ 放大加粗強調
+                cf = ct.get("conf")
+                if cf not in ("", None):
+                    try:
+                        if int(cf) == 0:
+                            rr += 12
+                            lw = 4
+                    except (TypeError, ValueError):
+                        pass
+                fill = kcolor if ct["down"] else ""
                 c.create_oval(px - rr, py - rr, px + rr, py + rr,
-                              fill=fill, outline=color, width=2)
+                              fill=fill, outline=kcolor, width=lw)
                 c.create_text(px, py - rr - 6, text=str(key),
-                              fill=color, font=("Consolas", 7))
+                              fill=kcolor, font=("Consolas", 7))
 
     def _clear_digi_canvas(self):
         self._adigi_devs.clear()
@@ -3488,14 +3512,14 @@ class HIDToolApp(tk.Tk):
             self._canvas_shown = False
             self._canvas_toggle_btn.config(text="顯示畫布 ▶")
         else:
-            self._monitor_split.add(self._canvas_panel, minsize=260, stretch="never")
+            self._monitor_split.add(self._canvas_panel, minsize=260, stretch="always")
             self._canvas_shown = True
             self._canvas_toggle_btn.config(text="隱藏畫布 ◀")
-            # 給畫布一個合理寬度並重繪
+            # 畫布與 Monitor Data 各佔一半
             def place_sash():
                 total = self._monitor_split.winfo_width()
                 if total > 1:
-                    self._monitor_split.sash_place(0, max(300, total - 480), 0)
+                    self._monitor_split.sash_place(0, total // 2, 0)
                 self._redraw_canvas()
             self.after(30, place_sash)
 
@@ -4838,11 +4862,25 @@ class HIDToolApp(tk.Tk):
         self._digi_tree.bind("<<TreeviewSelect>>", self._digi_on_tree_select)
         # 注意：_digi_table_frame 尚未 pack（隱藏狀態）
 
-        # 軌跡畫布
-        self._digi_canvas = tk.Canvas(parent, bg=self._SURFACE, highlightthickness=1,
-                                      highlightbackground=self._BORDER)
-        self._digi_canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
-        self._digi_canvas.bind("<Configure>", lambda _e: self._digi_request_redraw())
+        # 軌跡畫布：手（觸控）與筆各一張，座標軸獨立（兩者座標範圍差很多）
+        canv_wrap = ttk.Frame(parent)
+        canv_wrap.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
+
+        touch_col = ttk.Frame(canv_wrap)
+        touch_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 4))
+        ttk.Label(touch_col, text="手 (Touch)", style="Muted.TLabel").pack(anchor="w")
+        self._digi_canvas_touch = tk.Canvas(touch_col, bg=self._SURFACE, highlightthickness=1,
+                                            highlightbackground=self._BORDER)
+        self._digi_canvas_touch.pack(fill=tk.BOTH, expand=True)
+        self._digi_canvas_touch.bind("<Configure>", lambda _e: self._digi_request_redraw())
+
+        pen_col = ttk.Frame(canv_wrap)
+        pen_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0))
+        ttk.Label(pen_col, text="筆 (Pen)", style="Muted.TLabel").pack(anchor="w")
+        self._digi_canvas_pen = tk.Canvas(pen_col, bg=self._SURFACE, highlightthickness=1,
+                                          highlightbackground=self._BORDER)
+        self._digi_canvas_pen.pack(fill=tk.BOTH, expand=True)
+        self._digi_canvas_pen.bind("<Configure>", lambda _e: self._digi_request_redraw())
 
     # ---- 載入 / 解析 ----
 
@@ -4891,10 +4929,18 @@ class HIDToolApp(tk.Tk):
         if n == 0:
             self._digi_scale.configure(to=0)
             self._digi_frame_lbl.set("Frame - / -")
-            self._digi_canvas.delete("all")
+            self._digi_canvas_touch.delete("all")
+            self._digi_canvas_pen.delete("all")
             self._digi_status_var.set("沒有解析到觸控資料")
             return
-        self._digi_compute_bounds()
+        self._digi_compute_bounds()   # 先用資料範圍當後備
+        # 有 <digitizers> 表頭宣告的範圍時，改用裝置真實座標空間（較準）
+        bt = res.get("bounds_touch")
+        bp = res.get("bounds_pen")
+        if bt:
+            self._digi_bounds_touch = bt
+        if bp:
+            self._digi_bounds_pen = bp
         self._digi_scale.configure(to=n - 1)
         self._digi_scale.set(0)
         self._digi_start = 0
@@ -4916,20 +4962,33 @@ class HIDToolApp(tk.Tk):
             cids.update(fr["contacts"].keys())
         return len(cids)
 
-    def _digi_compute_bounds(self):
-        xs, ys = [], []
-        for fr in self._digi_frames:
-            for c in fr["contacts"].values():
-                xs.append(c["x"])
-                ys.append(c["y"])
-        if not xs:
-            self._digi_bounds = (0.0, 1.0, 0.0, 1.0)
-            return
-        # 從 0 起算、上界留 5% 邊
-        self._digi_bounds = (0.0, max(1.0, max(xs) * 1.05), 0.0, max(1.0, max(ys) * 1.05))
+    # 合成 contactid 的起點（無 contactid 的裝置如手寫筆 = 90+digitizer），
+    # 用來把「筆」與「觸控」分到不同畫布。
+    _DIGI_PEN_CID_BASE = 90
 
-    def _digi_axis(self) -> Tuple[float, float, float, float]:
-        x0, x1, y0, y1 = self._digi_bounds
+    @classmethod
+    def _digi_is_pen_cid(cls, cid) -> bool:
+        try:
+            return int(cid) >= cls._DIGI_PEN_CID_BASE
+        except (TypeError, ValueError):
+            return False
+
+    def _digi_compute_bounds(self):
+        def _bounds(is_pen: bool):
+            xs, ys = [], []
+            for fr in self._digi_frames:
+                for cid, c in fr["contacts"].items():
+                    if self._digi_is_pen_cid(cid) == is_pen:
+                        xs.append(c["x"]); ys.append(c["y"])
+            if not xs:
+                return (0.0, 1.0, 0.0, 1.0)
+            # 從 0 起算、上界留 5% 邊
+            return (0.0, max(1.0, max(xs) * 1.05), 0.0, max(1.0, max(ys) * 1.05))
+        self._digi_bounds_touch = _bounds(False)
+        self._digi_bounds_pen = _bounds(True)
+
+    def _digi_axis(self, bounds) -> Tuple[float, float, float, float]:
+        x0, x1, y0, y1 = bounds
         try:
             ux = float(self._digi_xmax_var.get())
             if ux > 0:
@@ -5062,36 +5121,52 @@ class HIDToolApp(tk.Tk):
             self.after_idle(self._digi_redraw)
 
     def _digi_data_to_canvas(self, x, y, geo):
-        w, h, pad, x0, x1, y0, y1 = geo
-        cx = pad + (x - x0) / (x1 - x0) * (w - 2 * pad)
-        cy = pad + (y - y0) / (y1 - y0) * (h - 2 * pad)   # y 不反轉：data 原點在左上
-        return cx, cy
+        # geo = (s, off_x, off_y, x0, y0)；等比例縮放，避免 x/y 各自拉伸變形
+        s, off_x, off_y, x0, y0 = geo
+        return off_x + (x - x0) * s, off_y + (y - y0) * s   # y 不反轉：data 原點在左上
 
     def _digi_redraw(self):
         self._digi_redraw_pending = False
-        c = self._digi_canvas
-        c.delete("all")
         if not self._digi_frames:
+            try:
+                self._digi_canvas_touch.delete("all")
+                self._digi_canvas_pen.delete("all")
+            except Exception:
+                pass
             return
         cur = self._digi_cur
         self._digi_frame_lbl.set(f"Frame {cur} / {len(self._digi_frames) - 1}")
+        self._digi_draw_group(self._digi_canvas_touch, self._digi_bounds_touch, is_pen=False)
+        self._digi_draw_group(self._digi_canvas_pen, self._digi_bounds_pen, is_pen=True)
 
+    def _digi_draw_group(self, c, bounds, is_pen: bool):
+        """把符合 is_pen 分類的 contact 畫到指定畫布（手/筆各一張，座標軸獨立）。"""
+        c.delete("all")
+        cur = self._digi_cur
         w = c.winfo_width()
         h = c.winfo_height()
         if w <= 1 or h <= 1:
             return
         pad = 18
-        x0, x1, y0, y1 = self._digi_axis()
+        x0, x1, y0, y1 = self._digi_axis(bounds)
         if x1 <= x0 or y1 <= y0:
             return
-        geo = (w, h, pad, x0, x1, y0, y1)
+        # 等比例縮放（x、y 共用同一比例），讓軌跡形狀不變形、座標大小匹配
+        avail_w = w - 2 * pad
+        avail_h = h - 2 * pad
+        s = min(avail_w / (x1 - x0), avail_h / (y1 - y0))
+        off_x = pad + (avail_w - (x1 - x0) * s) / 2
+        off_y = pad + (avail_h - (y1 - y0) * s) / 2
+        geo = (s, off_x, off_y, x0, y0)
 
-        # 外框 + 角落座標
-        c.create_rectangle(pad, pad, w - pad, h - pad,
+        # 外框 + 角落座標：對齊實際映射範圍（letterbox 後的子矩形）
+        bx0, by0 = off_x, off_y
+        bx1, by1 = off_x + (x1 - x0) * s, off_y + (y1 - y0) * s
+        c.create_rectangle(bx0, by0, bx1, by1,
                            outline="#cccccc", width=1, dash=(3, 3))
-        c.create_text(pad + 2, pad + 2, text=f"({x0:g},{y0:g})", anchor="nw",
+        c.create_text(bx0 + 2, by0 + 2, text=f"({x0:g},{y0:g})", anchor="nw",
                       font=("Consolas", 7), fill="#aaaaaa")
-        c.create_text(w - pad - 2, h - pad - 2, text=f"({x1:g},{y1:g})", anchor="se",
+        c.create_text(bx1 - 2, by1 - 2, text=f"({x1:g},{y1:g})", anchor="se",
                       font=("Consolas", 7), fill="#aaaaaa")
 
         # 收集每個 contact 在 起始幀..cur 範圍的軌跡點（之前的不顯示）
@@ -5100,8 +5175,15 @@ class HIDToolApp(tk.Tk):
         per_cid: Dict[int, List[Tuple[int, float, float, bool, bool]]] = {}
         for i in range(lo, cur + 1):
             for cid, ct in self._digi_frames[i]["contacts"].items():
+                if self._digi_is_pen_cid(cid) != is_pen:
+                    continue
                 per_cid.setdefault(cid, []).append(
                     (i, ct["x"], ct["y"], bool(ct["down"]), bool(ct["conf"])))
+
+        if not per_cid:
+            c.create_text(w // 2, h // 2, text="（無資料）",
+                          fill="#bbbbbb", font=("Microsoft JhengHei", 10))
+            return
 
         total_pts = sum(len(v) for v in per_cid.values())
         draw_dots = total_pts <= 1500   # 點太多時略過每點小圓，只留線與重點
@@ -5131,7 +5213,9 @@ class HIDToolApp(tk.Tk):
                     segment.clear()
                     last_idx = idx
                     continue
-                if last_idx is not None and idx != last_idx + 1 and segment:
+                # 容忍小幀間隔：筆與觸控在 log 內交錯時，同一裝置的點不會幀幀相連，
+                # 間隔 <=6 視為同一筆軌跡；真正抬起由 down=False 斷筆。
+                if last_idx is not None and idx - last_idx > 6 and segment:
                     flush_segment()
                     segment.clear()
                 cx, cy = self._digi_data_to_canvas(x, y, geo)
@@ -5154,11 +5238,14 @@ class HIDToolApp(tk.Tk):
                         c.create_oval(cx - r, cy - r, cx + r, cy + r,
                                       outline="black", width=1.5, fill=color)
 
-        # 目前這一幀的點：加大強調 + ID 標籤（起點之前不顯示）
-        cur_contacts = self._digi_frames[cur]["contacts"] if cur >= lo else {}
-        for cid, ct in sorted(cur_contacts.items()):
+        # 目前位置強調 + ID 標籤：每個 contact 取「最近一次出現」的點，
+        # 避免手/筆交錯時當前幀沒有該裝置封包而閃爍；太久沒出現（已抬起）則不標示
+        for cid in sorted(per_cid.keys()):
+            idx, x, y, _d, _cf = per_cid[cid][-1]
+            if cur - idx > 6:
+                continue
             color = self._SLOT_COLORS[cid % len(self._SLOT_COLORS)]
-            cx, cy = self._digi_data_to_canvas(ct["x"], ct["y"], geo)
+            cx, cy = self._digi_data_to_canvas(x, y, geo)
             c.create_oval(cx - 6, cy - 6, cx + 6, cy + 6,
                           fill=color, outline="white", width=2)
             c.create_text(cx, cy - 12, text=str(cid), fill=color,

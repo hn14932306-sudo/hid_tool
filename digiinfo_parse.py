@@ -70,11 +70,34 @@ def parse_digiinfo_xml(path: str, progress_cb: Optional[Callable[[int], None]] =
     next_row_id = 1
     order_seq = 0
 
+    # <digitizers> 表頭：每個 digitizer 宣告的座標範圍，畫布座標軸用這個才準
+    digi_ranges: Dict[int, dict] = {}   # id -> {"x":(lo,hi), "y":(lo,hi)}
+    cur_digi: Optional[int] = None
+    pen_digis: set = set()              # 進「筆」群（無 contactid）的 digitizer id
+    touch_digis: set = set()            # 進「手」群（有 contactid）的 digitizer id
+
     with open(path, "rb") as fh:
         for ev, elem in ET.iterparse(fh, events=("start", "end")):
             tag = (elem.tag or "").lower()
+            local = tag.rsplit("}", 1)[-1]   # 去掉命名空間
 
             if ev == "start":
+                if local == "digitizer":
+                    at = _lower_attrib(elem.attrib)
+                    try:
+                        cur_digi = int(at.get("id"))
+                        digi_ranges[cur_digi] = {"x": None, "y": None}
+                    except (TypeError, ValueError):
+                        cur_digi = None
+                elif local == "property" and cur_digi is not None:
+                    at = _lower_attrib(elem.attrib)
+                    nm = (at.get("name") or "").lower()
+                    if nm in ("x", "y"):
+                        try:
+                            digi_ranges[cur_digi][nm] = (
+                                float(at.get("logmin")), float(at.get("logmax")))
+                        except (TypeError, ValueError):
+                            pass
                 if "events" in tag:
                     in_events = True
                     at = _lower_attrib(elem.attrib)
@@ -111,8 +134,37 @@ def parse_digiinfo_xml(path: str, progress_cb: Optional[Callable[[int], None]] =
 
                     if has_x or has_y:
                         contactid = at.get("contactid") or at.get("id") or at.get("contact")
+                        # 沒有 contactid 的裝置（如手寫筆 digitizer kind=PEN）給合成 ID，
+                        # 否則 wide/frames 樞紐會把它丟掉，畫布上看不到。
+                        # 以 digitizer 區分（90+），避免與觸控 contactid(0~63) 撞號。
+                        synth = contactid is None
+                        dig_raw = at.get("digitizer")
+                        try:
+                            dig_id = (int(dig_raw)
+                                      if dig_raw is not None and str(dig_raw).strip() != ""
+                                      else None)
+                        except (TypeError, ValueError):
+                            dig_id = None
+                        if synth:
+                            if dig_id is not None:
+                                contactid = 90 + dig_id
+                                pen_digis.add(dig_id)
+                        elif dig_id is not None:
+                            touch_digis.add(dig_id)
                         if has_x and has_y:
-                            d_raw, c_raw = at.get("down"), at.get("confidence")
+                            c_raw = at.get("confidence")
+                            if synth:
+                                # 筆：tip(down) 或 eraser 或 有壓力 才算「接觸」→ 才連線；
+                                # 純懸空(inrange 但無壓力)只顯示位置、不畫線
+                                tip = _map_bool(at.get("down"))
+                                era = _map_bool(at.get("eraser"))
+                                pr = _to_float(at.get("pressure"))
+                                contact = bool(tip) or bool(era) or (pr is not None and pr > 0)
+                                d_raw = "true" if contact else "false"
+                                if c_raw is None:
+                                    c_raw = "true"          # 筆無 confidence → 高信心，不標 palm
+                            else:
+                                d_raw = at.get("down")
                         else:
                             d_raw, c_raw = None, None
                         order_seq += 1
@@ -123,11 +175,19 @@ def parse_digiinfo_xml(path: str, progress_cb: Optional[Callable[[int], None]] =
                             "y": y_raw if has_y else None,
                             "down": d_raw,
                             "confidence": c_raw,
+                            # 筆專屬狀態（觸控多為空）：tip=下筆、invert/eraser/inrange、壓力
+                            "tip": _map_bool(at.get("down")),
+                            "invert": _map_bool(at.get("inverted")),
+                            "eraser": _map_bool(at.get("eraser")),
+                            "inrange": _map_bool(at.get("inrange")),
+                            "pressure": _to_int(at.get("pressure")),
                             "scantime": st,
                             "contactid": contactid,
                             "logtime": lt,
                         })
 
+                if local == "digitizer":
+                    cur_digi = None
                 if "frame" in tag and frame_stack:
                     frame_stack.pop()
                 elif "events" in tag:
@@ -144,11 +204,26 @@ def parse_digiinfo_xml(path: str, progress_cb: Optional[Callable[[int], None]] =
                     except Exception:
                         pass
 
+    # 依 <digitizers> 表頭算出每群（手/筆）的座標範圍；多個 digitizer 取聯集(取最大)
+    def _group_bounds(digis):
+        xs_hi, ys_hi = [], []
+        for d in digis:
+            rng = digi_ranges.get(d)
+            if rng and rng.get("x") and rng.get("y"):
+                xs_hi.append(rng["x"][1]); ys_hi.append(rng["y"][1])
+        if not xs_hi:
+            return None
+        return (0.0, max(xs_hi), 0.0, max(ys_hi))
+
+    bounds_touch = _group_bounds(touch_digis)
+    bounds_pen = _group_bounds(pen_digis)
+
     if not rows:
         empty_stats = dict(total_points=0, rows_with_xy=0, unique_row_id=0, unique_scantime=0)
         return {
             "frames": [], "wide_rows": [], "wide_cols": [],
             "long_rows": [], "long_cols": [], "stats": empty_stats,
+            "bounds_touch": bounds_touch, "bounds_pen": bounds_pen,
         }
 
     # ---- long 清整 ----
@@ -178,7 +253,8 @@ def parse_digiinfo_xml(path: str, progress_cb: Optional[Callable[[int], None]] =
         if r["scantime"] is not None:
             scantime_set.add(r["scantime"])
 
-    long_cols = ["row_id", "order_seq", "x", "y", "down", "confidence",
+    long_cols = ["row_id", "order_seq", "x", "y", "down", "tip", "invert",
+                 "eraser", "inrange", "pressure", "confidence",
                  "scantime", "contactid", "logtime"]
 
     # ---- wide 樞紐 ----
@@ -198,17 +274,29 @@ def parse_digiinfo_xml(path: str, progress_cb: Optional[Callable[[int], None]] =
             continue
         cids_seen.add(cid)
         slot = pivot[rid]
-        for base, key in (("x", "x"), ("y", "y"), ("down", "down"), ("confidence", "confidence")):
+        for base in ("x", "y", "down", "confidence",
+                     "tip", "invert", "eraser", "inrange", "pressure"):
             col = f"{base}_{cid}"
             if col not in slot:           # first 聚合
-                slot[col] = r[key]
+                slot[col] = r[base]
 
     sorted_cids = sorted(cids_seen)
+    # 筆專屬欄位只對「該接點確實有值」才加欄，避免觸控產生一堆空欄
+    _EXTRA = ("tip", "invert", "eraser", "inrange", "pressure")
+    extra_has = set()
+    for rid in pivot:
+        for cid in sorted_cids:
+            for f in _EXTRA:
+                if pivot[rid].get(f"{f}_{cid}") is not None:
+                    extra_has.add((cid, f))
     wide_cols = ["row_id", "logtime", "scantime"]
     for cid in sorted_cids:
         wide_cols += [f"x_{cid}", f"y_{cid}"]
     for cid in sorted_cids:
         wide_cols += [f"down_{cid}", f"confidence_{cid}"]
+        for f in _EXTRA:
+            if (cid, f) in extra_has:
+                wide_cols += [f"{f}_{cid}"]
 
     wide_rows: List[dict] = []
     frames: List[dict] = []
@@ -231,6 +319,9 @@ def parse_digiinfo_xml(path: str, progress_cb: Optional[Callable[[int], None]] =
             row[f"y_{cid}"] = y
             row[f"down_{cid}"] = d
             row[f"confidence_{cid}"] = c
+            for f in _EXTRA:
+                if (cid, f) in extra_has:
+                    row[f"{f}_{cid}"] = slot.get(f"{f}_{cid}")
             if xy_ok:
                 contacts[cid] = {"x": x, "y": y, "down": d, "conf": c}
         wide_rows.append(row)
@@ -250,6 +341,7 @@ def parse_digiinfo_xml(path: str, progress_cb: Optional[Callable[[int], None]] =
         "long_rows": sorted(rows, key=lambda d: d["order_seq"]),
         "long_cols": long_cols,
         "stats": stats,
+        "bounds_touch": bounds_touch, "bounds_pen": bounds_pen,
     }
 
 
