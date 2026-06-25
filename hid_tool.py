@@ -71,7 +71,7 @@ except Exception:
 class HIDToolApp(tk.Tk):
     _APP_NAME          = "RE024 Touch Inspector"
     _APP_AUTHOR        = "Shane.Lin"
-    _APP_VERSION_LABEL = "v1.3"
+    _APP_VERSION_LABEL = "v1.4"
     _APP_VERSION_TIME  = "2026-06-25"
 
     # 版本(edition)：Engineer = 全功能；FAE / Customer = 閹割版
@@ -129,23 +129,25 @@ class HIDToolApp(tk.Tk):
 
     @staticmethod
     def _set_dpi_awareness():
-        """DPI 感知：優先 per-monitor v2（拖到不同 DPI 螢幕不被點陣拉伸），
-        失敗則逐步退回。必須在建立 Tk 視窗前呼叫。"""
+        """DPI 感知：採用 System Aware——整個程式以「啟動時主螢幕」的 DPI 計算一次，
+        拖到不同 DPI 的螢幕時由 Windows 等比點陣拉伸，版面與字體不會重算、不會跑掉
+        （代價：在非主螢幕上字會稍微糊一點，屬 OS 層級取捨）。
+        刻意不用 per-monitor，避免拖到另一螢幕後字體被重算成過大／過小。
+        必須在建立 Tk 視窗前呼叫。"""
         try:
             user32 = ctypes.windll.user32
             user32.SetProcessDpiAwarenessContext.restype  = ctypes.c_bool
             user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
-            # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
-            if user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            # DPI_AWARENESS_CONTEXT_SYSTEM_AWARE = -2
+            if user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-2)):
                 return
         except Exception:
             pass
-        for level in (2, 1):   # PER_MONITOR_AWARE → SYSTEM_AWARE
-            try:
-                ctypes.windll.shcore.SetProcessDpiAwareness(level)
-                return
-            except Exception:
-                pass
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)   # PROCESS_SYSTEM_DPI_AWARE
+            return
+        except Exception:
+            pass
         try:
             ctypes.windll.user32.SetProcessDPIAware()
         except Exception:
