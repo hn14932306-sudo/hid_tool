@@ -571,17 +571,50 @@ class HIDToolApp(tk.Tk):
                                                             if parent.winfo_exists() else self)))
                 return
             # 下載完成 → 套用（會結束本行程並重啟新版）
-            self.after(0, lambda: self._apply_update(dlg, dest))
+            self.after(0, lambda: self._apply_update(dlg, dest, info))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _apply_update(self, dlg, dest):
+    def _apply_update(self, dlg, dest, info):
         try:
             dlg.destroy()
         except tk.TclError:
             pass
         messagebox.showinfo("更新就緒", "下載完成，將關閉並重新啟動新版本。", parent=self)
-        updater.apply_update(dest)   # 不返回
+        # 寫入更新標記，重啟後的新版會讀取並顯示「更新內容」
+        updater.apply_update(dest, info.get("version", ""), info.get("notes", ""))   # 不返回
+
+    def _show_post_update_notes(self):
+        """若本次啟動是剛從自動更新重啟，跳出「更新完成」視窗顯示 release notes。"""
+        info = updater.read_update_marker()
+        if not info:
+            return
+        updater.clear_update_marker()   # 只顯示一次
+        # 版本不符（過期標記）就不顯示
+        if updater.parse_version(info.get("version", "")) != \
+                updater.parse_version(self._APP_VERSION_LABEL):
+            return
+        notes = (info.get("notes") or "").strip() or "（無更新說明）"
+        dlg = tk.Toplevel(self)
+        dlg.title("更新完成")
+        dlg.transient(self)
+        dlg.resizable(False, False)
+        frm = ttk.Frame(dlg, padding=(20, 16))
+        frm.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frm, text=f"已更新到 {self._APP_VERSION_LABEL}",
+                  font=self._FONT_UI_BOLD).pack(anchor="w")
+        txt = tk.Text(frm, width=46, height=min(14, notes.count("\n") + 3),
+                      wrap="word", relief=tk.FLAT, bd=0, padx=2, pady=6)
+        self._style_log_text(txt)
+        txt.insert("1.0", notes)
+        txt.configure(state="disabled")
+        txt.pack(fill=tk.BOTH, expand=True, pady=(8, 12))
+        ttk.Button(frm, text="知道了", command=dlg.destroy).pack(anchor="e")
+        dlg.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 3
+        dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        dlg.grab_set()
 
     def _warmup_tabs(self):
         """啟動時預先渲染每個分頁（含回放子分頁），把 sv-ttk 首次繪製成本一次
@@ -697,8 +730,11 @@ class HIDToolApp(tk.Tk):
             self.attributes("-alpha", 1.0)
         except tk.TclError:
             pass
-        # 自動更新：先清掉上次自我替換留下的殘檔，再於背景靜默檢查新版
+        # 自動更新：先清掉上次自我替換留下的殘檔
         updater.cleanup_old()
+        # 若剛從更新重啟，顯示「更新內容」
+        self.after(400, self._show_post_update_notes)
+        # 背景靜默檢查新版
         self.after(3000, lambda: self._check_update_async(silent=True))
 
     def _build_ui(self):

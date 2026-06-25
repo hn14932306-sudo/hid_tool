@@ -173,8 +173,46 @@ def staged_path() -> str:
     return current_exe_path() + ".new"
 
 
-def apply_update(new_file: str) -> None:
-    """以下載好的新檔自我替換並重啟。呼叫成功後本行程立即結束（不返回）。"""
+# ---------------------------------------------------------------------------
+# 更新完成標記（讓新版開機時顯示「更新內容」）
+# ---------------------------------------------------------------------------
+def _marker_path() -> str:
+    return current_exe_path() + ".updated"
+
+
+def write_update_marker(version: str, notes: str) -> None:
+    """更新前寫入標記，內含新版號與 release notes，供重啟後的新版讀取顯示。"""
+    try:
+        with open(_marker_path(), "w", encoding="utf-8") as f:
+            json.dump({"version": version, "notes": notes}, f, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+def read_update_marker():
+    """讀取更新標記，回傳 dict(version, notes) 或 None。"""
+    p = _marker_path()
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def clear_update_marker() -> None:
+    try:
+        os.remove(_marker_path())
+    except OSError:
+        pass
+
+
+def apply_update(new_file: str, version: str = "", notes: str = "") -> None:
+    """以下載好的新檔自我替換並重啟。呼叫成功後本行程立即結束（不返回）。
+
+    version/notes 會寫成標記檔，讓重啟後的新版顯示「更新內容」視窗。
+    """
     exe = current_exe_path()
     old = exe + ".old"
     # 先清掉上一輪可能殘留的 .old
@@ -192,5 +230,7 @@ def apply_update(new_file: str) -> None:
     # 父行程結束刪掉該夾後，新版便找不到 sv_ttk 等資料檔而崩潰。
     env = {k: v for k, v in os.environ.items()
            if not (k.startswith("_MEIPASS") or k.startswith("_PYI"))}
+    if version:
+        write_update_marker(version, notes)
     subprocess.Popen([exe], close_fds=True, env=env)
     os._exit(0)                     # 不跑 atexit / tk 清理，乾淨退出讓新版接手
