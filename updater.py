@@ -31,6 +31,17 @@ _TIMEOUT = 12          # 秒；離線時快速放棄，不卡 UI
 _UA = "RE024-Touch-Inspector-Updater"
 
 
+def _ssl_context():
+    """建立 SSL context。優先用 truststore（走 Windows 系統信任庫／SChannel），
+    才能在有 TLS 攔截（公司 MITM proxy）的網路下，信任公司根憑證——這也是瀏覽器/
+    git 能連的原因。沒有 truststore 時退回標準 context。"""
+    try:
+        import truststore
+        return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    except Exception:
+        return ssl.create_default_context()
+
+
 # ---------------------------------------------------------------------------
 # 版本字串
 # ---------------------------------------------------------------------------
@@ -81,8 +92,7 @@ def _http_get(url: str, accept: str = "application/vnd.github+json"):
     req = urllib.request.Request(
         url, headers={"User-Agent": _UA, "Accept": accept}
     )
-    ctx = ssl.create_default_context()
-    return urllib.request.urlopen(req, timeout=_TIMEOUT, context=ctx)
+    return urllib.request.urlopen(req, timeout=_TIMEOUT, context=_ssl_context())
 
 
 def _http_json(url: str) -> dict:
