@@ -97,8 +97,9 @@ class HIDToolApp(tk.Tk):
     _RED_DARK    = "#c92a2a"
     _STRIPE      = "#f0f0f3"   # zebra row background (subtle)
 
-    _FONT_UI      = ("Microsoft JhengHei UI", 9)
-    _FONT_UI_BOLD = ("Microsoft JhengHei UI", 9, "bold")
+    _FONT_FAMILY  = "Microsoft JhengHei UI"   # 全 UI 統一字族（中英共用，Windows 內建）
+    _FONT_UI      = (_FONT_FAMILY, 9)
+    _FONT_UI_BOLD = (_FONT_FAMILY, 9, "bold")
     _FONT_MONO    = ("Consolas", 9)
 
     # UI 在 96 DPI（100%）下的基準視窗尺寸；實際依螢幕 DPI 動態放大
@@ -186,6 +187,22 @@ class HIDToolApp(tk.Tk):
         "SunValleyBodyLargeFont", "SunValleySubtitleFont", "SunValleyTitleFont",
         "SunValleyTitleLargeFont", "SunValleyDisplayFont",
     )
+
+    # Tk 內建具名字體（ttk 元件與選單/工具提示等會用到，非等寬資料字體）
+    _TK_FONTS = (
+        "TkDefaultFont", "TkTextFont", "TkHeadingFont", "TkMenuFont",
+        "TkTooltipFont", "TkCaptionFont", "TkSmallCaptionFont", "TkIconFont",
+    )
+
+    def _unify_font_family(self):
+        """把 sv_ttk 主題與 Tk 內建的具名字體字族全部統一成微軟正黑體，
+        讓中文不再 fallback 到細明體、與英數同一套字。只改字族不動大小／粗細，
+        故 DPI 縮放與粗體仍正常。等寬資料字體（Consolas）刻意不動，維持表格對齊。"""
+        for name in self._SV_FONTS + self._TK_FONTS:
+            try:
+                tkfont.nametofont(name).configure(family=self._FONT_FAMILY)
+            except Exception:
+                pass
 
     def _capture_sv_font_sizes(self):
         """記下 sv_ttk 具名字體的原始大小，之後依 DPI 倍率從原始值換算（避免疊加）。"""
@@ -405,6 +422,7 @@ class HIDToolApp(tk.Tk):
     def _setup_style(self):
         # Windows 11 風主題；大部分元件外觀交給 sv-ttk
         sv_ttk.set_theme("light")
+        self._unify_font_family()       # 把主題字體字族統一成微軟正黑體（中英一致、不再 fallback 醜襯線體）
         self._capture_sv_font_sizes()   # 記下 sv_ttk 原始字體大小（供 DPI 縮放）
         self.option_add("*Font", self._FONT_UI)   # 影響 tk（非 ttk）元件
 
