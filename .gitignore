@@ -17,3 +17,6 @@ _edition.py
 
 # 投影片擷取用暫存
 _sample_digiinfo.xml
+
+# 自動更新測試用資料夾
+_update_test/
