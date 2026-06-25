@@ -28,6 +28,7 @@ from xml.sax.saxutils import escape
 import sv_ttk
 import heatmap_frame
 import digiinfo_parse
+import updater
 
 from hid_descriptor import (
     HIDField,
@@ -451,13 +452,136 @@ class HIDToolApp(tk.Tk):
                          highlightcolor=self._BORDER, padx=6, pady=4)
 
     def _show_about(self, _event=None):
-        messagebox.showinfo(
-            f"About {self._APP_NAME}",
-            f"{self._APP_NAME}\n"
-            f"{self._APP_VERSION_LABEL} ({self._APP_VERSION_TIME})\n"
-            f"Edition: {self._EDITION}\n"
-            f"Author: {self._APP_AUTHOR}",
+        dlg = tk.Toplevel(self)
+        dlg.title(f"About {self._APP_NAME}")
+        dlg.transient(self)
+        dlg.resizable(False, False)
+        try:
+            dlg.configure(bg=self._BG)
+        except tk.TclError:
+            pass
+        frm = ttk.Frame(dlg, padding=(20, 16))
+        frm.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frm, text=self._APP_NAME, font=self._FONT_UI_BOLD).pack(anchor="w")
+        ttk.Label(
+            frm,
+            text=(f"{self._APP_VERSION_LABEL} ({self._APP_VERSION_TIME})\n"
+                  f"Edition: {self._EDITION}\n"
+                  f"Author: {self._APP_AUTHOR}"),
+            justify="left",
+        ).pack(anchor="w", pady=(6, 14))
+        btn_row = ttk.Frame(frm)
+        btn_row.pack(fill=tk.X)
+        chk = ttk.Button(
+            btn_row, text="檢查更新",
+            command=lambda: self._check_update_async(silent=False, parent=dlg),
         )
+        chk.pack(side=tk.LEFT)
+        if not updater.is_frozen():
+            chk.state(["disabled"])   # 開發模式（非打包 exe）不做自我替換
+        ttk.Button(btn_row, text="關閉", command=dlg.destroy).pack(side=tk.RIGHT)
+        dlg.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 3
+        dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        dlg.grab_set()
+
+    # ------------------------------------------------------------------
+    # 自動更新（GitHub Releases）
+    # ------------------------------------------------------------------
+    def _check_update_async(self, silent: bool = True, parent=None):
+        """背景查最新版。silent=True 時只有「有新版」才跳窗；False 會回報結果。"""
+        if not updater.is_frozen() and not silent:
+            messagebox.showinfo("檢查更新", "開發模式（未打包）不支援自動更新。", parent=parent or self)
+            return
+        if getattr(self, "_update_checking", False):
+            return
+        self._update_checking = True
+
+        def worker():
+            try:
+                info = updater.check_latest(self._APP_VERSION_LABEL, self._EDITION)
+                err = None
+            except Exception as e:           # 離線 / 逾時 / 403 等一律安靜處理
+                info, err = None, e
+            self.after(0, lambda: self._on_update_result(info, err, silent, parent))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_update_result(self, info, err, silent, parent):
+        self._update_checking = False
+        parent = parent if (parent and parent.winfo_exists()) else self
+        if err is not None:
+            if not silent:
+                messagebox.showwarning(
+                    "檢查更新", f"無法連線到更新伺服器：\n{err}", parent=parent)
+            return
+        if not info:
+            if not silent:
+                messagebox.showinfo(
+                    "檢查更新", f"目前已是最新版本（{self._APP_VERSION_LABEL}）。", parent=parent)
+            return
+        notes = info.get("notes", "")
+        if len(notes) > 600:
+            notes = notes[:600] + "…"
+        msg = (f"發現新版本：{info['version']}\n"
+               f"目前版本：{self._APP_VERSION_LABEL}\n\n"
+               f"{notes}\n\n是否立即下載並更新？")
+        if messagebox.askyesno("有可用更新", msg, parent=parent):
+            self._do_update(info, parent)
+
+    def _do_update(self, info, parent):
+        """下載新版 exe（進度視窗）→ 驗證 → 自我替換重啟。"""
+        dlg = tk.Toplevel(self)
+        dlg.title("下載更新")
+        dlg.transient(self)
+        dlg.resizable(False, False)
+        dlg.protocol("WM_DELETE_WINDOW", lambda: None)   # 下載中不可關
+        frm = ttk.Frame(dlg, padding=(20, 16))
+        frm.pack(fill=tk.BOTH, expand=True)
+        status = tk.StringVar(value=f"正在下載 {info['version']} …")
+        ttk.Label(frm, textvariable=status).pack(anchor="w")
+        bar = ttk.Progressbar(frm, length=320, mode="determinate", maximum=100)
+        bar.pack(fill=tk.X, pady=(10, 0))
+        dlg.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 3
+        dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        dlg.grab_set()
+
+        def progress(done, total):
+            pct = (done * 100 // total) if total else 0
+            self.after(0, lambda: (bar.configure(value=pct),
+                                   status.set(f"正在下載 {info['version']} … {pct}%")))
+
+        def worker():
+            dest = updater.staged_path()
+            try:
+                sha = updater.download(info["url"], dest, progress)
+                if not updater.verify_digest(sha, info.get("digest", "")):
+                    raise ValueError("檔案校驗失敗（sha256 不符），已中止更新。")
+            except Exception as e:
+                try:
+                    if os.path.exists(updater.staged_path()):
+                        os.remove(updater.staged_path())
+                except OSError:
+                    pass
+                self.after(0, lambda: (dlg.destroy(),
+                                       messagebox.showerror("更新失敗", str(e), parent=parent
+                                                            if parent.winfo_exists() else self)))
+                return
+            # 下載完成 → 套用（會結束本行程並重啟新版）
+            self.after(0, lambda: self._apply_update(dlg, dest))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_update(self, dlg, dest):
+        try:
+            dlg.destroy()
+        except tk.TclError:
+            pass
+        messagebox.showinfo("更新就緒", "下載完成，將關閉並重新啟動新版本。", parent=self)
+        updater.apply_update(dest)   # 不返回
 
     def _warmup_tabs(self):
         """啟動時預先渲染每個分頁（含回放子分頁），把 sv-ttk 首次繪製成本一次
@@ -573,6 +697,9 @@ class HIDToolApp(tk.Tk):
             self.attributes("-alpha", 1.0)
         except tk.TclError:
             pass
+        # 自動更新：先清掉上次自我替換留下的殘檔，再於背景靜默檢查新版
+        updater.cleanup_old()
+        self.after(3000, lambda: self._check_update_async(silent=True))
 
     def _build_ui(self):
         # ---- Top bar (shared) ----
