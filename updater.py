@@ -188,5 +188,9 @@ def apply_update(new_file: str) -> None:
         os.replace(new_file, exe)   # 同磁碟區的原子替換
     except OSError:
         shutil.move(new_file, exe)  # 跨磁碟區後援
-    subprocess.Popen([exe], close_fds=True)
+    # 清掉 PyInstaller onefile 的環境變數，否則子行程會誤用父行程的 _MEI 解壓夾，
+    # 父行程結束刪掉該夾後，新版便找不到 sv_ttk 等資料檔而崩潰。
+    env = {k: v for k, v in os.environ.items()
+           if not (k.startswith("_MEIPASS") or k.startswith("_PYI"))}
+    subprocess.Popen([exe], close_fds=True, env=env)
     os._exit(0)                     # 不跑 atexit / tk 清理，乾淨退出讓新版接手
