@@ -245,7 +245,6 @@ class RawInputThread(threading.Thread):
             return
 
         try:
-            device_name = get_device_name_from_handle(hdr.hDevice)
             if hdr.hDevice not in self._device_name_cache:
                 self._device_name_cache[hdr.hDevice] = get_device_name_from_handle(hdr.hDevice)
             device_name = self._device_name_cache[hdr.hDevice]

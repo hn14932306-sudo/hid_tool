@@ -110,6 +110,7 @@ class HIDToolApp(tk.Tk):
     _ALL_DIGI_LABEL = "（全部 digitizer — 不選裝置，自動解碼）"
 
     _RECORD_MAX   = 50000   # 監聽回放的封包環形緩衝上限（約數 MB）
+    _MONITOR_LOG_MAX = 100000   # Excel 匯出資料上限（環形，超過丟最舊；防長時間監聽記憶體膨脹）
 
     @staticmethod
     def _resource_path(*parts: str) -> str:
@@ -308,7 +309,8 @@ class HIDToolApp(tk.Tk):
         self._ff01_fmt:         tk.StringVar             = tk.StringVar(value="Hex")
         self._table_rid:        int                      = -1
         self._frame_deque:      collections.deque        = collections.deque()
-        self._monitor_log_rows: List[dict]               = []
+        # 匯出 Excel 的資料來源；加上限避免長時間監聽無限累積拖慢整體（GC 停頓）
+        self._monitor_log_rows: collections.deque        = collections.deque(maxlen=self._MONITOR_LOG_MAX)
         self._last_pkt_rx_time: float                    = 0.0
         self._last_scan_time:   int                      = -1
         self._scan_time_field:  Optional[HIDField]       = None
@@ -2461,8 +2463,7 @@ class HIDToolApp(tk.Tk):
             max_rows = 200
         children = self._table.get_children()
         if len(children) > max_rows:
-            for iid in children[max_rows:]:
-                self._table.delete(iid)
+            self._table.delete(*children[max_rows:])
 
     # ------------------------------------------------------------------
     # 「全部 digitizer」自動模式：不選裝置，通用 HID digitizer 解碼
