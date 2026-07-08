@@ -71,8 +71,8 @@ except Exception:
 class HIDToolApp(tk.Tk):
     _APP_NAME          = "RE024 Touch Inspector"
     _APP_AUTHOR        = "Shane.Lin"
-    _APP_VERSION_LABEL = "v1.6"
-    _APP_VERSION_TIME  = "2026-07-07"
+    _APP_VERSION_LABEL = "v1.7"
+    _APP_VERSION_TIME  = "2026-07-08"
 
     # 版本(edition)：Engineer = 全功能；FAE / Customer = 閹割版
     # 由 build 時產生的 _edition.py 決定（見 .spec），開發/沒有該檔時預設 Engineer。
@@ -83,19 +83,21 @@ class HIDToolApp(tk.Tk):
     def _is_engineer(cls) -> bool:
         return cls._EDITION == "Engineer"
 
-    # ---- UI palette & fonts（配合 sv-ttk light 主題）----
-    _BG          = "#fafafa"   # sv-ttk light 背景
-    _SURFACE     = "#ffffff"   # canvas / logs
-    _BORDER      = "#d7d7d7"
-    _TEXT        = "#1c1c1c"
-    _TEXT_MUTED  = "#6b6b6b"
-    _ACCENT      = "#0067c0"   # sv-ttk accent 藍
-    _ACCENT_DARK = "#005ba1"
-    _GREEN       = "#2f9e44"
-    _GREEN_DARK  = "#268a3b"
-    _RED         = "#e03131"
-    _RED_DARK    = "#c92a2a"
-    _STRIPE      = "#f0f0f3"   # zebra row background (subtle)
+    # ---- UI palette & fonts（配合 sv-ttk light 主題，重新調校過的層次與對比）----
+    _BG            = "#eef0f4"   # 應用程式底色（比卡片深一階，讓區塊立體）
+    _SURFACE       = "#ffffff"   # 卡片 / 表格 / 記錄區背景
+    _SURFACE_ALT   = "#f5f6f9"   # 頂列 / 側欄 / 狀態列的淺色底
+    _BORDER        = "#dde1e8"
+    _BORDER_STRONG = "#c7cdd7"
+    _TEXT        = "#181b20"
+    _TEXT_MUTED  = "#6b7280"
+    _ACCENT      = "#2f6fed"   # 主色：更飽和的藍，強調可互動元素
+    _ACCENT_DARK = "#1d54c9"
+    _GREEN       = "#1f9d55"
+    _GREEN_DARK  = "#167a42"
+    _RED         = "#dc2626"
+    _RED_DARK    = "#b91c1c"
+    _STRIPE      = "#f5f7fa"   # zebra row background (subtle)
 
     _FONT_FAMILY  = "Microsoft JhengHei UI"   # 全 UI 統一字族（中英共用，Windows 內建）
     _FONT_UI      = (_FONT_FAMILY, 9)
@@ -430,11 +432,27 @@ class HIDToolApp(tk.Tk):
 
         style = ttk.Style(self)
 
-        # 分頁標籤粗體
-        style.configure("TNotebook.Tab", font=self._FONT_UI_BOLD)
+        # ---- 版面骨架：只給頂列 / 狀態列淺色底做出頁首頁尾層次；
+        # 其餘 Frame 交給 sv-ttk 預設，避免與主題底色拼接出色差 ----
+        style.configure("Top.TFrame",    background=self._SURFACE_ALT)
+        style.configure("Status.TFrame", background=self._SURFACE_ALT)
 
-        # 表格：加大列高 + 等寬字體（顏色/邊框交給 sv-ttk）
-        style.configure("Treeview", rowheight=26)
+        # 分頁：加大點擊區、粗體標籤
+        style.configure("TNotebook", background=self._BG, borderwidth=0, tabmargins=(4, 6, 4, 0))
+        style.configure("TNotebook.Tab", font=self._FONT_UI_BOLD, padding=(16, 8))
+
+        # 區塊標題：用主色粗體當視覺錨點（sv-ttk 的 LabelFrame 邊框吃不到自訂色，
+        # 改以標題顏色 + 區塊間距做出分組感）
+        style.configure("Section.TLabelframe.Label",
+                        foreground=self._ACCENT_DARK,
+                        font=(self._FONT_FAMILY, 10, "bold"))
+
+        # 側欄收合按鈕：低調樣式（原本未定義，退回成普通按鈕）
+        style.configure("Toggle.TButton", font=self._FONT_UI_BOLD, padding=(6, 10))
+
+        # 表格：加大列高 + 粗體表頭 + 等寬字體（底色交給 sv-ttk）
+        style.configure("Treeview", rowheight=28)
+        style.configure("Treeview.Heading", font=self._FONT_UI_BOLD, padding=(6, 6))
         style.configure("Mono.Treeview", font=self._FONT_MONO)
 
         # 語意性文字顏色（ttk Label 的 foreground 在 sv-ttk 下可套用）
@@ -443,17 +461,20 @@ class HIDToolApp(tk.Tk):
         style.configure("TopTitle.TLabel", font=("Microsoft JhengHei UI", 14, "bold"))
         style.configure("TopMuted.TLabel", foreground=self._TEXT_MUTED)
         style.configure("Version.TLabel",  foreground=self._TEXT_MUTED, font=("Consolas", 9))
-        style.configure("Status.TLabel",   foreground=self._TEXT)
-        style.configure("StatusRate.TLabel",  foreground="#3a3a3a", font=("Consolas", 9, "bold"))
-        style.configure("StatusError.TLabel", foreground=self._RED,  font=("Consolas", 11, "bold"))
+        style.configure("Status.TLabel",   foreground=self._TEXT, background=self._SURFACE_ALT)
+        style.configure("StatusRate.TLabel",  foreground=self._TEXT_MUTED, font=("Consolas", 9, "bold"),
+                        background=self._SURFACE_ALT)
+        style.configure("StatusError.TLabel", foreground=self._RED,  font=("Consolas", 11, "bold"),
+                        background=self._SURFACE_ALT)
+        style.configure("Panel.TFrame",  background=self._SURFACE_ALT)
 
-        # 頂部彩色小晶片
-        style.configure("TopChip.TLabel",    background="#eaf2fb", foreground="#0067c0",
-                        font=("Consolas", 9, "bold"), padding=(8, 2))
-        style.configure("TopChipOk.TLabel",  background="#e7f6ec", foreground="#1e7a34",
-                        font=("Consolas", 9, "bold"), padding=(8, 2))
-        style.configure("TopChipErr.TLabel", background="#fdeaea", foreground="#c92a2a",
-                        font=("Consolas", 9, "bold"), padding=(8, 2))
+        # 頂部彩色小晶片（跟主色系呼應的淺色底）
+        style.configure("TopChip.TLabel",    background="#e7edfd", foreground=self._ACCENT_DARK,
+                        font=("Consolas", 9, "bold"), padding=(10, 3))
+        style.configure("TopChipOk.TLabel",  background="#e5f5eb", foreground=self._GREEN_DARK,
+                        font=("Consolas", 9, "bold"), padding=(10, 3))
+        style.configure("TopChipErr.TLabel", background="#fce9e9", foreground=self._RED_DARK,
+                        font=("Consolas", 9, "bold"), padding=(10, 3))
 
         # sv_ttk 像素字體 + Treeview 列高依目前 DPI 放大
         self._apply_font_scaling()
@@ -464,7 +485,7 @@ class HIDToolApp(tk.Tk):
             parent, text=text, command=command,
             bg=color, fg="white", activebackground=color_dark, activeforeground="white",
             relief=tk.FLAT, bd=0, highlightthickness=0,
-            font=self._FONT_UI_BOLD, padx=16, pady=5, cursor="hand2",
+            font=self._FONT_UI_BOLD, padx=20, pady=9, cursor="hand2",
         )
 
     def _style_log_text(self, widget):
@@ -761,8 +782,9 @@ class HIDToolApp(tk.Tk):
 
     def _build_ui(self):
         # ---- Top bar (shared) ----
-        top = ttk.Frame(self, style="Top.TFrame", padding=(10, 8))
+        top = ttk.Frame(self, style="Top.TFrame", padding=(14, 12))
         top.pack(side=tk.TOP, fill=tk.X)
+        ttk.Separator(self, orient="horizontal").pack(side=tk.TOP, fill=tk.X)
 
         self._top_rate_var = tk.StringVar(value="0 scan/s")
         self._top_error_var = tk.StringVar(value="ERR 0")
@@ -796,17 +818,19 @@ class HIDToolApp(tk.Tk):
 
         # 彩色晶片用 tk.Label（sv-ttk 的 ttk.Label 吃不到背景色）
         chip_row = ttk.Frame(top, style="Top.TFrame")
-        chip_row.pack(fill=tk.X, pady=(4, 0))
+        chip_row.pack(fill=tk.X, pady=(8, 0))
         def _chip(var, bg, fg):
             return tk.Label(chip_row, textvariable=var, bg=bg, fg=fg,
-                            font=("Consolas", 9, "bold"), padx=8, pady=2)
-        _chip(self._top_record_var, "#eaf2fb", "#0067c0").pack(side=tk.RIGHT, padx=(6, 0))
-        _chip(self._top_error_var,  "#fdeaea", "#c92a2a").pack(side=tk.RIGHT, padx=(6, 0))
-        _chip(self._top_rate_var,   "#e7f6ec", "#1e7a34").pack(side=tk.RIGHT, padx=(6, 0))
+                            font=("Consolas", 9, "bold"), padx=10, pady=3,
+                            highlightthickness=1, highlightbackground=fg)
+        _chip(self._top_record_var, "#e7edfd", self._ACCENT_DARK).pack(side=tk.RIGHT, padx=(6, 0))
+        _chip(self._top_error_var,  "#fce9e9", self._RED_DARK).pack(side=tk.RIGHT, padx=(6, 0))
+        _chip(self._top_rate_var,   "#e5f5eb", self._GREEN_DARK).pack(side=tk.RIGHT, padx=(6, 0))
 
         # ---- Status bar ----
         # 比 PanedWindow 先 pack：視窗高度不足時才不會被擠出畫面
-        sb_frame = ttk.Frame(self, style="Status.TFrame", padding=(8, 3))
+        ttk.Separator(self, orient="horizontal").pack(side=tk.BOTTOM, fill=tk.X)
+        sb_frame = ttk.Frame(self, style="Status.TFrame", padding=(10, 5))
         sb_frame.pack(side=tk.BOTTOM, fill=tk.X)
 
         self._status_var = tk.StringVar(value="就緒")
@@ -937,7 +961,7 @@ class HIDToolApp(tk.Tk):
     def _build_monitor_tab(self, parent):
         ctrl_box = ttk.LabelFrame(parent, text="監聽顯示與篩選", padding=(8, 6),
                                   style="Section.TLabelframe")
-        ctrl_box.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(8, 4))
+        ctrl_box.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(12, 6))
         display_row = ttk.Frame(ctrl_box)
         display_row.pack(side=tk.TOP, fill=tk.X)
         advanced_row = ttk.Frame(ctrl_box)
@@ -987,10 +1011,11 @@ class HIDToolApp(tk.Tk):
                     textvariable=self._max_rows_var,
                     width=5).pack(side=tk.LEFT, padx=(2, 8))
 
-        # FF01 usage filter row
+        # FF01 usage filter row（沒有 FF01 欄位時整塊自動隱藏，不佔空間）
         self._ff01_filter_frame = ttk.LabelFrame(parent, text="Usage Page FF01 欄位顯示",
                                                  padding=(6, 3), style="Section.TLabelframe")
-        self._ff01_filter_frame.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 4))
+        self._ff01_filter_pack = dict(side=tk.TOP, fill=tk.X, padx=10, pady=(0, 10))
+        self._ff01_filter_visible = False   # 預設隱藏，_update_ff01_filter 有欄位才顯示
 
         # 格式選擇器永久固定在右側
         fmt_right = ttk.Frame(self._ff01_filter_frame)
@@ -1013,14 +1038,15 @@ class HIDToolApp(tk.Tk):
         self._record_status_var = tk.StringVar(value="錄製 0")
         replay_row = ttk.LabelFrame(parent, text="錄製回放", padding=(8, 5),
                                     style="Section.TLabelframe")
-        replay_row.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 4))
+        self._replay_row_frame = replay_row   # FF01 區塊顯示時要插在這之前
+        replay_row.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(0, 10))
         self._build_replay_controls(replay_row)
 
         # 表格 | 畫布 水平分割（畫布預設收合，可由「顯示畫布」展開）
         self._monitor_split = tk.PanedWindow(parent, orient=tk.HORIZONTAL,
                                              sashrelief=tk.FLAT, sashwidth=6, bd=0,
                                              bg=self._BG)
-        self._monitor_split.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        self._monitor_split.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 12))
 
         tbl_frame = ttk.LabelFrame(self._monitor_split, text="Monitor Data",
                                    padding=(4, 4), style="Section.TLabelframe")
@@ -1056,7 +1082,7 @@ class HIDToolApp(tk.Tk):
 
         param_frame = ttk.LabelFrame(parent, text="發送參數", padding=8,
                                      style="Section.TLabelframe")
-        param_frame.pack(fill=tk.X, padx=8, pady=(8, 4))
+        param_frame.pack(fill=tk.X, padx=10, pady=(12, 6))
         param_frame.columnconfigure(1, weight=1)
 
         ttk.Label(param_frame, text="Report 類型:").grid(row=0, column=0, sticky="w", padx=4)
@@ -1118,7 +1144,7 @@ class HIDToolApp(tk.Tk):
         self._style_log_text(self._send_log)
         self._send_log.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Button(parent, text="清除記錄", command=self._clear_send_log).pack(anchor=tk.E, padx=8, pady=(0, 8))
+        ttk.Button(parent, text="清除記錄", command=self._clear_send_log).pack(anchor=tk.E, padx=10, pady=(0, 12))
 
     # ------------------------------------------------------------------
     # Shared Device Management
@@ -1395,9 +1421,15 @@ class HIDToolApp(tk.Tk):
                     seen.add(first_usage)
 
         if not ff01_usages:
-            ttk.Label(self._ff01_check_frame, text="（無 FF01 欄位）",
-                      style="Muted.TLabel").pack(side=tk.LEFT, padx=4)
+            if self._ff01_filter_visible:
+                self._ff01_filter_frame.pack_forget()
+                self._ff01_filter_visible = False
             return
+
+        if not self._ff01_filter_visible:
+            self._ff01_filter_frame.pack(before=self._replay_row_frame,
+                                         **self._ff01_filter_pack)
+            self._ff01_filter_visible = True
 
         for usage in ff01_usages:
             var = tk.BooleanVar(value=True)
@@ -3726,7 +3758,7 @@ class HIDToolApp(tk.Tk):
 
         cmd_frame = ttk.LabelFrame(parent, text="壓測後發送指令", padding=8,
                                    style="Section.TLabelframe")
-        cmd_frame.pack(fill=tk.X, padx=8, pady=(8, 4))
+        cmd_frame.pack(fill=tk.X, padx=10, pady=(12, 6))
 
         ttk.Label(cmd_frame, text="Report 類型:").grid(row=0, column=0, sticky="w", padx=4)
         self._stress_report_type = tk.StringVar(value="Output")
@@ -3769,7 +3801,7 @@ class HIDToolApp(tk.Tk):
 
         settings_frame = ttk.LabelFrame(parent, text="壓測設定", padding=8,
                                         style="Section.TLabelframe")
-        settings_frame.pack(fill=tk.X, padx=8, pady=4)
+        settings_frame.pack(fill=tk.X, padx=10, pady=6)
 
         ttk.Label(settings_frame, text="抬起後延遲 (ms):").grid(row=0, column=0, sticky="w", padx=4)
         self._stress_delay_var = tk.StringVar(value="200")
@@ -3785,7 +3817,7 @@ class HIDToolApp(tk.Tk):
 
         poll_frame = ttk.LabelFrame(parent, text="定時讀取指令", padding=8,
                                     style="Section.TLabelframe")
-        poll_frame.pack(fill=tk.X, padx=8, pady=4)
+        poll_frame.pack(fill=tk.X, padx=10, pady=6)
 
         # Row 0: 間隔 / Report 類型 / Report ID
         ttk.Label(poll_frame, text="間隔 (ms, 0=停用):").grid(row=0, column=0, sticky="w", padx=4)
@@ -3817,7 +3849,7 @@ class HIDToolApp(tk.Tk):
         ttk.Spinbox(poll_frame, from_=1, to=100, textvariable=self._poll_count_var, width=5).grid(row=2, column=3, sticky="w", pady=(4, 0))
 
         ctrl_row = ttk.Frame(parent)
-        ctrl_row.pack(fill=tk.X, padx=8, pady=4)
+        ctrl_row.pack(fill=tk.X, padx=10, pady=6)
         self._stress_start_btn = self._mk_color_button(
             ctrl_row, "開始壓測", self._stress_toggle, self._GREEN, self._GREEN_DARK)
         self._stress_start_btn.pack(side=tk.LEFT, padx=4)
@@ -3826,7 +3858,7 @@ class HIDToolApp(tk.Tk):
 
         stats_frame = ttk.LabelFrame(parent, text="統計", padding=6,
                                      style="Section.TLabelframe")
-        stats_frame.pack(fill=tk.X, padx=8, pady=(0, 4))
+        stats_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
 
         ttk.Label(stats_frame, text="總次數:").pack(side=tk.LEFT, padx=(4, 2))
         self._stress_count_var = tk.StringVar(value="0")
@@ -3855,7 +3887,7 @@ class HIDToolApp(tk.Tk):
 
         log_frame = ttk.LabelFrame(parent, text="壓測記錄", padding=4,
                                    style="Section.TLabelframe")
-        log_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 12))
         self._stress_log = scrolledtext.ScrolledText(
             log_frame, height=12, state="disabled", font=("Consolas", 9))
         self._style_log_text(self._stress_log)
@@ -4536,7 +4568,7 @@ class HIDToolApp(tk.Tk):
         # 檔案選擇
         file_row = ttk.LabelFrame(parent, text="Differ 資料來源", padding=(8, 6),
                                   style="Section.TLabelframe")
-        file_row.pack(fill=tk.X, padx=8, pady=(8, 4))
+        file_row.pack(fill=tk.X, padx=10, pady=(12, 6))
         ttk.Label(file_row, text="TXT 檔案:", width=8, anchor="e").pack(side=tk.LEFT)
         self._hm_path_var = tk.StringVar()
         ttk.Entry(file_row, textvariable=self._hm_path_var).pack(
@@ -4546,7 +4578,7 @@ class HIDToolApp(tk.Tk):
         # 參數
         param_row = ttk.LabelFrame(parent, text="熱圖設定", padding=(8, 6),
                                    style="Section.TLabelframe")
-        param_row.pack(fill=tk.X, padx=8, pady=4)
+        param_row.pack(fill=tk.X, padx=10, pady=6)
         ttk.Label(param_row, text="vmin:").pack(side=tk.LEFT)
         self._hm_vmin_var = tk.StringVar(value="-1000")
         e_vmin = ttk.Entry(param_row, textvariable=self._hm_vmin_var, width=8)
@@ -4580,7 +4612,7 @@ class HIDToolApp(tk.Tk):
 
         # frame 導覽
         nav_row = ttk.Frame(parent)
-        nav_row.pack(fill=tk.X, padx=8, pady=4)
+        nav_row.pack(fill=tk.X, padx=10, pady=6)
         ttk.Button(nav_row, text="◀", width=3,
                    command=lambda: self._hm_step_frame(-1)).pack(side=tk.LEFT)
         self._hm_frame_var = tk.IntVar(value=0)
@@ -4607,12 +4639,12 @@ class HIDToolApp(tk.Tk):
         # frame 熱圖畫布
         self._hm_canvas = tk.Canvas(parent, bg=self._SURFACE, highlightthickness=1,
                                     highlightbackground=self._BORDER)
-        self._hm_canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
+        self._hm_canvas.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
         self._hm_canvas.bind("<Configure>", lambda _e: self._hm_request_redraw())
 
         # 匯出 / 進度
         bottom = ttk.Frame(parent)
-        bottom.pack(fill=tk.X, padx=8, pady=(0, 8))
+        bottom.pack(fill=tk.X, padx=10, pady=(0, 12))
         self._hm_export_btn = ttk.Button(bottom, text="匯出 HTML", command=self._hm_export)
         self._hm_export_btn.pack(side=tk.LEFT)
         self._hm_cancel_btn = ttk.Button(bottom, text="取消", command=self._hm_cancel_export,
@@ -4957,7 +4989,7 @@ class HIDToolApp(tk.Tk):
         # 檔案載入
         file_row = ttk.LabelFrame(parent, text="DigiInfo 資料來源", padding=(8, 6),
                                   style="Section.TLabelframe")
-        file_row.pack(fill=tk.X, padx=8, pady=(8, 4))
+        file_row.pack(fill=tk.X, padx=10, pady=(12, 6))
         ttk.Label(file_row, text="XML 檔案:", width=8, anchor="e").pack(side=tk.LEFT)
         self._digi_path_var = tk.StringVar()
         ttk.Entry(file_row, textvariable=self._digi_path_var).pack(
@@ -4968,7 +5000,7 @@ class HIDToolApp(tk.Tk):
         # 繪圖控制
         ctrl = ttk.LabelFrame(parent, text="顯示設定", padding=(8, 6),
                               style="Section.TLabelframe")
-        ctrl.pack(fill=tk.X, padx=8, pady=4)
+        ctrl.pack(fill=tk.X, padx=10, pady=6)
         self._digi_highlight = tk.BooleanVar(value=True)
         ttk.Checkbutton(ctrl, text="標示 palm point", variable=self._digi_highlight,
                         command=self._digi_request_redraw).pack(side=tk.LEFT, padx=(0, 12))
@@ -4992,7 +5024,7 @@ class HIDToolApp(tk.Tk):
 
         # 導覽 + 播放
         nav = ttk.Frame(parent)
-        nav.pack(fill=tk.X, padx=8, pady=4)
+        nav.pack(fill=tk.X, padx=10, pady=6)
         ttk.Button(nav, text="◀", width=3,
                    command=lambda: self._digi_step(-1)).pack(side=tk.LEFT)
         self._digi_scale = ttk.Scale(nav, from_=0, to=0, orient=tk.HORIZONTAL,
@@ -5028,7 +5060,7 @@ class HIDToolApp(tk.Tk):
 
         # 底部：表格切換 / 匯出 / 進度
         bottom = ttk.Frame(parent)
-        bottom.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(0, 8))
+        bottom.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 12))
         self._digi_table_btn = ttk.Button(bottom, text="顯示表格 ▼",
                                           command=self._digi_toggle_table)
         self._digi_table_btn.pack(side=tk.LEFT)
@@ -5062,7 +5094,7 @@ class HIDToolApp(tk.Tk):
 
         # 軌跡畫布：手（觸控）與筆各一張，座標軸獨立（兩者座標範圍差很多）
         canv_wrap = ttk.Frame(parent)
-        canv_wrap.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
+        canv_wrap.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 
         touch_col = ttk.Frame(canv_wrap)
         touch_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 4))
@@ -5458,7 +5490,7 @@ class HIDToolApp(tk.Tk):
             self._digi_table_btn.config(text="顯示表格 ▼")
         else:
             # 插在 canvas 之前、底部列之後
-            self._digi_table_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(0, 4))
+            self._digi_table_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 10))
             self._digi_table_visible = True
             self._digi_table_btn.config(text="隱藏表格 ▲")
             self._digi_refresh_table()
