@@ -301,6 +301,7 @@ class HIDToolApp(tk.Tk):
         self._adigi_devs:        Dict[str, dict]           = {}
         self._digi_dev_next:     int                       = 0
         self._digi_canvas_redraw_pending: bool             = False
+        self._touch_canvas_redraw_pending: bool            = False
 
         # Monitor state
         self._raw_thread:       Optional[RawInputThread] = None
@@ -389,6 +390,7 @@ class HIDToolApp(tk.Tk):
         self._hm_drain_id:      Optional[str]  = None
         self._hm_output_files:  List[str]      = []
         self._hm_redraw_pending: bool          = False
+        self._hm_cmap_redraw_pending: bool     = False
         self._hm_playing:       bool           = False
         self._hm_play_id:       Optional[str]  = None
 
@@ -3731,10 +3733,21 @@ class HIDToolApp(tk.Tk):
         self._touch_canvas.bind("<Configure>", self._on_touch_canvas_configure)
 
     def _on_touch_canvas_configure(self, *_):
+        # 兩種模式都節流（~30fps），縮放時 <Configure> 連續觸發不會每次都全重繪
         if self._all_digi_mode:
-            self._schedule_digi_canvas_redraw()   # 節流，縮放時不會每次都全重繪
+            self._schedule_digi_canvas_redraw()
         else:
-            self._redraw_canvas()
+            self._schedule_touch_canvas_redraw()
+
+    def _schedule_touch_canvas_redraw(self):
+        if self._touch_canvas_redraw_pending:
+            return
+        self._touch_canvas_redraw_pending = True
+        self.after(33, self._do_touch_canvas_redraw)
+
+    def _do_touch_canvas_redraw(self):
+        self._touch_canvas_redraw_pending = False
+        self._redraw_canvas()
 
     def _toggle_monitor_canvas(self):
         if self._canvas_shown:
@@ -4608,7 +4621,7 @@ class HIDToolApp(tk.Tk):
         self._hm_cmap_canvas = tk.Canvas(parent, height=38, bg=self._SURFACE,
                                          highlightthickness=1, highlightbackground=self._BORDER)
         self._hm_cmap_canvas.pack(fill=tk.X, padx=8, pady=(0, 2))
-        self._hm_cmap_canvas.bind("<Configure>", lambda _e: self._hm_redraw_cmap_preview())
+        self._hm_cmap_canvas.bind("<Configure>", lambda _e: self._hm_request_cmap_redraw())
 
         # frame 導覽
         nav_row = ttk.Frame(parent)
@@ -4818,10 +4831,19 @@ class HIDToolApp(tk.Tk):
         self._hm_play_id = self.after(max(16, int(1000 / max(1, fps))), self._hm_play_tick)
 
     def _hm_request_redraw(self):
-        """節流：合併連續的重畫請求到 idle 時做一次。"""
+        """節流（~30fps）：after_idle 在拖曳縮放時幾乎每個事件都會執行，改用定時合併。"""
         if not self._hm_redraw_pending:
             self._hm_redraw_pending = True
-            self.after_idle(self._hm_redraw_frame)
+            self.after(33, self._hm_redraw_frame)
+
+    def _hm_request_cmap_redraw(self):
+        if not self._hm_cmap_redraw_pending:
+            self._hm_cmap_redraw_pending = True
+            self.after(33, self._do_hm_cmap_redraw)
+
+    def _do_hm_cmap_redraw(self):
+        self._hm_cmap_redraw_pending = False
+        self._hm_redraw_cmap_preview()
 
     def _hm_redraw_frame(self):
         self._hm_redraw_pending = False
@@ -5346,9 +5368,10 @@ class HIDToolApp(tk.Tk):
     # ---- 繪圖 ----
 
     def _digi_request_redraw(self):
+        # 節流（~30fps）：after_idle 在拖曳縮放時幾乎每個事件都會執行，改用定時合併
         if not self._digi_redraw_pending:
             self._digi_redraw_pending = True
-            self.after_idle(self._digi_redraw)
+            self.after(33, self._digi_redraw)
 
     def _digi_data_to_canvas(self, x, y, geo):
         # geo = (s, off_x, off_y, x0, y0)；等比例縮放，避免 x/y 各自拉伸變形
