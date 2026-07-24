@@ -71,8 +71,8 @@ except Exception:
 class HIDToolApp(tk.Tk):
     _APP_NAME          = "RE024 Touch Inspector"
     _APP_AUTHOR        = "Shane.Lin"
-    _APP_VERSION_LABEL = "v1.8"
-    _APP_VERSION_TIME  = "2026-07-09"
+    _APP_VERSION_LABEL = "v1.9"
+    _APP_VERSION_TIME  = "2026-07-24"
 
     # 版本(edition)：Engineer = 全功能；FAE / Customer = 閹割版
     # 由 build 時產生的 _edition.py 決定（見 .spec），開發/沒有該檔時預設 Engineer。
@@ -307,6 +307,9 @@ class HIDToolApp(tk.Tk):
         self._raw_thread:       Optional[RawInputThread] = None
         self._packet_queue:     queue.Queue              = queue.Queue()
         self._listening:        bool                     = False
+        self._listen_starting:  bool                     = False
+        self._listen_start_seq: int                      = 0
+        self._device_refresh_seq: int                    = 0
         self._col_defs:         List[dict]               = []
         self._ff01_usage_vars:  Dict[int, tk.BooleanVar] = {}  # FF01 usage -> visible
         self._ff01_fmt:         tk.StringVar             = tk.StringVar(value="Hex")
@@ -337,7 +340,8 @@ class HIDToolApp(tk.Tk):
         self._canvas_item_ids:         Dict[int, Tuple[int, int]]   = {}
         self._canvas_item_shape:       Dict[int, str]               = {}
         self._canvas_trail_line_ids:   Dict[int, int]               = {}
-        self._table_pending:           List[tuple]                   = []   # (row, tags, errs)
+        # UI 只保留最新待顯示列；完整資料仍寫入 _monitor_log_rows。
+        self._table_pending:           collections.deque             = collections.deque(maxlen=250)
         self._table_flush_pending:     bool                         = False
         self._table_row_seq:           int                          = 0    # 斑馬紋交錯計數
         self._canvas_flush_pending:    bool                         = False
@@ -412,9 +416,9 @@ class HIDToolApp(tk.Tk):
         self._digi_render_token:   int         = 0
 
         self._build_ui()
-        self._refresh_devices()
+        self._refresh_devices_async()
         self.after(20, self._poll_queue)
-        self.after(50, self._startup_finalize)   # 收合側欄 + 預熱分頁 + 顯示視窗
+        self.after(50, self._startup_finalize)   # 收合側欄 + 顯示視窗
 
         # 裝置熱插拔偵測
         self._devchange_after_id: Optional[str] = None
@@ -768,8 +772,7 @@ class HIDToolApp(tk.Tk):
             self._apply_dpi_scaling()
         # 拖到不同 DPI 螢幕時動態重算字體
         self.bind("<Configure>", self._on_possible_dpi_change, add="+")
-        # 預熱各分頁（此時視窗透明，不會閃爍）
-        self._warmup_tabs()
+        # 不同步切換所有分頁；讓視窗先可操作，分頁首次開啟時自然排版。
         # 一切就緒，顯示視窗
         try:
             self.attributes("-alpha", 1.0)
@@ -1154,7 +1157,28 @@ class HIDToolApp(tk.Tk):
 
     _CMD_SAME_LABEL = "（同監聽裝置）"
 
-    def _refresh_devices(self, auto: bool = False):
+    def _refresh_devices_async(self, auto: bool = False):
+        """列舉 HID 可能碰到慢速驅動，避免在 Tk 主執行緒同步等待。"""
+        self._device_refresh_seq += 1
+        seq = self._device_refresh_seq
+        if not auto:
+            self._status_var.set("正在搜尋 HID 裝置...")
+
+        def worker():
+            devices = sorted(
+                enumerate_hid_devices(),
+                key=lambda d: (d.get("vendor_id", 0), d.get("product_id", 0), device_collection(d)),
+            )
+            self.after(0, lambda: self._apply_device_refresh(seq, devices, auto))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_device_refresh(self, seq: int, devices: List[dict], auto: bool):
+        if seq != self._device_refresh_seq or not self.winfo_exists():
+            return
+        self._refresh_devices(auto=auto, devices=devices)
+
+    def _refresh_devices(self, auto: bool = False, devices: Optional[List[dict]] = None):
         """重新列舉 HID 裝置。auto=True 表示由熱插拔事件觸發：
         保留現有選擇與 descriptor 快取，監聽中的 session 不受影響。"""
         prev_path     = self._get_dev_path_str(self._selected_dev) if self._selected_dev else None
@@ -1163,7 +1187,7 @@ class HIDToolApp(tk.Tk):
         if not auto:
             self._descriptors.clear()
             self._raw_descriptors.clear()
-        self._hidapi_devices = sorted(
+        self._hidapi_devices = devices if devices is not None else sorted(
             enumerate_hid_devices(),
             key=lambda d: (d.get("vendor_id", 0), d.get("product_id", 0), device_collection(d)),
         )
@@ -1200,7 +1224,7 @@ class HIDToolApp(tk.Tk):
         self._status_var.set(f"{prefix}找到 {len(self._hidapi_devices)} 個 HID 裝置")
 
         if self._all_digi_mode and self._listening:
-            self._preload_digi_ctx()   # 監聽中裝置清單變更才重新預載（啟動時不做，避免卡頓）
+            self._preload_digi_ctx_async()
 
     # ------------------------------------------------------------------
     # Hot-plug detection
@@ -1218,7 +1242,7 @@ class HIDToolApp(tk.Tk):
 
     def _do_device_refresh(self):
         self._devchange_after_id = None
-        self._refresh_devices(auto=True)
+        self._refresh_devices_async(auto=True)
 
     def _on_device_selected(self, event):
         idx = self._dev_combo.current()
@@ -2180,12 +2204,19 @@ class HIDToolApp(tk.Tk):
             self._start_listen()
 
     def _start_listen(self):
-        if self._raw_thread and self._raw_thread.is_alive():
+        if self._listen_starting or (self._raw_thread and self._raw_thread.is_alive()):
             return
 
         # 開始即時監聽前先結束回放
         if self._replay_active or self._replay_paused_at:
             self._replay_finish()
+
+        self._listen_starting = True
+        self._listen_start_seq += 1
+        seq = self._listen_start_seq
+        self._listen_btn.config(text="啟動中...", state=tk.DISABLED)
+        self._dev_combo.configure(state=tk.DISABLED)
+        self._status_var.set("正在準備監聽...")
 
         if self._selected_dev:
             path_str = self._get_dev_path_str(self._selected_dev)
@@ -2193,7 +2224,17 @@ class HIDToolApp(tk.Tk):
             self._raw_descriptors.pop(path_str, None)
             self._load_descriptor(self._selected_dev)
         elif self._all_digi_mode:
-            self._preload_digi_ctx()   # 全裝置模式：監聽開始時才預載所有 digitizer descriptor
+            self._preload_digi_ctx_async(
+                lambda: self._begin_raw_listener(seq),
+                listen_seq=seq,
+            )
+            return
+
+        self._begin_raw_listener(seq)
+
+    def _begin_raw_listener(self, seq: int):
+        if seq != self._listen_start_seq or not self._listen_starting:
+            return
 
         extra_up = self._selected_dev.get("usage_page", 0) if self._selected_dev else 0
         extra_u  = self._selected_dev.get("usage",      0) if self._selected_dev else 0
@@ -2209,18 +2250,59 @@ class HIDToolApp(tk.Tk):
             extra_usages=extra_usages,
         )
         self._raw_thread.start()
-        self._raw_thread._ready_event.wait(timeout=3.0)
+        deadline = time.monotonic() + 3.0
 
-        self._listening = True
-        self._listen_btn.config(text="停止監聽", bg=self._RED, activebackground=self._RED_DARK)
-        self._status_var.set("監聽中...")
+        def check_ready():
+            if seq != self._listen_start_seq or not self._listen_starting:
+                return
+            thread = self._raw_thread
+            if thread and thread._ready_event.is_set():
+                self._listen_starting = False
+                if thread._hwnd:
+                    self._listening = True
+                    self._listen_btn.config(
+                        text="停止監聽", state=tk.NORMAL,
+                        bg=self._RED, activebackground=self._RED_DARK,
+                    )
+                    self._dev_combo.configure(state="readonly")
+                    self._status_var.set("監聽中...")
+                else:
+                    self._raw_thread = None
+                    self._listen_btn.config(
+                        text="開始監聽", state=tk.NORMAL,
+                        bg=self._GREEN, activebackground=self._GREEN_DARK,
+                    )
+                    self._dev_combo.configure(state="readonly")
+                    self._status_var.set("無法啟動 RawInput 監聽")
+                return
+            if time.monotonic() >= deadline:
+                if thread:
+                    thread.stop()
+                self._raw_thread = None
+                self._listen_starting = False
+                self._listen_btn.config(
+                    text="開始監聽", state=tk.NORMAL,
+                    bg=self._GREEN, activebackground=self._GREEN_DARK,
+                )
+                self._dev_combo.configure(state="readonly")
+                self._status_var.set("RawInput 監聽啟動逾時")
+                return
+            self.after(25, check_ready)
+
+        self.after(0, check_ready)
 
     def _stop_listen(self):
+        self._listen_start_seq += 1
+        self._listen_starting = False
         if self._raw_thread:
             self._raw_thread.stop()
             self._raw_thread = None
         self._listening = False
-        self._listen_btn.config(text="開始監聽", bg=self._GREEN, activebackground=self._GREEN_DARK)
+        self._listen_btn.config(
+            text="開始監聽", state=tk.NORMAL,
+            bg=self._GREEN, activebackground=self._GREEN_DARK,
+        )
+        self._dev_combo.configure(state="readonly")
         self._status_var.set("已停止監聽")
 
     # ------------------------------------------------------------------
@@ -2290,20 +2372,21 @@ class HIDToolApp(tk.Tk):
 
     def _poll_queue(self):
         # 整段包 try/finally：單一封包/處理出錯也絕不讓 poll 迴圈停掉
+        next_delay = 20
         try:
-            pkts = []
-            try:
-                while len(pkts) < 64:
-                    pkts.append(self._packet_queue.get_nowait())
-            except queue.Empty:
-                pass
-
-            if pkts and not self._replay_active:
+            processed = 0
+            if not self._replay_active:
                 gap_threshold = self._gap_threshold()
                 # 只處理「選定監聽裝置」的封包；RawInput 會收到所有同 usage page 裝置
                 listen_key = (self._dev_match_key(self._get_dev_path_str(self._selected_dev))
                               if self._selected_dev else "")
-                for pkt in pkts:
+                deadline = time.perf_counter() + 0.008
+                while processed < 64 and time.perf_counter() < deadline:
+                    try:
+                        pkt = self._packet_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    processed += 1
                     try:
                         if listen_key:
                             dn = pkt.get("device_name", "")
@@ -2318,12 +2401,15 @@ class HIDToolApp(tk.Tk):
                         self._ingest_packet(pkt, gap_threshold)
                     except Exception:
                         traceback.print_exc()
-                self._update_scan_rate(time.monotonic())
-                self._update_record_status()
+                if processed:
+                    self._update_scan_rate(time.monotonic())
+                    self._update_record_status()
+                if not self._packet_queue.empty():
+                    next_delay = 1
         except Exception:
             traceback.print_exc()
         finally:
-            self.after(20, self._poll_queue)
+            self.after(next_delay, self._poll_queue)
 
     _MAX_ROWS = 300
 
@@ -2479,13 +2565,14 @@ class HIDToolApp(tk.Tk):
         self._table_pending.append((row, row_tags))
         if not self._table_flush_pending:
             self._table_flush_pending = True
-            self.after(0, self._table_flush)
+            self.after(40, self._table_flush)
 
     def _table_flush(self):
         self._table_flush_pending = False
         if not self._table_pending:
             return
-        pending, self._table_pending = self._table_pending, []
+        pending = list(self._table_pending)
+        self._table_pending.clear()
         for row, row_tags in pending:
             self._table_row_seq += 1
             if not row_tags and self._table_row_seq % 2 == 0:
@@ -2589,28 +2676,44 @@ class HIDToolApp(tk.Tk):
                            "yr": (yhf.logical_min, yhf.logical_max)}
         return by_rid
 
-    def _preload_digi_ctx(self):
-        """進入全裝置模式時，先把所有 digitizer 的 descriptor 讀好建 ctx，
-        避免封包到達時裝置正被使用而讀不到 descriptor。"""
-        self._adigi_entries = []
-        for dev in self._hidapi_devices:
-            if dev.get("usage_page") != 0x0D:
-                continue
-            try:
-                path_str = self._get_dev_path_str(dev)
-                fields = self._descriptors.get(path_str)
-                if fields is None:
-                    raw = read_descriptor_via_hidapi(dev.get("path", b""))
-                    fields = parse_report_descriptor(raw) if raw else []
-                    self._descriptors[path_str] = fields
-                ctx = self._build_digi_ctx(fields)
-                if not ctx:
+    def _preload_digi_ctx_async(self, on_done=None, listen_seq: Optional[int] = None):
+        """在背景載入全部 digitizer descriptor，避免阻塞 Tk event loop。"""
+        devices = list(self._hidapi_devices)
+        descriptor_snapshot = dict(self._descriptors)
+
+        def worker():
+            entries = []
+            loaded = {}
+            for dev in devices:
+                if dev.get("usage_page") != 0x0D:
                     continue
-                key = self._dev_match_key(path_str)        # 完整路徑 key
-                vp, col = self._parse_vidpid_col(path_str)
-                self._adigi_entries.append((key, vp, col, ctx))
-            except Exception:
-                continue
+                try:
+                    path_str = self._get_dev_path_str(dev)
+                    fields = descriptor_snapshot.get(path_str)
+                    if fields is None:
+                        raw = read_descriptor_via_hidapi(dev.get("path", b""))
+                        fields = parse_report_descriptor(raw) if raw else []
+                        loaded[path_str] = fields
+                    ctx = self._build_digi_ctx(fields)
+                    if not ctx:
+                        continue
+                    key = self._dev_match_key(path_str)
+                    vp, col = self._parse_vidpid_col(path_str)
+                    entries.append((key, vp, col, ctx))
+                except Exception:
+                    continue
+
+            def apply():
+                if listen_seq is not None and listen_seq != self._listen_start_seq:
+                    return
+                self._descriptors.update(loaded)
+                self._adigi_entries = entries
+                if on_done is not None:
+                    on_done()
+
+            self.after(0, apply)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     @staticmethod
     def _parse_vidpid_col(name: str):
