@@ -312,6 +312,8 @@ class HIDToolApp(tk.Tk):
         self._device_refresh_seq: int                    = 0
         self._col_defs:         List[dict]               = []
         self._ff01_usage_vars:  Dict[int, tk.BooleanVar] = {}  # FF01 usage -> visible
+        self._ff01_usage_state: Dict[str, Dict[int, bool]] = {}  # path -> usage -> visible
+        self._ff01_filter_path: str                      = ""
         self._ff01_fmt:         tk.StringVar             = tk.StringVar(value="Hex")
         self._table_rid:        int                      = -1
         self._frame_deque:      collections.deque        = collections.deque()
@@ -1428,11 +1430,26 @@ class HIDToolApp(tk.Tk):
     # FF01 usage filter
     # ------------------------------------------------------------------
 
+    def _save_ff01_filter_state(self):
+        """保存目前 FF01 面板狀態，供 descriptor 重載後還原。"""
+        if not self._ff01_filter_path or not self._ff01_usage_vars:
+            return
+        self._ff01_usage_state[self._ff01_filter_path] = {
+            usage: bool(var.get())
+            for usage, var in self._ff01_usage_vars.items()
+        }
+
+    def _on_ff01_filter_changed(self):
+        self._save_ff01_filter_state()
+        self._rebuild_table_columns()
+
     def _update_ff01_filter(self, path_str: str):
         """根據目前 descriptor 重建 FF01 usage 勾選面板。"""
+        self._save_ff01_filter_state()
         for widget in self._ff01_check_frame.winfo_children():
             widget.destroy()
         self._ff01_usage_vars.clear()
+        self._ff01_filter_path = path_str
 
         fields = self._descriptors.get(path_str, [])
         seen: set = set()
@@ -1457,14 +1474,15 @@ class HIDToolApp(tk.Tk):
                                          **self._ff01_filter_pack)
             self._ff01_filter_visible = True
 
+        saved_state = self._ff01_usage_state.get(path_str, {})
         for usage in ff01_usages:
-            var = tk.BooleanVar(value=True)
+            var = tk.BooleanVar(value=saved_state.get(usage, True))
             self._ff01_usage_vars[usage] = var
             cb = ttk.Checkbutton(
                 self._ff01_check_frame,
                 text=f"U{usage:02X}",
                 variable=var,
-                command=self._rebuild_table_columns,
+                command=self._on_ff01_filter_changed,
             )
             cb.pack(side=tk.LEFT, padx=2, pady=1)
 
