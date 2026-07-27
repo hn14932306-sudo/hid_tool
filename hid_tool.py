@@ -71,7 +71,7 @@ except Exception:
 class HIDToolApp(tk.Tk):
     _APP_NAME          = "RE024 Touch Inspector"
     _APP_AUTHOR        = "Shane.Lin"
-    _APP_VERSION_LABEL = "v1.9.3"
+    _APP_VERSION_LABEL = "v1.9.4"
     _APP_VERSION_TIME  = "2026-07-27"
 
     # 版本(edition)：Engineer = 全功能；FAE / Customer = 閹割版
@@ -1144,9 +1144,9 @@ class HIDToolApp(tk.Tk):
         log_ctrl.pack(fill=tk.X, pady=(0, 4))
         ttk.Checkbutton(log_ctrl, text="2-byte 合併顯示",
                         variable=self._pair_bytes_var).pack(side=tk.LEFT)
-        ttk.Label(log_ctrl, text="每行對數（第二行起）:").pack(side=tk.LEFT, padx=(12, 2))
+        ttk.Label(log_ctrl, text="每行對數:").pack(side=tk.LEFT, padx=(12, 2))
         ttk.Entry(log_ctrl, textvariable=self._pair_cols_var, width=5).pack(side=tk.LEFT)
-        ttk.Label(log_ctrl, text="（第一行為此值 -1；留空則不合併）").pack(side=tk.LEFT, padx=(2, 0))
+        ttk.Label(log_ctrl, text="（留空則不合併）").pack(side=tk.LEFT, padx=(2, 0))
 
         self._send_log = scrolledtext.ScrolledText(
             log_frame, height=14, state="disabled", font=("Consolas", 9))
@@ -3717,9 +3717,9 @@ class HIDToolApp(tk.Tk):
             self._send_log_append(f"  [INT 錯誤] {e}")
 
     def _pair_cols(self) -> Optional[int]:
-        """2-byte 合併顯示時，第二行起每行的對數。
-        沒有預設值：留空或填無效值（第一行是 cols-1 對，故需 >= 2）時回 None，
-        呼叫端會退回一般單 byte 顯示。"""
+        """2-byte 合併顯示時，每行的對數（含第一行開頭的 length field）。
+        沒有預設值：留空或填無效值（需 >= 1）時回 None，呼叫端會退回一般
+        單 byte 顯示。"""
         var = getattr(self, '_pair_cols_var', None)
         if var is None:
             return None
@@ -3727,12 +3727,13 @@ class HIDToolApp(tk.Tk):
             cols = int(var.get().strip())
         except (ValueError, AttributeError):
             return None
-        return cols if cols >= 2 else None
+        return cols if cols >= 1 else None
 
     def _log_bytes(self, data, append_fn):
         """顯示 bytes：第一行 64 bytes，後續每行 66 bytes（對齊 I2C block）。
         若 _pair_bytes_var 打勾「且」_pair_cols_var 有填有效數值，才改成每 2 bytes
-        合併顯示：該值是第二行起的每行對數，第一行為該值 -1。留空即不合併。"""
+        合併顯示，每行固定該值個對數。開頭補回的 length field 自己佔一組，
+        所以第一行不再少一組。留空即不合併。"""
         if not data:
             return
         pair = getattr(self, '_pair_bytes_var', None) and self._pair_bytes_var.get()
@@ -3748,14 +3749,13 @@ class HIDToolApp(tk.Tk):
             return ' '.join(parts)
 
         if cols:
-            # 補回 Windows strip 掉的 2-byte I2C-HID Length field
-            first_len = (cols - 1) * 2
-            rest_len = cols * 2
+            # 補回 Windows strip 掉的 2-byte I2C-HID Length field；它自己佔第一組，
+            # 每行（含第一行）都是 cols 對。
+            row_len = cols * 2
             length_val = len(data) + 2
             extended = bytes([length_val & 0xFF, (length_val >> 8) & 0xFF]) + bytes(data)
-            append_fn(f"    0000:  {fmt_pairs(extended[:first_len])}")
-            for off in range(first_len, len(extended), rest_len):
-                chunk = extended[off:off + rest_len]
+            for off in range(0, len(extended), row_len):
+                chunk = extended[off:off + row_len]
                 append_fn(f"    {off:04X}:  {fmt_pairs(chunk)}")
         else:
             first = data[:64]
