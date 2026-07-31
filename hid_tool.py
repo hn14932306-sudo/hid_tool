@@ -71,8 +71,8 @@ except Exception:
 class HIDToolApp(tk.Tk):
     _APP_NAME          = "RE024 Touch Inspector"
     _APP_AUTHOR        = "Shane.Lin"
-    _APP_VERSION_LABEL = "v1.9.4"
-    _APP_VERSION_TIME  = "2026-07-27"
+    _APP_VERSION_LABEL = "v1.9.5"
+    _APP_VERSION_TIME  = "2026-07-31"
 
     # 版本(edition)：Engineer = 全功能；FAE / Customer = 閹割版
     # 由 build 時產生的 _edition.py 決定（見 .spec），開發/沒有該檔時預設 Engineer。
@@ -315,6 +315,18 @@ class HIDToolApp(tk.Tk):
         self._ff01_usage_state: Dict[str, Dict[int, bool]] = {}  # path -> usage -> visible
         self._ff01_filter_path: str                      = ""
         self._ff01_fmt:         tk.StringVar             = tk.StringVar(value="Hex")
+        # FF01 統計列（平均 / 最大 / 最小 / 標準差），累計自開始監聽或按「清除」之後
+        self._ff01_stats_var:   tk.BooleanVar            = tk.BooleanVar(value=False)
+        self._ff01_stats_cols:  List[str]                = []   # 目前納入統計的 vu_ 欄位（依 _col_defs 順序）
+        self._ff01_stat_pos:    List[int]                = []   # 對應的 payload byte 位置
+        self._ff01_stat_n:      int                      = 0
+        self._ff01_stat_sum:    List[int]                = []
+        self._ff01_stat_sq:     List[int]                = []
+        self._ff01_stat_min:    List[int]                = []
+        self._ff01_stat_max:    List[int]                = []
+        self._ff01_stats_dirty: bool                     = False
+        self._stats_rows:       Dict[str, str]           = {}   # 統計列名 -> treeview iid
+        self._stats_visible:    bool                     = False
         self._table_rid:        int                      = -1
         self._frame_deque:      collections.deque        = collections.deque()
         # 匯出 Excel 的資料來源；加上限避免長時間監聽無限累積拖慢整體（GC 停頓）
@@ -1027,6 +1039,12 @@ class HIDToolApp(tk.Tk):
         # 格式選擇器永久固定在右側
         fmt_right = ttk.Frame(self._ff01_filter_frame)
         fmt_right.pack(side=tk.RIGHT, padx=4, pady=1)
+        ttk.Checkbutton(fmt_right, text="統計列",
+                        variable=self._ff01_stats_var,
+                        command=self._toggle_ff01_stats).pack(side=tk.LEFT, padx=(0, 4))
+        self._ff01_stats_n_var = tk.StringVar(value="")
+        ttk.Label(fmt_right, textvariable=self._ff01_stats_n_var,
+                  style="Muted.TLabel", width=11).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Label(fmt_right, text="格式:").pack(side=tk.LEFT)
         fmt_combo = ttk.Combobox(
             fmt_right, textvariable=self._ff01_fmt,
@@ -1068,14 +1086,29 @@ class HIDToolApp(tk.Tk):
         self._tbl_wrap.pack(fill=tk.BOTH, expand=True)
         self._table = ttk.Treeview(self._tbl_wrap, show="headings", selectmode="browse",
                                    style="Mono.Treeview")
+        # FF01 統計列：欄位定義與主表格同步，貼在表格正下方對齊顯示
+        self._stats_table = ttk.Treeview(self._tbl_wrap, show="", selectmode="none",
+                                         style="Mono.Treeview", height=len(self._STAT_ROWS))
         vsb = ttk.Scrollbar(self._tbl_wrap, orient=tk.VERTICAL,   command=self._table.yview)
-        hsb = ttk.Scrollbar(self._tbl_wrap, orient=tk.HORIZONTAL, command=self._table.xview)
-        self._table.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        hsb = ttk.Scrollbar(self._tbl_wrap, orient=tk.HORIZONTAL, command=self._on_table_xview)
+        self._table_hsb = hsb
+
+        def _table_xscroll(first, last):
+            hsb.set(first, last)
+            try:
+                self._stats_table.xview_moveto(first)
+            except Exception:
+                pass
+
+        self._table.configure(yscrollcommand=vsb.set, xscrollcommand=_table_xscroll)
         vsb.pack(side=tk.RIGHT,  fill=tk.Y)
         hsb.pack(side=tk.BOTTOM, fill=tk.X)
         self._table.pack(fill=tk.BOTH, expand=True)
         self._table.tag_configure("scan_error", background="#ffd6d6")
         self._table.tag_configure("stripe", background=self._STRIPE)
+        self._stats_table.tag_configure("stat", background=self._STRIPE)
+        # 使用者拖曳調整欄寬後，統計列跟著對齊
+        self._table.bind("<ButtonRelease-1>", self._sync_stats_widths, add="+")
 
         # 畫布面板（建立但預設不加入分割視窗 = 收合）
         self._canvas_panel = ttk.LabelFrame(self._monitor_split, text="Touch Canvas",
@@ -1487,6 +1520,146 @@ class HIDToolApp(tk.Tk):
                 command=self._on_ff01_filter_changed,
             )
             cb.pack(side=tk.LEFT, padx=2, pady=1)
+
+    # ------------------------------------------------------------------
+    # FF01 統計列（平均 / 最大 / 最小 / 標準差）
+    # ------------------------------------------------------------------
+
+    # (key, 顯示名稱)；名稱放在第一欄，欄寬有限所以標準差用 σ
+    _STAT_ROWS = (("avg", "平均"), ("max", "最大"), ("min", "最小"), ("sd", "σ"))
+
+    def _on_table_xview(self, *args):
+        """水平捲軸同時捲動主表格與統計列，兩者才不會錯位。"""
+        self._table.xview(*args)
+        try:
+            self._stats_table.xview(*args)
+        except Exception:
+            pass
+
+    def _toggle_ff01_stats(self):
+        self._sync_stats_table()
+        self._update_stats_visibility()
+
+    def _reset_ff01_stats(self):
+        """依目前欄位定義重建統計累加器。欄位沒變時保留已累計的資料
+        （例如只切換 Hex/Dec/Bin 格式，統計不該歸零）。"""
+        cols: List[str] = []
+        pos:  List[int] = []
+        for col in self._col_defs:
+            cid = str(col.get("col_id", ""))
+            hf  = col.get("field_ref")
+            if not cid.startswith("vu_") or hf is None:
+                continue
+            cols.append(cid)
+            pos.append((hf.bit_offset // 8) + col["byte_index"])
+        if cols == self._ff01_stats_cols and pos == self._ff01_stat_pos:
+            return
+        self._ff01_stats_cols = cols
+        self._ff01_stat_pos   = pos
+        self._clear_ff01_stats()
+
+    def _clear_ff01_stats(self):
+        n = len(self._ff01_stats_cols)
+        self._ff01_stat_n   = 0
+        self._ff01_stat_sum = [0] * n
+        self._ff01_stat_sq  = [0] * n
+        self._ff01_stat_min = [256] * n
+        self._ff01_stat_max = [-1] * n
+        self._ff01_stats_dirty = True
+        if hasattr(self, "_ff01_stats_n_var"):
+            self._ff01_stats_n_var.set("")
+        self._refresh_stats_table()
+
+    def _accumulate_ff01_stats(self, payload: bytes):
+        """每個封包累加一次（不是每列，Hybrid 多接點不會重複計算）。"""
+        plen = len(payload)
+        self._ff01_stat_n += 1
+        s  = self._ff01_stat_sum
+        sq = self._ff01_stat_sq
+        mn = self._ff01_stat_min
+        mx = self._ff01_stat_max
+        for i, byte_pos in enumerate(self._ff01_stat_pos):
+            v = payload[byte_pos] if byte_pos < plen else 0
+            s[i]  += v
+            sq[i] += v * v
+            if v < mn[i]:
+                mn[i] = v
+            if v > mx[i]:
+                mx[i] = v
+        self._ff01_stats_dirty = True
+
+    def _update_stats_visibility(self):
+        want = bool(self._ff01_stats_var.get() and self._ff01_stats_cols)
+        if want == self._stats_visible:
+            return
+        if want:
+            self._stats_table.pack(side=tk.BOTTOM, fill=tk.X, before=self._table)
+        else:
+            self._stats_table.pack_forget()
+        self._stats_visible = want
+
+    def _sync_stats_table(self):
+        """統計列的欄位／寬度跟主表格一致，左右才對得齊。"""
+        if not hasattr(self, "_stats_table"):
+            return
+        cols = list(self._table["columns"])
+        self._stats_table["columns"] = cols
+        for cid in cols:
+            self._stats_table.column(
+                cid,
+                width=int(self._table.column(cid, "width")),
+                stretch=bool(self._table.column(cid, "stretch")),
+                anchor="center",
+            )
+        for iid in self._stats_table.get_children():
+            self._stats_table.delete(iid)
+        self._stats_rows = {
+            key: self._stats_table.insert("", tk.END, values=(), tags=("stat",))
+            for key, _ in self._STAT_ROWS
+        }
+        self._refresh_stats_table()
+
+    def _sync_stats_widths(self, _event=None):
+        """使用者拖曳主表格欄寬後，統計列跟著同步（只調寬度，不重建列）。"""
+        if not self._stats_visible:
+            return
+        for cid in self._stats_table["columns"]:
+            try:
+                self._stats_table.column(cid, width=int(self._table.column(cid, "width")))
+            except tk.TclError:
+                pass
+
+    def _refresh_stats_table(self):
+        if not self._stats_rows:
+            return
+        self._ff01_stats_dirty = False
+        cols  = list(self._stats_table["columns"])
+        n     = self._ff01_stat_n
+        idx_of = {cid: i for i, cid in enumerate(self._ff01_stats_cols)}
+        rows: Dict[str, List[str]] = {key: [] for key, _ in self._STAT_ROWS}
+
+        for pos, cid in enumerate(cols):
+            i = idx_of.get(cid)
+            for key, label in self._STAT_ROWS:
+                if pos == 0:                       # 第一欄放統計項目名稱
+                    rows[key].append(label)
+                elif i is None or n <= 0:
+                    rows[key].append("")
+                elif key == "avg":
+                    rows[key].append(f"{self._ff01_stat_sum[i] / n:.1f}")
+                elif key == "max":
+                    rows[key].append(self._fmt_ff01_byte(self._ff01_stat_max[i]))
+                elif key == "min":
+                    rows[key].append(self._fmt_ff01_byte(self._ff01_stat_min[i]))
+                else:                              # 標準差（母體）
+                    mean = self._ff01_stat_sum[i] / n
+                    var  = max(0.0, self._ff01_stat_sq[i] / n - mean * mean)
+                    rows[key].append(f"{math.sqrt(var):.1f}")
+
+        for key, _ in self._STAT_ROWS:
+            self._stats_table.item(self._stats_rows[key], values=rows[key])
+        if hasattr(self, "_ff01_stats_n_var"):
+            self._ff01_stats_n_var.set(f"樣本 {n}" if n else "")
 
     # ------------------------------------------------------------------
     # Raw Descriptor viewer
@@ -2004,9 +2177,12 @@ class HIDToolApp(tk.Tk):
     def _rebuild_table_columns(self):
         if self._all_digi_mode:
             self._setup_all_digi_columns()   # 全裝置模式：固定欄位，不被 View/RID/RAW 蓋掉
-            return
-        path_str = self._get_dev_path_str(self._selected_dev) if self._selected_dev else ""
-        self._setup_table_columns(self._descriptors.get(path_str, []))
+        else:
+            path_str = self._get_dev_path_str(self._selected_dev) if self._selected_dev else ""
+            self._setup_table_columns(self._descriptors.get(path_str, []))
+        self._reset_ff01_stats()
+        self._sync_stats_table()
+        self._update_stats_visibility()
 
     def _setup_table_columns(self, fields: List[HIDField]):
         rid_sel = self._rid_filter_var.get()
@@ -2234,6 +2410,7 @@ class HIDToolApp(tk.Tk):
         self._listen_starting = True
         self._listen_start_seq += 1
         seq = self._listen_start_seq
+        self._clear_ff01_stats()   # 統計自本次監聽起算
         self._listen_btn.config(text="啟動中...", state=tk.DISABLED)
         self._dev_combo.configure(state=tk.DISABLED)
         self._status_var.set("正在準備監聽...")
@@ -2605,6 +2782,8 @@ class HIDToolApp(tk.Tk):
         children = self._table.get_children()
         if len(children) > max_rows:
             self._table.delete(*children[max_rows:])
+        if self._stats_visible and self._ff01_stats_dirty:
+            self._refresh_stats_table()
 
     # ------------------------------------------------------------------
     # 「全部 digitizer」自動模式：不選裝置，通用 HID digitizer 解碼
@@ -3032,6 +3211,9 @@ class HIDToolApp(tk.Tk):
         if not self._col_defs:
             return
 
+        if self._ff01_stat_pos:
+            self._accumulate_ff01_stats(payload)
+
         field_cache: Dict[int, List[int]] = {}
 
         def get_vals(hf: HIDField) -> List[int]:
@@ -3280,6 +3462,7 @@ class HIDToolApp(tk.Tk):
         self._table_pending.clear()
         for iid in self._table.get_children():
             self._table.delete(iid)
+        self._clear_ff01_stats()
         self._frame_seq = 0
         self._table_row_seq = 0
         self._error_count = 0
@@ -3465,6 +3648,7 @@ class HIDToolApp(tk.Tk):
         self._table_pending.clear()
         for iid in self._table.get_children():
             self._table.delete(iid)
+        self._clear_ff01_stats()
         self._frame_seq = 0
         self._table_row_seq = 0
         self._error_count = 0
