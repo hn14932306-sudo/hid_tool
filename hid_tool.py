@@ -71,7 +71,7 @@ except Exception:
 class HIDToolApp(tk.Tk):
     _APP_NAME          = "RE024 Touch Inspector"
     _APP_AUTHOR        = "Shane.Lin"
-    _APP_VERSION_LABEL = "v1.9.6"
+    _APP_VERSION_LABEL = "v1.9.7"
     _APP_VERSION_TIME  = "2026-07-31"
 
     # 版本(edition)：Engineer = 全功能；FAE / Customer = 閹割版
@@ -340,6 +340,11 @@ class HIDToolApp(tk.Tk):
         self._hybrid_groups:    List[dict]               = []
         self._hybrid_common:    Dict[str, Tuple[HIDField, int]] = {}
         self._frame_seq:        int                      = 0
+        # 同一 frame（ScanTime 不變）內，多包分傳（例如 10 指分兩包各 5 指）時，
+        # 用「這個 frame 第一包回報的 ContactCount」當基準，累計已讀過幾個 slot，
+        # 後面幾包各自的 ContactCount 可能不準（例如讀到 0），不能拿來覆蓋基準值。
+        self._frame_contact_target: Optional[int]        = None
+        self._frame_contact_seen:   int                  = 0
         self._dev_tooltip:      Optional[tk.Toplevel]    = None
         self._dev_tooltip_label: Optional[tk.Label]      = None
 
@@ -2308,6 +2313,8 @@ class HIDToolApp(tk.Tk):
         self._last_contact_count = -1
         self._last_touch_active = False
         self._frame_seq = 0
+        self._frame_contact_target = None
+        self._frame_contact_seen = 0
         self._error_count = 0
         self._field_error_count = 0
         self._error_var.set("")
@@ -3386,6 +3393,12 @@ class HIDToolApp(tk.Tk):
             if is_new_frame:
                 self._canvas_prev_active = set(self._canvas_contacts.keys())
                 self._canvas_contacts.clear()
+                # 新 frame（ScanTime 變了）先清掉累計基準，等這個 frame 第一包
+                # 的 ContactCount 決定這個 frame 總共要收幾個接點。
+                self._frame_contact_target = None
+                self._frame_contact_seen = 0
+            if self._frame_contact_target is None and active_count >= 0:
+                self._frame_contact_target = active_count
             _stress_pkt_conf = False
             _stress_pkt_tip  = False
             appended = False
@@ -3406,11 +3419,13 @@ class HIDToolApp(tk.Tk):
                 cx = read_entry(group.get("CenterX"))
                 cy = read_entry(group.get("CenterY"))
 
-                # In parallel reports, ContactCount tells us how many contacts are valid.
-                # Hide trailing empty slots when switching to the hybrid-style view.
-                if active_count >= 0 and group["slot"] >= active_count:
-                    if tip in ("", 0) and cid_val in ("", 0) and x in ("", 0) and y in ("", 0):
-                        continue
+                # 用這個 frame 累計已讀過的 slot 數（跨多包）+ 目前這包的 slot 位置，
+                # 跟 frame 第一包給的 ContactCount 基準比對，超出才視為 padding 略過。
+                # 不能用「這一包自己回報的 ContactCount」，因為多包分傳時後面幾包
+                # 這個欄位可能不準（例如恆讀 0），但 slot 裡的資料仍是真的。
+                target = self._frame_contact_target
+                if target is not None and (self._frame_contact_seen + group["slot"]) >= target:
+                    continue
 
                 if (
                     tip in ("", 0)
@@ -3461,6 +3476,8 @@ class HIDToolApp(tk.Tk):
                     else:
                         row.append("")
 
+                # ContactCount 之外的 slot 是裝置沒在用的 padding，不管裡面填什麼保留值
+                # （常見是全 0 或全 1 之類的 sentinel），都不該拿去比對格式。
                 field_errors = [msg for msg in (
                     self._check_field_range("X", group.get("X"), x),
                     self._check_field_range("Y", group.get("Y"), y),
@@ -3490,6 +3507,8 @@ class HIDToolApp(tk.Tk):
                     track_key = None
                 if track_key is not None:
                     self._canvas_update_slot(track_key, tip, lx, ly, cid_val, confidence)
+
+            self._frame_contact_seen += len(self._hybrid_groups)
 
             if self._stress_running and not self._stress_pending:
                 if _stress_pkt_tip:
@@ -3569,6 +3588,8 @@ class HIDToolApp(tk.Tk):
             self._table.delete(iid)
         self._clear_ff01_stats()
         self._frame_seq = 0
+        self._frame_contact_target = None
+        self._frame_contact_seen = 0
         self._table_row_seq = 0
         self._error_count = 0
         self._field_error_count = 0
@@ -3759,6 +3780,8 @@ class HIDToolApp(tk.Tk):
             self._table.delete(iid)
         self._clear_ff01_stats()
         self._frame_seq = 0
+        self._frame_contact_target = None
+        self._frame_contact_seen = 0
         self._table_row_seq = 0
         self._error_count = 0
         self._field_error_count = 0
