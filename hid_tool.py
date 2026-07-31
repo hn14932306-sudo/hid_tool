@@ -71,7 +71,7 @@ except Exception:
 class HIDToolApp(tk.Tk):
     _APP_NAME          = "RE024 Touch Inspector"
     _APP_AUTHOR        = "Shane.Lin"
-    _APP_VERSION_LABEL = "v1.9.5"
+    _APP_VERSION_LABEL = "v1.9.6"
     _APP_VERSION_TIME  = "2026-07-31"
 
     # 版本(edition)：Engineer = 全功能；FAE / Customer = 閹割版
@@ -368,6 +368,9 @@ class HIDToolApp(tk.Tk):
         self._scan_delta_suppress: bool                  = False  # 觸控中斷後下一個 frame 的 Δ 不列入錯誤
         self._error_count:      int                      = 0
 
+        # Descriptor conformance-check state（比對實際回報值 vs descriptor 宣告的格式）
+        self._field_error_count:   int                     = 0
+
         # Record / replay state（監聽回放）
         self._record_buf:       collections.deque        = collections.deque(maxlen=self._RECORD_MAX)
         self._replay_active:    bool                     = False
@@ -485,6 +488,8 @@ class HIDToolApp(tk.Tk):
         style.configure("StatusRate.TLabel",  foreground=self._TEXT_MUTED, font=("Consolas", 9, "bold"),
                         background=self._SURFACE_ALT)
         style.configure("StatusError.TLabel", foreground=self._RED,  font=("Consolas", 11, "bold"),
+                        background=self._SURFACE_ALT)
+        style.configure("StatusFieldError.TLabel", foreground="#b45309", font=("Consolas", 11, "bold"),
                         background=self._SURFACE_ALT)
         style.configure("Panel.TFrame",  background=self._SURFACE_ALT)
 
@@ -807,6 +812,7 @@ class HIDToolApp(tk.Tk):
 
         self._top_rate_var = tk.StringVar(value="0 scan/s")
         self._top_error_var = tk.StringVar(value="ERR 0")
+        self._top_field_error_var = tk.StringVar(value="FMT 0")
         self._top_record_var = tk.StringVar(value="REC 0")
 
         # Device command strip
@@ -843,6 +849,7 @@ class HIDToolApp(tk.Tk):
                             font=("Consolas", 9, "bold"), padx=10, pady=3,
                             highlightthickness=1, highlightbackground=fg)
         _chip(self._top_record_var, "#e7edfd", self._ACCENT_DARK).pack(side=tk.RIGHT, padx=(6, 0))
+        _chip(self._top_field_error_var, "#fff1d6", "#b45309").pack(side=tk.RIGHT, padx=(6, 0))
         _chip(self._top_error_var,  "#fce9e9", self._RED_DARK).pack(side=tk.RIGHT, padx=(6, 0))
         _chip(self._top_rate_var,   "#e5f5eb", self._GREEN_DARK).pack(side=tk.RIGHT, padx=(6, 0))
 
@@ -868,6 +875,10 @@ class HIDToolApp(tk.Tk):
         self._error_var = tk.StringVar(value="")
         ttk.Label(sb_frame, textvariable=self._error_var, anchor=tk.E,
                   style="StatusError.TLabel", width=34).pack(side=tk.RIGHT, padx=(8, 4))
+
+        self._field_error_var = tk.StringVar(value="")
+        ttk.Label(sb_frame, textvariable=self._field_error_var, anchor=tk.E,
+                  style="StatusFieldError.TLabel", width=34).pack(side=tk.RIGHT, padx=(8, 4))
 
         # ---- Main PanedWindow ----
         paned = tk.PanedWindow(self, orient=tk.HORIZONTAL, sashrelief=tk.FLAT,
@@ -1105,6 +1116,7 @@ class HIDToolApp(tk.Tk):
         hsb.pack(side=tk.BOTTOM, fill=tk.X)
         self._table.pack(fill=tk.BOTH, expand=True)
         self._table.tag_configure("scan_error", background="#ffd6d6")
+        self._table.tag_configure("field_error", background="#ffe6b3")
         self._table.tag_configure("stripe", background=self._STRIPE)
         self._stats_table.tag_configure("stat", background=self._STRIPE)
         # 使用者拖曳調整欄寬後，統計列跟著對齊
@@ -2109,6 +2121,78 @@ class HIDToolApp(tk.Tk):
             return self._combine_field_parts(vals, hf.per_bit_size, hf.logical_min) if vals else ""
         return vals[idx] if idx < len(vals) else ""
 
+    def _check_field_range(
+        self, name: str, entry: Optional[Tuple[HIDField, int]], value: object,
+    ) -> Optional[str]:
+        """數值是否超出 descriptor 宣告的 Logical [min, max]。回傳 None 代表沒有異常。"""
+        if not entry or value in ("", None):
+            return None
+        hf, _idx = entry
+        try:
+            v = int(value)
+        except (TypeError, ValueError):
+            return None
+        lo, hi = hf.logical_min, hf.logical_max
+        if hi > lo and not (lo <= v <= hi):
+            return f"{name}超出範圍({v}∉[{lo},{hi}])"
+        return None
+
+    @staticmethod
+    def _as_float(value: object) -> Optional[float]:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _check_touch_geometry(
+        self, group: dict, x: object, y: object, cx: object, cy: object,
+        width: object, height: object,
+    ) -> Optional[str]:
+        """比對 X/Y 與 CenterX/CenterY、Width/Height 之間的幾何關係是否符合 descriptor 宣告：
+        - Width/Height 與 CenterX/CenterY 都有宣告時，X 應落在 [CenterX-Width/2, CenterX+Width/2]（Y/Height 同理）。
+        - 只宣告 CenterX/CenterY、沒宣告 Width/Height 時，CenterX/CenterY 應該等於 X/Y。
+        回傳 None 代表沒有異常。"""
+        xv, yv = self._as_float(x), self._as_float(y)
+        cxv, cyv = self._as_float(cx), self._as_float(cy)
+        wv, hv = self._as_float(width), self._as_float(height)
+        has_width, has_height = group.get("Width") is not None, group.get("Height") is not None
+
+        msgs = []
+        if group.get("CenterX") is not None and xv is not None and cxv is not None:
+            if has_width and wv is not None:
+                lo, hi = cxv - wv / 2, cxv + wv / 2
+                if not (lo <= xv <= hi):
+                    msgs.append(f"X({xv:g})不在CenterX±Width/2範圍[{lo:g},{hi:g}]內")
+            elif not has_width and cxv != xv:
+                msgs.append(f"CenterX({cxv:g})≠X({xv:g})")
+        if group.get("CenterY") is not None and yv is not None and cyv is not None:
+            if has_height and hv is not None:
+                lo, hi = cyv - hv / 2, cyv + hv / 2
+                if not (lo <= yv <= hi):
+                    msgs.append(f"Y({yv:g})不在CenterY±Height/2範圍[{lo:g},{hi:g}]內")
+            elif not has_height and cyv != yv:
+                msgs.append(f"CenterY({cyv:g})≠Y({yv:g})")
+        return "; ".join(msgs) if msgs else None
+
+    def _check_field_nonzero_when_active(
+        self, name: str, entry: Optional[Tuple[HIDField, int]], value: object, tip: object,
+    ) -> Optional[str]:
+        """Tip=1（實際有接觸）時，descriptor 有宣告的面積類欄位（Width/Height）理論上不該是 0。
+        沒有 CenterX/CenterY 可比對時，這是唯一能驗證數值合理性的獨立規則。
+        回傳 None 代表沒有異常。"""
+        if not entry or value in ("", None):
+            return None
+        try:
+            active = bool(int(tip))
+        except (TypeError, ValueError):
+            active = False
+        if not active:
+            return None
+        v = self._as_float(value)
+        if v == 0:
+            return f"{name}=0(Tip=1時面積不應為0)"
+        return None
+
     # Status 欄位顯示用：旗標 col_id -> 顯示名稱（依序）
     _STATUS_FLAGS = [
         ("Confidence", "Confidence"),
@@ -2225,9 +2309,13 @@ class HIDToolApp(tk.Tk):
         self._last_touch_active = False
         self._frame_seq = 0
         self._error_count = 0
+        self._field_error_count = 0
         self._error_var.set("")
+        self._field_error_var.set("")
         if hasattr(self, "_top_error_var"):
             self._top_error_var.set("ERR 0")
+        if hasattr(self, "_top_field_error_var"):
+            self._top_field_error_var.set("FMT 0")
 
         if self._view_mode.get() == "Hybrid" and self._setup_hybrid_columns(input_fields):
             self._pen_canvas = None   # 多點由 hybrid 路徑處理畫布
@@ -3315,6 +3403,8 @@ class HIDToolApp(tk.Tk):
                 y = read_entry(group.get("Y"))
                 width = read_entry(group.get("Width"))
                 height = read_entry(group.get("Height"))
+                cx = read_entry(group.get("CenterX"))
+                cy = read_entry(group.get("CenterY"))
 
                 # In parallel reports, ContactCount tells us how many contacts are valid.
                 # Hide trailing empty slots when switching to the hybrid-style view.
@@ -3348,9 +3438,9 @@ class HIDToolApp(tk.Tk):
                     "Status": status_val,
                     "ContactID": cid_val,
                     "X": x,
-                    "CenterX": read_entry(group.get("CenterX")),
+                    "CenterX": cx,
                     "Y": y,
-                    "CenterY": read_entry(group.get("CenterY")),
+                    "CenterY": cy,
                     "Width": width,
                     "Height": height,
                     "__raw__": raw_hex,
@@ -3370,7 +3460,22 @@ class HIDToolApp(tk.Tk):
                             row.append(f"{val:02X}")
                     else:
                         row.append("")
-                self._append_monitor_row(pkt, headers, row, row_tags, error_reasons)
+
+                field_errors = [msg for msg in (
+                    self._check_field_range("X", group.get("X"), x),
+                    self._check_field_range("Y", group.get("Y"), y),
+                    self._check_touch_geometry(group, x, y, cx, cy, width, height),
+                    self._check_field_nonzero_when_active("Width", group.get("Width"), width, tip),
+                    self._check_field_nonzero_when_active("Height", group.get("Height"), height, tip),
+                ) if msg]
+                row_tags_final = row_tags
+                if field_errors:
+                    row_tags_final = row_tags + ("field_error",)
+                    self._field_error_count += 1
+                    self._field_error_var.set(f"FMT:{self._field_error_count} | {field_errors[0]}")
+                    if hasattr(self, "_top_field_error_var"):
+                        self._top_field_error_var.set(f"FMT {self._field_error_count}")
+                self._append_monitor_row(pkt, headers, row, row_tags_final, error_reasons)
                 appended = True
 
                 # Canvas: 用 ContactID 當 key，避免兩指交叉時 slot 互串
@@ -3466,9 +3571,13 @@ class HIDToolApp(tk.Tk):
         self._frame_seq = 0
         self._table_row_seq = 0
         self._error_count = 0
+        self._field_error_count = 0
         self._error_var.set("")
+        self._field_error_var.set("")
         if hasattr(self, "_top_error_var"):
             self._top_error_var.set("ERR 0")
+        if hasattr(self, "_top_field_error_var"):
+            self._top_field_error_var.set("FMT 0")
 
     def _clear_monitor_all(self):
         """單一清除：監聽表格、畫布、錄製緩衝一次全部清空。"""
@@ -3652,9 +3761,13 @@ class HIDToolApp(tk.Tk):
         self._frame_seq = 0
         self._table_row_seq = 0
         self._error_count = 0
+        self._field_error_count = 0
         self._error_var.set("")
+        self._field_error_var.set("")
         if hasattr(self, "_top_error_var"):
             self._top_error_var.set("ERR 0")
+        if hasattr(self, "_top_field_error_var"):
+            self._top_field_error_var.set("FMT 0")
         self._last_pkt_rx_time = 0.0
         self._last_scan_time = -1
         self._scan_time_delta = 0
