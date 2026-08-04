@@ -71,8 +71,8 @@ except Exception:
 class HIDToolApp(tk.Tk):
     _APP_NAME          = "RE024 Touch Inspector"
     _APP_AUTHOR        = "Shane.Lin"
-    _APP_VERSION_LABEL = "v1.9.7"
-    _APP_VERSION_TIME  = "2026-07-31"
+    _APP_VERSION_LABEL = "v1.9.8"
+    _APP_VERSION_TIME  = "2026-08-04"
 
     # 版本(edition)：Engineer = 全功能；FAE / Customer = 閹割版
     # 由 build 時產生的 _edition.py 決定（見 .spec），開發/沒有該檔時預設 Engineer。
@@ -82,6 +82,10 @@ class HIDToolApp(tk.Tk):
     @classmethod
     def _is_engineer(cls) -> bool:
         return cls._EDITION == "Engineer"
+
+    @classmethod
+    def _is_fae(cls) -> bool:
+        return cls._EDITION == "FAE"
 
     # ---- UI palette & fonts（配合 sv-ttk light 主題，重新調校過的層次與對比）----
     _BG            = "#eef0f4"   # 應用程式底色（比卡片深一階，讓區塊立體）
@@ -324,7 +328,11 @@ class HIDToolApp(tk.Tk):
         self._ff01_stat_sq:     List[int]                = []
         self._ff01_stat_min:    List[int]                = []
         self._ff01_stat_max:    List[int]                = []
+        self._ff01_hist:        List[List[int]]          = []   # 每欄 256 格直方圖（截尾平均用）
+        self._ff01_ck:          List[List[int]]          = []   # 每欄的累計和檢查點（時間中段用）
+        self._ff01_ck_step:     int                      = 0    # 每幾個封包記一次檢查點
         self._ff01_stats_dirty: bool                     = False
+        self._ff01_stats_drawn: float                    = 0.0  # 上次重畫統計列的時間
         self._stats_rows:       Dict[str, str]           = {}   # 統計列名 -> treeview iid
         self._stats_visible:    bool                     = False
         self._table_rid:        int                      = -1
@@ -948,16 +956,19 @@ class HIDToolApp(tk.Tk):
         self._notebook.add(monitor_tab, text="監聽")
         self._build_monitor_tab(monitor_tab)
 
-        # 發送 / 壓測 / 回放分頁僅 Engineer 版（FAE/Customer 隱藏）
+        # 發送 / 回放分頁僅 Engineer 版（FAE/Customer 隱藏）
         if self._is_engineer():
             send_tab = ttk.Frame(self._notebook, style="Surface.TFrame")
             self._notebook.add(send_tab, text="發送")
             self._build_send_tab(send_tab)
 
+        # 壓測分頁：Engineer 與 FAE 版皆可用（Customer 隱藏）
+        if self._is_engineer() or self._is_fae():
             stress_tab = ttk.Frame(self._notebook, style="Surface.TFrame")
             self._notebook.add(stress_tab, text="壓測")
             self._build_stress_tab(stress_tab)
 
+        if self._is_engineer():
             # 回放分頁：內含 Differ / DigiInfo 兩個子分頁
             replay_tab = ttk.Frame(self._notebook, style="Surface.TFrame")
             self._notebook.add(replay_tab, text="回放")
@@ -1542,8 +1553,15 @@ class HIDToolApp(tk.Tk):
     # FF01 統計列（平均 / 最大 / 最小 / 標準差）
     # ------------------------------------------------------------------
 
-    # (key, 顯示名稱)；名稱放在第一欄，欄寬有限所以標準差用 σ
-    _STAT_ROWS = (("avg", "平均"), ("max", "最大"), ("min", "最小"), ("sd", "σ"))
+    # (key, 顯示名稱)；名稱放在第一欄，欄寬有限所以都用 2 字：
+    #   平均=全部樣本、截尾=去掉數值最大/最小各 25%、中段=去掉時間最前/最後各 25%
+    _STAT_ROWS = (("avg", "平均"), ("trim", "截尾"), ("mid", "中段"),
+                  ("max", "最大"), ("min", "最小"), ("sd", "σ"))
+
+    _TRIM_RATIO   = 0.25    # 截尾／中段：頭尾各去掉 25%，取中間 50%
+    _CK_STEP_INIT = 8       # 中段用：一開始每 8 個封包記一次累計和檢查點
+    _CK_MAX       = 2048    # 檢查點上限；超過就抽掉一半、間隔加倍（記憶體固定）
+    _STATS_DRAW_INTERVAL = 0.25   # 統計列最快每 0.25 秒重畫一次
 
     def _on_table_xview(self, *args):
         """水平捲軸同時捲動主表格與統計列，兩者才不會錯位。"""
@@ -1582,7 +1600,11 @@ class HIDToolApp(tk.Tk):
         self._ff01_stat_sq  = [0] * n
         self._ff01_stat_min = [256] * n
         self._ff01_stat_max = [-1] * n
+        self._ff01_hist     = [[0] * 256 for _ in range(n)]
+        self._ff01_ck       = [[0] for _ in range(n)]
+        self._ff01_ck_step  = self._CK_STEP_INIT
         self._ff01_stats_dirty = True
+        self._ff01_stats_drawn = 0.0
         if hasattr(self, "_ff01_stats_n_var"):
             self._ff01_stats_n_var.set("")
         self._refresh_stats_table()
@@ -1595,6 +1617,7 @@ class HIDToolApp(tk.Tk):
         sq = self._ff01_stat_sq
         mn = self._ff01_stat_min
         mx = self._ff01_stat_max
+        hist = self._ff01_hist
         for i, byte_pos in enumerate(self._ff01_stat_pos):
             v = payload[byte_pos] if byte_pos < plen else 0
             s[i]  += v
@@ -1603,7 +1626,59 @@ class HIDToolApp(tk.Tk):
                 mn[i] = v
             if v > mx[i]:
                 mx[i] = v
+            hist[i][v] += 1
+        if self._ff01_stat_n % self._ff01_ck_step == 0:
+            self._push_ff01_checkpoint()
         self._ff01_stats_dirty = True
+
+    def _push_ff01_checkpoint(self):
+        """記下目前的累計和。第 j 個檢查點 = 第 j*step 個封包，
+        中段平均就用兩個檢查點相減得到區間和。"""
+        ck = self._ff01_ck
+        s  = self._ff01_stat_sum
+        for i, col in enumerate(ck):
+            col.append(s[i])
+        if ck and len(ck[0]) > self._CK_MAX:
+            # 抽掉一半：舊的第 2j 個 = 新的第 j 個（間隔加倍），區間對應仍正確
+            for i, col in enumerate(ck):
+                ck[i] = col[::2]
+            self._ff01_ck_step *= 2
+
+    def _trimmed_mean(self, hist: List[int], n: int) -> Optional[float]:
+        """截尾平均：依數值排序後去掉最大/最小各 _TRIM_RATIO，剩下的平均。
+        值域是 byte，用 256 格直方圖算，邊界照比例切、結果精確。"""
+        drop = n * self._TRIM_RATIO
+        keep = n - 2 * drop
+        if keep <= 0:
+            return None
+        hi_rank = n - drop
+        total = 0.0
+        pos   = 0
+        for value, cnt in enumerate(hist):
+            if not cnt:
+                continue
+            lo_edge = pos if pos > drop else drop
+            hi_edge = (pos + cnt) if (pos + cnt) < hi_rank else hi_rank
+            if hi_edge > lo_edge:
+                total += (hi_edge - lo_edge) * value
+            pos += cnt
+            if pos >= hi_rank:
+                break
+        return total / keep
+
+    def _time_middle_mean(self, col_idx: int) -> Optional[float]:
+        """中段平均：依封包先後去掉最前/最後各 _TRIM_RATIO，只算中間那段。
+        區間邊界會對齊到檢查點（誤差最多 step 個封包）。"""
+        ck   = self._ff01_ck[col_idx]
+        n_ck = len(ck) - 1
+        if n_ck < 4:
+            return None            # 樣本還不夠切出中段
+        drop = int(n_ck * self._TRIM_RATIO)
+        lo, hi = drop, n_ck - drop
+        cnt = (hi - lo) * self._ff01_ck_step
+        if cnt <= 0:
+            return None
+        return (ck[hi] - ck[lo]) / cnt
 
     def _update_stats_visibility(self):
         want = bool(self._ff01_stats_var.get() and self._ff01_stats_cols)
@@ -1664,6 +1739,12 @@ class HIDToolApp(tk.Tk):
                     rows[key].append("")
                 elif key == "avg":
                     rows[key].append(f"{self._ff01_stat_sum[i] / n:.1f}")
+                elif key == "trim":
+                    v = self._trimmed_mean(self._ff01_hist[i], n)
+                    rows[key].append(f"{v:.1f}" if v is not None else "—")
+                elif key == "mid":
+                    v = self._time_middle_mean(i)
+                    rows[key].append(f"{v:.1f}" if v is not None else "—")
                 elif key == "max":
                     rows[key].append(self._fmt_ff01_byte(self._ff01_stat_max[i]))
                 elif key == "min":
@@ -2596,6 +2677,8 @@ class HIDToolApp(tk.Tk):
         )
         self._dev_combo.configure(state="readonly")
         self._status_var.set("已停止監聽")
+        if self._stats_visible:
+            self._refresh_stats_table()   # 停下時把最後 0.25 秒的資料補進統計列
 
     # ------------------------------------------------------------------
     # Monitor: Queue polling & packet handling
@@ -2877,8 +2960,12 @@ class HIDToolApp(tk.Tk):
         children = self._table.get_children()
         if len(children) > max_rows:
             self._table.delete(*children[max_rows:])
+        # 截尾平均要掃直方圖，比其他統計貴，這裡再節流一次（~4fps 足夠讀）
         if self._stats_visible and self._ff01_stats_dirty:
-            self._refresh_stats_table()
+            now = time.monotonic()
+            if now - self._ff01_stats_drawn >= self._STATS_DRAW_INTERVAL:
+                self._ff01_stats_drawn = now
+                self._refresh_stats_table()
 
     # ------------------------------------------------------------------
     # 「全部 digitizer」自動模式：不選裝置，通用 HID digitizer 解碼
