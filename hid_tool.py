@@ -26,6 +26,7 @@ from typing import Dict, List, Optional, Tuple
 from xml.sax.saxutils import escape
 
 import sv_ttk
+from fast_table import FastTable
 import heatmap_frame
 import digiinfo_parse
 import updater
@@ -71,8 +72,8 @@ except Exception:
 class HIDToolApp(tk.Tk):
     _APP_NAME          = "RE024 Touch Inspector"
     _APP_AUTHOR        = "Shane.Lin"
-    _APP_VERSION_LABEL = "v1.9.8"
-    _APP_VERSION_TIME  = "2026-08-04"
+    _APP_VERSION_LABEL = "v1.9.9"
+    _APP_VERSION_TIME  = "2026-08-07"
 
     # 版本(edition)：Engineer = 全功能；FAE / Customer = 閹割版
     # 由 build 時產生的 _edition.py 決定（見 .spec），開發/沒有該檔時預設 Engineer。
@@ -298,6 +299,7 @@ class HIDToolApp(tk.Tk):
         # 「全部 digitizer」自動模式
         self._all_digi_mode:     bool                      = False
         self._adigi_entries:     List[tuple]               = []   # (vidpid, col, ctx_by_rid) 預載清單
+        self._digi_ctx_memo:     Dict[tuple, object]       = {}   # (device_name, rid) -> 解析結果
         self._digi_headers:      List[str]                 = []
         self._digi_rate_deques:  Dict[str, collections.deque] = {}  # 來源 label -> rx_time deque
         # 每裝置畫布（grid）：label -> {order,color,xr,yr,contacts,trails}
@@ -315,6 +317,10 @@ class HIDToolApp(tk.Tk):
         self._listen_start_seq: int                      = 0
         self._device_refresh_seq: int                    = 0
         self._col_defs:         List[dict]               = []
+        # 熱路徑快取：欄位標題與「有沒有 RAW 欄」隨 _col_defs 一起更新，
+        # 免得每個封包都重算一次（高回報率時這是可觀的固定成本）。
+        self._col_labels:       List[str]                = []
+        self._has_raw_col:      bool                     = False
         self._ff01_usage_vars:  Dict[int, tk.BooleanVar] = {}  # FF01 usage -> visible
         self._ff01_usage_state: Dict[str, Dict[int, bool]] = {}  # path -> usage -> visible
         self._ff01_filter_path: str                      = ""
@@ -333,7 +339,7 @@ class HIDToolApp(tk.Tk):
         self._ff01_ck_step:     int                      = 0    # 每幾個封包記一次檢查點
         self._ff01_stats_dirty: bool                     = False
         self._ff01_stats_drawn: float                    = 0.0  # 上次重畫統計列的時間
-        self._stats_rows:       Dict[str, str]           = {}   # 統計列名 -> treeview iid
+        self._stats_rows:       List[str]                = []   # 統計列的 key 順序
         self._stats_visible:    bool                     = False
         self._table_rid:        int                      = -1
         self._frame_deque:      collections.deque        = collections.deque()
@@ -370,8 +376,16 @@ class HIDToolApp(tk.Tk):
         # UI 只保留最新待顯示列；完整資料仍寫入 _monitor_log_rows。
         self._table_pending:           collections.deque             = collections.deque(maxlen=250)
         self._table_flush_pending:     bool                         = False
+        self._table_flush_ms:          int                          = 40   # 表格重繪間隔（依排程延遲自動調整）
+        self._table_flush_due:         float                        = 0.0  # 這次 flush 排定的觸發時刻
         self._table_row_seq:           int                          = 0    # 斑馬紋交錯計數
         self._canvas_flush_pending:    bool                         = False
+        # tk 變數 get() 是 Tcl 往返，每包讀會拖慢畫面；熱路徑用的設定值定期快取
+        self._hot_params_ts:           float                        = 0.0
+        self._hot_max_delta:           int                          = 200
+        self._hot_view_hybrid:         bool                         = True
+        self._hot_show_raw:            bool                         = False
+        self._dev_key_memo:            Dict[str, str]               = {}
         self._canvas_dirty_keys:       set                          = set()  # 有新資料的 cid
         self._canvas_trail_reset_keys: set                          = set()  # 需清除舊軌跡線
         self._canvas_circle_del_keys:  set                          = set()  # 需刪除圓圈
@@ -1111,11 +1125,20 @@ class HIDToolApp(tk.Tk):
 
         self._tbl_wrap = ttk.Frame(tbl_frame)
         self._tbl_wrap.pack(fill=tk.BOTH, expand=True)
-        self._table = ttk.Treeview(self._tbl_wrap, show="headings", selectmode="browse",
-                                   style="Mono.Treeview")
+        # 監聽表格用 FastTable（Text 自繪）而非 ttk.Treeview：
+        # Treeview 每次重繪都會重畫整個可見區的所有 cell，成本正比於
+        # 可見列數 × 欄位數，高回報率下會把 event loop 塞住（實測 14 欄 33 列
+        # 每批 ~80ms，超過 40ms 的更新預算）。FastTable 只寫入可見的那幾列，
+        # 同條件約 11ms。代價是欄寬不能用滑鼠拖曳，改由 _col_width 決定。
+        self._table = FastTable(self._tbl_wrap, font=self._FONT_MONO,
+                                bg=self._SURFACE, fg=self._TEXT,
+                                header_bg=self._SURFACE_ALT)
         # FF01 統計列：欄位定義與主表格同步，貼在表格正下方對齊顯示
-        self._stats_table = ttk.Treeview(self._tbl_wrap, show="", selectmode="none",
-                                         style="Mono.Treeview", height=len(self._STAT_ROWS))
+        self._stats_table = FastTable(self._tbl_wrap, font=self._FONT_MONO,
+                                      height=len(self._STAT_ROWS),
+                                      bg=self._SURFACE, fg=self._TEXT,
+                                      header_bg=self._SURFACE_ALT,
+                                      show_header=False)
         vsb = ttk.Scrollbar(self._tbl_wrap, orient=tk.VERTICAL,   command=self._table.yview)
         hsb = ttk.Scrollbar(self._tbl_wrap, orient=tk.HORIZONTAL, command=self._on_table_xview)
         self._table_hsb = hsb
@@ -1127,16 +1150,17 @@ class HIDToolApp(tk.Tk):
             except Exception:
                 pass
 
-        self._table.configure(yscrollcommand=vsb.set, xscrollcommand=_table_xscroll)
+        self._table.configure_scroll(yscrollcommand=vsb.set, xscrollcommand=_table_xscroll)
         vsb.pack(side=tk.RIGHT,  fill=tk.Y)
         hsb.pack(side=tk.BOTTOM, fill=tk.X)
         self._table.pack(fill=tk.BOTH, expand=True)
-        self._table.tag_configure("scan_error", background="#ffd6d6")
-        self._table.tag_configure("field_error", background="#ffe6b3")
-        self._table.tag_configure("stripe", background=self._STRIPE)
-        self._stats_table.tag_configure("stat", background=self._STRIPE)
-        # 使用者拖曳調整欄寬後，統計列跟著對齊
-        self._table.bind("<ButtonRelease-1>", self._sync_stats_widths, add="+")
+        # priority 大的蓋過小的：錯誤色永遠贏過斑馬紋。
+        # 目前 _table_flush 只在沒有錯誤 tag 時才加 stripe，兩者不會同時出現，
+        # 但把優先序寫明，日後改動那段也不會讓斑馬紋蓋掉錯誤列。
+        self._table.tag_configure("stripe", background=self._STRIPE, priority=0)
+        self._table.tag_configure("scan_error", background="#ffd6d6", priority=10)
+        self._table.tag_configure("field_error", background="#ffe6b3", priority=20)
+        self._stats_table.tag_configure("stat", background=self._STRIPE, priority=0)
 
         # 畫布面板（建立但預設不加入分割視窗 = 收合）
         self._canvas_panel = ttk.LabelFrame(self._monitor_split, text="Touch Canvas",
@@ -1316,6 +1340,7 @@ class HIDToolApp(tk.Tk):
             # 「全部 digitizer」：不選裝置、自動解碼所有 digitizer
             self._enter_all_digi_mode()
             self._adigi_entries = []          # 預載延後到開始監聽時才做，避免啟動卡頓
+            self._digi_ctx_memo.clear()
             self._hide_dev_tooltip()
             # 監聽中切入：重啟以註冊完整 digitizer TLC（含 Pen/Stylus）
             if self._listening:
@@ -1691,41 +1716,20 @@ class HIDToolApp(tk.Tk):
         self._stats_visible = want
 
     def _sync_stats_table(self):
-        """統計列的欄位／寬度跟主表格一致，左右才對得齊。"""
+        """統計列直接沿用主表格的欄位定義，左右自然對得齊。"""
         if not hasattr(self, "_stats_table"):
             return
-        cols = list(self._table["columns"])
-        self._stats_table["columns"] = cols
-        for cid in cols:
-            self._stats_table.column(
-                cid,
-                width=int(self._table.column(cid, "width")),
-                stretch=bool(self._table.column(cid, "stretch")),
-                anchor="center",
-            )
-        for iid in self._stats_table.get_children():
-            self._stats_table.delete(iid)
-        self._stats_rows = {
-            key: self._stats_table.insert("", tk.END, values=(), tags=("stat",))
-            for key, _ in self._STAT_ROWS
-        }
+        cols = self._table.get_columns()
+        self._stats_table.set_columns(cols)
+        self._stats_table.set_max_rows(len(self._STAT_ROWS))
+        self._stats_rows = [key for key, _ in self._STAT_ROWS]
         self._refresh_stats_table()
-
-    def _sync_stats_widths(self, _event=None):
-        """使用者拖曳主表格欄寬後，統計列跟著同步（只調寬度，不重建列）。"""
-        if not self._stats_visible:
-            return
-        for cid in self._stats_table["columns"]:
-            try:
-                self._stats_table.column(cid, width=int(self._table.column(cid, "width")))
-            except tk.TclError:
-                pass
 
     def _refresh_stats_table(self):
         if not self._stats_rows:
             return
         self._ff01_stats_dirty = False
-        cols  = list(self._stats_table["columns"])
+        cols  = [c[0] for c in self._stats_table.get_columns()]
         n     = self._ff01_stat_n
         idx_of = {cid: i for i, cid in enumerate(self._ff01_stats_cols)}
         rows: Dict[str, List[str]] = {key: [] for key, _ in self._STAT_ROWS}
@@ -1754,8 +1758,11 @@ class HIDToolApp(tk.Tk):
                     var  = max(0.0, self._ff01_stat_sq[i] / n - mean * mean)
                     rows[key].append(f"{math.sqrt(var):.1f}")
 
-        for key, _ in self._STAT_ROWS:
-            self._stats_table.item(self._stats_rows[key], values=rows[key])
+        # insert_rows 是「最新在最上」，反序送進去才會照 _STAT_ROWS 的順序顯示
+        self._stats_table.clear()
+        self._stats_table.insert_rows(
+            [(rows[key], ("stat",)) for key, _ in reversed(self._STAT_ROWS)])
+        self._stats_table.flush()
         if hasattr(self, "_ff01_stats_n_var"):
             self._ff01_stats_n_var.set(f"樣本 {n}" if n else "")
 
@@ -2198,6 +2205,7 @@ class HIDToolApp(tk.Tk):
             col_defs.append({"col_id": "__raw__", "label": "RAW", "width": 220, "kind": "meta", "field_ref": None, "value_index": -1, "byte_index": -1})
 
         self._col_defs = col_defs
+        self._refresh_col_cache()
         return True
 
     def _get_field_display_value(self, payload: bytes, hf: HIDField, idx: int) -> object:
@@ -2344,7 +2352,19 @@ class HIDToolApp(tk.Tk):
             return f"{val:08b}"
         return f"{val:02X}"
 
+    def _apply_table_columns(self, col_defs: List[dict]):
+        """把欄位定義套到 FastTable：RAW 欄靠左，其餘置中。"""
+        self._table.set_columns([
+            (c["col_id"], c["label"], self._col_width(c["width"], c["label"]))
+            for c in col_defs
+        ])
+        for c in col_defs:
+            self._table.column(c["col_id"],
+                               anchor="w" if c["col_id"] == "__raw__" else "center")
+
     def _rebuild_table_columns(self):
+        # 欄位重建後 View 模式可能已改變，快取立刻失效，避免短暫欄位錯位
+        self._hot_params_ts = 0.0
         if self._all_digi_mode:
             self._setup_all_digi_columns()   # 全裝置模式：固定欄位，不被 View/RID/RAW 蓋掉
         else:
@@ -2407,13 +2427,7 @@ class HIDToolApp(tk.Tk):
 
         if self._view_mode.get() == "Hybrid" and self._setup_hybrid_columns(input_fields):
             self._pen_canvas = None   # 多點由 hybrid 路徑處理畫布
-            ids = [c["col_id"] for c in self._col_defs]
-            self._table["columns"] = ids
-            self._table["show"] = "headings"
-            for c in self._col_defs:
-                self._table.heading(c["col_id"], text=c["label"])
-                self._table.column(c["col_id"], width=self._col_width(c["width"], c["label"]),
-                                   stretch=(c["col_id"] == "__raw__"), anchor="center")
+            self._apply_table_columns(self._col_defs)
             return
 
         # 單點（手寫筆）：descriptor 沒有 ContactID，hybrid 不成立，
@@ -2556,14 +2570,8 @@ class HIDToolApp(tk.Tk):
                     })
 
         self._col_defs  = col_defs
-
-        ids = [c["col_id"] for c in col_defs]
-        self._table["columns"] = ids
-        self._table["show"]    = "headings"
-        for c in col_defs:
-            self._table.heading(c["col_id"], text=c["label"])
-            self._table.column(c["col_id"], width=self._col_width(c["width"], c["label"]),
-                               stretch=(c["col_id"] == "__raw__"), anchor="center")
+        self._refresh_col_cache()
+        self._apply_table_columns(col_defs)
 
     # ------------------------------------------------------------------
     # Monitor: Listen / Stop
@@ -2751,10 +2759,12 @@ class HIDToolApp(tk.Tk):
         try:
             processed = 0
             if not self._replay_active:
+                self._refresh_hot_params(time.monotonic())
                 gap_threshold = self._gap_threshold()
                 # 只處理「選定監聽裝置」的封包；RawInput 會收到所有同 usage page 裝置
                 listen_key = (self._dev_match_key(self._get_dev_path_str(self._selected_dev))
                               if self._selected_dev else "")
+                dev_key_memo = self._dev_key_memo
                 deadline = time.perf_counter() + 0.008
                 while processed < 64 and time.perf_counter() < deadline:
                     try:
@@ -2765,8 +2775,13 @@ class HIDToolApp(tk.Tk):
                     try:
                         if listen_key:
                             dn = pkt.get("device_name", "")
-                            if dn and self._dev_match_key(dn) != listen_key:
-                                continue   # 非選定裝置，忽略（不錄製/不計數/不顯示）
+                            if dn:
+                                # 裝置名稱數量有限，正規化結果記起來重用
+                                key = dev_key_memo.get(dn)
+                                if key is None:
+                                    key = dev_key_memo[dn] = self._dev_match_key(dn)
+                                if key != listen_key:
+                                    continue   # 非選定裝置，忽略（不錄製/不計數/不顯示）
                         if self._listening:
                             self._record_buf.append({
                                 "data": pkt.get("data", b""),
@@ -2787,6 +2802,9 @@ class HIDToolApp(tk.Tk):
             self.after(next_delay, self._poll_queue)
 
     _MAX_ROWS = 300
+    _TABLE_FLUSH_MIN_MS = 40
+    _TABLE_FLUSH_MAX_MS = 200
+    _NO_ERRORS: Tuple[str, ...] = ()   # 無錯誤時共用，省掉每列一個空 list
 
     @staticmethod
     def _excel_col_name(index: int) -> str:
@@ -2908,8 +2926,10 @@ class HIDToolApp(tk.Tk):
         headers = ["Timestamp", "Device"] + dynamic_headers
         rows: List[List[object]] = []
         for item in self._monitor_log_rows:
-            row = [item["timestamp"], item["device_name"]]
-            row.extend(item["data"].get(header, "") for header in dynamic_headers)
+            ts = datetime.datetime.fromtimestamp(item["ts"]).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            data = dict(zip(item["headers"], item["row"]))
+            row = [ts, item["device_name"]]
+            row.extend(data.get(header, "") for header in dynamic_headers)
             rows.append(row)
 
         try:
@@ -2923,12 +2943,15 @@ class HIDToolApp(tk.Tk):
 
     def _append_monitor_row(self, pkt: dict, headers: List[str], row: List[object],
                             row_tags: Tuple[str, ...], error_reasons: List[str]):
+        # 監聽中每列都要存，所以這裡只留最便宜的形式：時間戳存 epoch 秒、
+        # headers 直接沿用共用的欄位標題 list、值存 row 本身。
+        # 格式化與 header→值 的對應延後到匯出時才做。
         self._monitor_log_rows.append({
-            "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+            "ts": time.time(),
             "device_name": pkt.get("device_name", ""),
             "headers": headers,
-            "data": dict(zip(headers, row)),
-            "errors": list(error_reasons),
+            "row": row,
+            "errors": error_reasons,
         })
         if error_reasons:
             self._error_count += 1
@@ -2936,30 +2959,62 @@ class HIDToolApp(tk.Tk):
             if hasattr(self, "_top_error_var"):
                 self._top_error_var.set(f"ERR {self._error_count}")
 
-        # Buffer row — actual table.insert() done in _table_flush via after(0)
+        # Buffer row — 真正寫進表格在 _table_flush，由 after() 節流
         self._table_pending.append((row, row_tags))
         if not self._table_flush_pending:
             self._table_flush_pending = True
-            self.after(40, self._table_flush)
+            self._table_flush_due = time.monotonic() + self._table_flush_ms / 1000.0
+            self.after(self._table_flush_ms, self._table_flush)
 
     def _table_flush(self):
         self._table_flush_pending = False
         if not self._table_pending:
             return
-        pending = list(self._table_pending)
-        self._table_pending.clear()
-        for row, row_tags in pending:
-            self._table_row_seq += 1
-            if not row_tags and self._table_row_seq % 2 == 0:
-                row_tags = ("stripe",)
-            self._table.insert("", 0, values=row, tags=row_tags)
+        # 表格看不到（切到別的分頁、視窗最小化）時完全不動表格。
+        # 資料仍在 _monitor_log_rows，切回來後由新封包重新填。
+        try:
+            if not self._table.winfo_viewable():
+                self._table_pending.clear()
+                return
+        except tk.TclError:
+            return
+
+        # 自適應間隔的信號是「排程延遲」而不是這個函式的耗時：
+        # 真正貴的重繪發生在本函式返回、Tk 進入閒置之後，量函式內部
+        # 只會量到寫入成本，永遠觸發不了退讓。after 被延後多久，
+        # 才真正反映 event loop 被塞住的程度。
+        lag_ms = (time.monotonic() - self._table_flush_due) * 1000.0
+        if lag_ms > 30:
+            self._table_flush_ms = min(self._TABLE_FLUSH_MAX_MS,
+                                       self._table_flush_ms + 20)
+        elif lag_ms < 10 and self._table_flush_ms > self._TABLE_FLUSH_MIN_MS:
+            self._table_flush_ms = max(self._TABLE_FLUSH_MIN_MS,
+                                       self._table_flush_ms - 10)
+
         try:
             max_rows = max(50, int(self._max_rows_var.get()))
         except (ValueError, AttributeError):
             max_rows = 200
-        children = self._table.get_children()
-        if len(children) > max_rows:
-            self._table.delete(*children[max_rows:])
+
+        pending = list(self._table_pending)
+        self._table_pending.clear()
+        # 一次爆量進來時，超出保留筆數的舊列寫進去也會馬上被擠掉，直接跳過
+        if len(pending) > max_rows:
+            self._table_row_seq += len(pending) - max_rows
+            pending = pending[-max_rows:]
+
+        seq = self._table_row_seq
+        batch = []
+        for row, row_tags in pending:
+            seq += 1
+            if not row_tags and seq % 2 == 0:
+                row_tags = ("stripe",)
+            batch.append((row, row_tags))
+        self._table_row_seq = seq
+
+        self._table.set_max_rows(max_rows)
+        self._table.insert_rows(batch)
+        self._table.flush()
         # 截尾平均要掃直方圖，比其他統計貴，這裡再節流一次（~4fps 足夠讀）
         if self._stats_visible and self._ff01_stats_dirty:
             now = time.monotonic()
@@ -2990,23 +3045,18 @@ class HIDToolApp(tk.Tk):
 
     def _setup_all_digi_columns(self):
         self._col_defs = []                          # 避免其他單一裝置路徑誤用
+        self._refresh_col_cache()
         cols = list(self._ALL_DIGI_COLS)
         raw_on = self._show_raw.get()
         if raw_on:
             cols.append(("__raw__", "RAW", 260))     # 整包原始位元組（hex）
         # 欄數改變時舊列會錯位，先清空
-        for iid in self._table.get_children():
-            self._table.delete(iid)
+        self._table.clear()
         self._digi_headers = [c[1] for c in cols]
-        ids = [c[0] for c in cols]
-        self._table["columns"] = ids
-        self._table["show"] = "headings"
+        self._table.set_columns([(cid_, lbl, self._col_width(w, lbl))
+                                 for cid_, lbl, w in cols])
         for cid_, lbl, w in cols:
-            stretch = (cid_ == "__raw__") if raw_on else (cid_ == "Status")
-            anchor = "w" if cid_ == "__raw__" else "center"
-            self._table.heading(cid_, text=lbl)
-            self._table.column(cid_, width=self._col_width(w, lbl),
-                               stretch=stretch, anchor=anchor)
+            self._table.column(cid_, anchor="w" if cid_ == "__raw__" else "center")
 
     @staticmethod
     def _short_dev_label(dev: dict) -> str:
@@ -3089,6 +3139,7 @@ class HIDToolApp(tk.Tk):
                     return
                 self._descriptors.update(loaded)
                 self._adigi_entries = entries
+                self._digi_ctx_memo.clear()
                 if on_done is not None:
                     on_done()
 
@@ -3110,6 +3161,16 @@ class HIDToolApp(tk.Tk):
         1) 先用完整裝置介面路徑精準比對（USB / I2C-HID 皆可，不需 VID/PID）
         2) 退而用 VID:PID + report_id（優先 Col 相符）
         回 (rid_ctx, label) 或 None。"""
+        # 每包都會查一次，而 (裝置名, report id) 的組合很少 —— 直接記憶結果，
+        # 省下 3 次 regex 與整串 _adigi_entries 掃描。
+        memo_key = (device_name, report_id)
+        if memo_key in self._digi_ctx_memo:
+            return self._digi_ctx_memo[memo_key]
+        res = self._resolve_digi_rid_ctx(device_name, report_id)
+        self._digi_ctx_memo[memo_key] = res
+        return res
+
+    def _resolve_digi_rid_ctx(self, device_name: str, report_id: int):
         label = self._label_from_name(device_name)
         key = self._dev_match_key(device_name)
         if key:
@@ -3207,12 +3268,13 @@ class HIDToolApp(tk.Tk):
         self._digi_rate_deques.setdefault(label, collections.deque()).append(rx)
         self._frame_seq += 1
         rows = self._decode_digi_rows(ctx, payload, label)
-        if self._show_raw.get():
-            raw_hex = " ".join(f"{b:02X}" for b in data)   # 整包（含 report id）
+        if self._hot_show_raw:
+            raw_hex = data.hex(" ").upper()               # 整包（含 report id）
             for row in rows:
                 row.append(raw_hex)
+        headers = self._digi_headers
         for row in rows:
-            self._append_monitor_row(pkt, self._digi_headers, row, (), [])
+            self._append_monitor_row(pkt, headers, row, (), self._NO_ERRORS)
         self._feed_digi_canvas(label, ctx, payload)
 
     # ---- 全裝置畫布（每裝置一格 grid）----
@@ -3375,6 +3437,30 @@ class HIDToolApp(tk.Tk):
         except Exception:
             pass
 
+    def _refresh_col_cache(self):
+        """欄位定義變動時同步熱路徑快取（標題列、是否有 RAW 欄）。"""
+        self._col_labels  = [col["label"] for col in self._col_defs]
+        self._has_raw_col = any(col["col_id"] == "__raw__" for col in self._col_defs)
+
+    def _refresh_hot_params(self, now: float):
+        """把封包處理會用到的 tk 變數快取起來，最多 200ms 更新一次。
+        使用者改設定後最慢 0.2 秒生效，但省下每包數次 Tcl 往返。"""
+        if now - self._hot_params_ts < 0.2:
+            return
+        self._hot_params_ts = now
+        try:
+            self._hot_max_delta = int(self._max_scan_delta_var.get())
+        except (ValueError, AttributeError):
+            self._hot_max_delta = 0
+        try:
+            self._hot_view_hybrid = self._view_mode.get() == "Hybrid"
+        except AttributeError:
+            self._hot_view_hybrid = True
+        try:
+            self._hot_show_raw = bool(self._show_raw.get())
+        except AttributeError:
+            self._hot_show_raw = False
+
     def _handle_packet(
         self,
         pkt: dict,
@@ -3436,10 +3522,7 @@ class HIDToolApp(tk.Tk):
 
         error_reasons: List[str] = []
         row_tags: Tuple[str, ...] = ()
-        try:
-            max_delta = int(self._max_scan_delta_var.get())
-        except ValueError:
-            max_delta = 0
+        max_delta = self._hot_max_delta
         suppress_scan_error = (
             is_new_frame
             and (current_touch_active and not self._last_touch_active)
@@ -3458,9 +3541,9 @@ class HIDToolApp(tk.Tk):
                 self._last_contact_count = current_contact_count
             self._last_touch_active = current_touch_active
 
-        if self._view_mode.get() == "Hybrid" and self._hybrid_groups:
-            headers = [col["label"] for col in self._col_defs]
-            raw_hex = " ".join(f"{b:02X}" for b in data)
+        if self._hot_view_hybrid and self._hybrid_groups:
+            headers = self._col_labels
+            raw_hex = data.hex(" ").upper() if self._has_raw_col else ""
 
             def read_entry(entry: Optional[Tuple[HIDField, int]]) -> object:
                 if not entry:
@@ -3645,7 +3728,7 @@ class HIDToolApp(tk.Tk):
             if cid == "__rid__":
                 row.append(f"0x{report_id:02X}")
             elif cid == "__raw__":
-                row.append(" ".join(f"{b:02X}" for b in data))
+                row.append(data.hex(" ").upper())
             elif col.get("status_entries") is not None:
                 row.append(self._merge_status_entries(col["status_entries"], get_vals))
             elif col["byte_index"] >= 0:
@@ -3665,14 +3748,12 @@ class HIDToolApp(tk.Tk):
                 else:
                     row.append(vals[idx] if idx < len(vals) else "")
 
-        headers = [col["label"] for col in self._col_defs]
-        self._append_monitor_row(pkt, headers, row, row_tags, error_reasons)
+        self._append_monitor_row(pkt, self._col_labels, row, row_tags, error_reasons)
 
     def _clear_log(self):
         self._monitor_log_rows.clear()
         self._table_pending.clear()
-        for iid in self._table.get_children():
-            self._table.delete(iid)
+        self._table.clear()
         self._clear_ff01_stats()
         self._frame_seq = 0
         self._frame_contact_target = None
@@ -3827,6 +3908,7 @@ class HIDToolApp(tk.Tk):
         self._enter_all_digi_mode()
 
         self._adigi_entries = []
+        self._digi_ctx_memo.clear()
         for k, hexdesc in (descs or {}).items():
             try:
                 fields = parse_report_descriptor(bytes.fromhex(hexdesc))
@@ -3863,8 +3945,7 @@ class HIDToolApp(tk.Tk):
         """回放前重置與封包處理相關的執行期狀態（不動欄位定義）。"""
         self._monitor_log_rows.clear()
         self._table_pending.clear()
-        for iid in self._table.get_children():
-            self._table.delete(iid)
+        self._table.clear()
         self._clear_ff01_stats()
         self._frame_seq = 0
         self._frame_contact_target = None
@@ -3955,7 +4036,9 @@ class HIDToolApp(tk.Tk):
             self._replay_finish()
             return
         gap_threshold = self._gap_threshold()
-        virtual_now = self._replay_t0 + (time.monotonic() - self._replay_wall0) * self._replay_speed
+        wall_now = time.monotonic()
+        self._refresh_hot_params(wall_now)
+        virtual_now = self._replay_t0 + (wall_now - self._replay_wall0) * self._replay_speed
 
         fed = 0
         while self._replay_idx < n:
