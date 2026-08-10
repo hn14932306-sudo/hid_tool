@@ -72,8 +72,8 @@ except Exception:
 class HIDToolApp(tk.Tk):
     _APP_NAME          = "RE024 Touch Inspector"
     _APP_AUTHOR        = "Shane.Lin"
-    _APP_VERSION_LABEL = "v1.9.9"
-    _APP_VERSION_TIME  = "2026-08-07"
+    _APP_VERSION_LABEL = "v1.9.10"
+    _APP_VERSION_TIME  = "2026-08-10"
 
     # 版本(edition)：Engineer = 全功能；FAE / Customer = 閹割版
     # 由 build 時產生的 _edition.py 決定（見 .spec），開發/沒有該檔時預設 Engineer。
