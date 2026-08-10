@@ -27,6 +27,7 @@ from xml.sax.saxutils import escape
 
 import sv_ttk
 from fast_table import FastTable
+import hid_desc_compare
 import heatmap_frame
 import digiinfo_parse
 import updater
@@ -72,7 +73,7 @@ except Exception:
 class HIDToolApp(tk.Tk):
     _APP_NAME          = "RE024 Touch Inspector"
     _APP_AUTHOR        = "Shane.Lin"
-    _APP_VERSION_LABEL = "v1.9.10"
+    _APP_VERSION_LABEL = "v1.9.11"
     _APP_VERSION_TIME  = "2026-08-10"
 
     # 版本(edition)：Engineer = 全功能；FAE / Customer = 閹割版
@@ -87,6 +88,10 @@ class HIDToolApp(tk.Tk):
     @classmethod
     def _is_fae(cls) -> bool:
         return cls._EDITION == "FAE"
+
+    @classmethod
+    def _is_customer(cls) -> bool:
+        return cls._EDITION == "Customer"
 
     # ---- UI palette & fonts（配合 sv-ttk light 主題，重新調校過的層次與對比）----
     _BG            = "#eef0f4"   # 應用程式底色（比卡片深一階，讓區塊立體）
@@ -295,6 +300,14 @@ class HIDToolApp(tk.Tk):
         self._selected_dev:      Optional[dict]            = None
         self._descriptors:       Dict[str, List[HIDField]] = {}
         self._raw_descriptors:   Dict[str, bytes]          = {}  # path_str -> raw descriptor bytes
+
+        # Descriptor 比對視窗狀態：A / B 兩側各自的來源清單 (顯示名稱, raw bytes)
+        self._cmp_win:           Optional[tk.Toplevel]     = None
+        self._cmp_sources:       Dict[str, List[Tuple[str, bytes]]] = {"A": [], "B": []}
+        self._cmp_result                                   = None
+        self._cmp_quick_seq:     int                       = 0
+        self._cmp_quick_result                             = None
+        self._cmp_quick_profile: str                       = ""
 
         # 「全部 digitizer」自動模式
         self._all_digi_mode:     bool                      = False
@@ -841,6 +854,7 @@ class HIDToolApp(tk.Tk):
         self._top_error_var = tk.StringVar(value="ERR 0")
         self._top_field_error_var = tk.StringVar(value="FMT 0")
         self._top_record_var = tk.StringVar(value="REC 0")
+        self._top_desc_result_var = tk.StringVar(value="FAIL")
 
         # Device command strip
         row1 = ttk.Frame(top, style="Top.TFrame")
@@ -876,9 +890,16 @@ class HIDToolApp(tk.Tk):
                             font=("Consolas", 9, "bold"), padx=10, pady=3,
                             highlightthickness=1, highlightbackground=fg)
         _chip(self._top_record_var, "#e7edfd", self._ACCENT_DARK).pack(side=tk.RIGHT, padx=(6, 0))
-        _chip(self._top_field_error_var, "#fff1d6", "#b45309").pack(side=tk.RIGHT, padx=(6, 0))
+        self._top_desc_result_chip = _chip(
+            self._top_desc_result_var, "#fce9e9", self._RED_DARK)
+        self._top_desc_result_chip.configure(cursor="hand2")
+        self._top_desc_result_chip.bind("<Button-1>", self._cmp_show_quick_summary)
+        self._top_desc_result_chip.pack(side=tk.RIGHT, padx=(6, 0))
+        self._top_field_error_chip = _chip(self._top_field_error_var, "#fff1d6", "#b45309")
+        self._top_field_error_chip.pack(side=tk.RIGHT, padx=(6, 0))
         _chip(self._top_error_var,  "#fce9e9", self._RED_DARK).pack(side=tk.RIGHT, padx=(6, 0))
         _chip(self._top_rate_var,   "#e5f5eb", self._GREEN_DARK).pack(side=tk.RIGHT, padx=(6, 0))
+        self._top_desc_result_chip.pack_forget()
 
         # ---- Status bar ----
         # 比 PanedWindow 先 pack：視窗高度不足時才不會被擠出畫面
@@ -916,7 +937,10 @@ class HIDToolApp(tk.Tk):
 
         # -- Left panel: collapsible descriptor panel --
         left_outer = ttk.Frame(paned, style="Panel.TFrame")
-        paned.add(left_outer, minsize=0)
+        # Customer 不提供 Report Descriptor 觀看；元件仍建立供內部解析流程使用，
+        # 但整個側欄不加入畫面。右上角 PASS / FAIL 是獨立背景比對，不受影響。
+        if not self._is_customer():
+            paned.add(left_outer, minsize=0)
 
         # Toggle button row
         toggle_row = ttk.Frame(left_outer)
@@ -948,8 +972,17 @@ class HIDToolApp(tk.Tk):
         self._desc_tree.column("bit_size",      width=self._sx(70),  stretch=False)
         self._desc_tree.column("logical_range", width=self._sx(100), stretch=False)
 
-        ttk.Button(left_frame, text="原始 Descriptor Bytes",
-                   command=self._show_raw_descriptor).pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
+        desc_btns = ttk.Frame(left_frame)
+        desc_btns.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
+        ttk.Button(desc_btns, text="原始 Descriptor Bytes",
+                   command=self._show_raw_descriptor).pack(fill=tk.X)
+        self._desc_compare_btn = ttk.Button(
+            desc_btns, text="Descriptor 比對", command=self._show_descriptor_compare)
+        self._desc_compare_btn.pack(fill=tk.X, pady=(4, 0))
+        self._desc_compare_btn.configure(state=tk.DISABLED)
+
+        if self._is_customer():
+            self._desc_collapsed = True
 
         desc_sb = ttk.Scrollbar(left_frame, orient=tk.VERTICAL, command=self._desc_tree.yview)
         self._desc_tree.configure(yscrollcommand=desc_sb.set)
@@ -1280,6 +1313,12 @@ class HIDToolApp(tk.Tk):
             enumerate_hid_devices(),
             key=lambda d: (d.get("vendor_id", 0), d.get("product_id", 0), device_collection(d)),
         )
+        # Customer 版只允許監聽 FocalTech VID 2808；從共同裝置清單源頭過濾，
+        # 「全部 digitizer」、熱插拔重整與 Descriptor 背景檢查都會套用同一限制。
+        if self._is_customer():
+            self._hidapi_devices = [
+                d for d in self._hidapi_devices if d.get("vendor_id", 0) == 0x2808
+            ]
         labels = [format_device_label(d) for d in self._hidapi_devices]
         paths  = [self._get_dev_path_str(d) for d in self._hidapi_devices]
         # 第一個是「全部 digitizer」哨兵，其餘裝置往後位移 1
@@ -1314,6 +1353,7 @@ class HIDToolApp(tk.Tk):
 
         if self._all_digi_mode and self._listening:
             self._preload_digi_ctx_async()
+        self._cmp_update_availability()
 
     # ------------------------------------------------------------------
     # Hot-plug detection
@@ -1346,6 +1386,7 @@ class HIDToolApp(tk.Tk):
             if self._listening:
                 self._stop_listen()
                 self._start_listen()
+            self._cmp_update_availability()
             return
         self._all_digi_mode = False
         dev_idx = idx - 1   # 哨兵位移
@@ -1360,6 +1401,8 @@ class HIDToolApp(tk.Tk):
             self._clear_digi_canvas()
             self._reset_monitor_runtime_state()
         self._load_descriptor(self._selected_dev)
+        self._cmp_update_availability()
+        self._cmp_auto_refresh()
 
     def _on_cmd_device_selected(self, event):
         idx = self._cmd_dev_combo.current()
@@ -1538,6 +1581,12 @@ class HIDToolApp(tk.Tk):
             widget.destroy()
         self._ff01_usage_vars.clear()
         self._ff01_filter_path = path_str
+
+        if self._is_customer():
+            if self._ff01_filter_visible:
+                self._ff01_filter_frame.pack_forget()
+                self._ff01_filter_visible = False
+            return
 
         fields = self._descriptors.get(path_str, [])
         seen: set = set()
@@ -1973,6 +2022,733 @@ class HIDToolApp(tk.Tk):
                 text_widget.insert(tk.END, f"{hex_bytes:<12}  (Long item / unknown)\n", "unknown")
 
     # ------------------------------------------------------------------
+    # Descriptor 比對（上報資料格式逐 bit + descriptor 寫法）
+    # ------------------------------------------------------------------
+
+    # 欄位比對狀態 -> Treeview tag
+    _CMP_TAGS = {"OK": "cmp_ok", "INFO": "cmp_info", "OFFSET": "cmp_offset",
+                 "DIFF": "cmp_diff", "LEN": "cmp_diff"}
+    _CMP_ITEM_TAGS = {"equal": "cmp_ok", "replace": "cmp_info",
+                      "delete": "cmp_diff", "insert": "cmp_insert"}
+
+    _CMP_VENDOR_ID = 0x2808
+
+    def _cmp_is_supported_device(self, dev: Optional[dict] = None) -> bool:
+        """只有 VID 2808、且同一實體裝置含 Touch Screen TLC 時開放比對。"""
+        dev = dev or self._selected_dev
+        if dev is None or self._all_digi_mode:
+            return False
+        group = self._cmp_device_group(dev)
+        return (dev.get("vendor_id", 0) == self._CMP_VENDOR_ID
+                and any((d.get("usage_page", 0), d.get("usage", 0)) == (0x0D, 0x04)
+                        for d in group))
+
+    def _cmp_update_availability(self):
+        """依目前監聽裝置更新入口；視窗已開時也立即清除不適用的結果。"""
+        button = getattr(self, "_desc_compare_btn", None)
+        supported = self._cmp_is_supported_device()
+        if button is not None:
+            button.configure(state=tk.NORMAL if supported else tk.DISABLED)
+        if supported:
+            if not self._top_desc_result_chip.winfo_manager():
+                self._top_desc_result_chip.pack(
+                    side=tk.RIGHT, padx=(6, 0), before=self._top_field_error_chip)
+            self._cmp_start_quick_check()
+        else:
+            self._cmp_quick_seq += 1
+            self._cmp_quick_result = None
+            self._cmp_quick_profile = ""
+            self._top_desc_result_chip.pack_forget()
+        if (not supported and self._cmp_win is not None
+                and self._cmp_win.winfo_exists()):
+            self._cmp_sources["A"] = []
+            self._cmp_sources["B"] = []
+            self._cmp_result = None
+            self._cmp_detect_var.set("")
+            self._cmp_status.set("僅支援 VID 2808 的 Touch Screen 裝置。")
+            self._cmp_refresh_lists()
+            self._cmp_clear_views()
+
+    def _cmp_set_quick_result(self, passed: bool, result=None, profile: str = ""):
+        """更新右上角 Descriptor 結果；畫面只呈現 PASS / FAIL。"""
+        self._cmp_quick_result = result
+        self._cmp_quick_profile = profile
+        self._top_desc_result_var.set("PASS" if passed else "FAIL")
+        chip = getattr(self, "_top_desc_result_chip", None)
+        if chip is not None:
+            chip.configure(
+                bg="#e5f5eb" if passed else "#fce9e9",
+                fg=self._GREEN_DARK if passed else self._RED_DARK,
+                highlightbackground=self._GREEN_DARK if passed else self._RED_DARK,
+            )
+
+    def _cmp_show_quick_summary(self, event=None):
+        """點擊右上角 PASS / FAIL，只顯示摘要；Customer 不開放完整 Descriptor。"""
+        if not self._cmp_is_supported_device():
+            return
+        result = self._cmp_quick_result
+        passed = self._top_desc_result_var.get() == "PASS"
+        lines = ["Descriptor PASS" if passed else "Descriptor FAIL"]
+        if self._cmp_quick_profile:
+            lines.append(f"比對基準：{self._cmp_quick_profile}")
+        lines.append("")
+
+        if result is None:
+            lines.append("Descriptor 尚在讀取或無法完成比對。")
+        elif passed:
+            lines.append("總結：上報資料格式與 Base target 相符。")
+            lines.append(f"逐 bit：{result.bitstat.text()}")
+            lines.append(f"Collection：{len(result.pairs)}")
+        else:
+            lines.append("差異：")
+            found = False
+            for pair in result.pairs:
+                if pair.a is None or pair.b is None:
+                    side = "B" if pair.a is None else "A"
+                    lines.append(f"- {pair.label}：只有 {side} 側有此 collection")
+                    found = True
+                for group in pair.groups:
+                    bad = [row for row in group.rows
+                           if row.status in ("DIFF", "OFFSET", "LEN")]
+                    if not bad:
+                        continue
+                    lines.append(f"- {pair.label} / {group.label}")
+                    for row in bad:
+                        reason = row.reason or row.status
+                        lines.append(f"    {row.status}: {reason}")
+                    found = True
+            if not found:
+                lines.append("- Descriptor 無法完成讀取或 Base target 不存在。")
+            lines.append("")
+            lines.append(f"逐 bit：{result.bitstat.text()}")
+
+        win = tk.Toplevel(self)
+        win.title("Descriptor 比對摘要")
+        self._set_window_icon(win)
+        win.geometry(f"{self._sx(720)}x{self._sx(480)}")
+        win.minsize(self._sx(520), self._sx(320))
+        win.configure(bg=self._BG)
+        body = ttk.Frame(win, padding=10)
+        body.pack(fill=tk.BOTH, expand=True)
+        text = scrolledtext.ScrolledText(body, font=("Consolas", 10), wrap=tk.WORD,
+                                         relief=tk.FLAT)
+        self._style_log_text(text)
+        text.pack(fill=tk.BOTH, expand=True)
+        text.insert("1.0", "\n".join(lines))
+        text.config(state=tk.DISABLED)
+        ttk.Button(body, text="關閉", command=win.destroy).pack(anchor=tk.E, pady=(8, 0))
+
+    def _cmp_start_quick_check(self):
+        """背景自動比對目前裝置，供右上角 PASS / FAIL 使用，不必開啟比對視窗。"""
+        dev = self._selected_dev
+        if dev is None:
+            self._cmp_set_quick_result(False)
+            return
+        group = list(self._cmp_device_group(dev))
+        base_dirs = list(self._cmp_base_dirs())
+        self._cmp_quick_seq += 1
+        seq = self._cmp_quick_seq
+        self._cmp_set_quick_result(False)
+
+        def worker():
+            sources = []
+            for d in group:
+                raw = self._cmp_read_descriptor(d)
+                if raw:
+                    sources.append((self._cmp_dev_label(d), raw))
+            passed = False
+            result = None
+            stem = ""
+            if sources:
+                side_a = hid_desc_compare.make_side("A", sources)
+                types = hid_desc_compare.detect_device_types(side_a.collections)
+                has_pen = (any((d.get("usage_page", 0), d.get("usage", 0)) == (0x0D, 0x02)
+                               for d in group)
+                           or "Pen" in types)
+                stem = "touchscreen_pen" if has_pen else "touchscreen"
+                profiles = hid_desc_compare.find_profiles(base_dirs)
+                if stem in profiles:
+                    base_sources, errors = hid_desc_compare.load_profile(profiles[stem])
+                    if base_sources and not errors:
+                        result = hid_desc_compare.compare_sides(
+                            side_a, hid_desc_compare.make_side("B", base_sources))
+                        passed = result.n_diff == 0 and result.bitstat.is_clean
+            self.after(0, lambda: seq == self._cmp_quick_seq
+                       and self._cmp_set_quick_result(passed, result, stem))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_descriptor_compare(self):
+        if not self._cmp_is_supported_device():
+            messagebox.showinfo(
+                "Descriptor 比對",
+                "此功能僅支援 VID 2808 的 Touch Screen 或 Touch Screen + Stylus。",
+                parent=self,
+            )
+            return
+        if self._cmp_win is not None and self._cmp_win.winfo_exists():
+            self._cmp_win.deiconify()
+            self._cmp_win.lift()
+            return
+
+        win = tk.Toplevel(self)
+        self._cmp_win = win
+        win.title("Report Descriptor 比對")
+        self._set_window_icon(win)
+        win.geometry(f"{self._sx(1280)}x{self._sx(800)}")
+        win.minsize(self._sx(900), self._sx(560))
+        win.configure(bg=self._BG)
+        win.protocol("WM_DELETE_WINDOW", self._close_descriptor_compare)
+
+        # ---- 模式列：自動比對「目前監聽裝置 ↔ base target」----
+        mode = ttk.Frame(win, padding=(8, 8, 8, 0))
+        mode.pack(fill=tk.X)
+        self._cmp_auto = tk.BooleanVar(value=True)
+        ttk.Label(mode, text="自動比對目前監聽裝置").pack(side=tk.LEFT)
+        ttk.Label(mode, text="Base target:").pack(side=tk.LEFT, padx=(14, 4))
+        self._cmp_profile_var = tk.StringVar(value=self._CMP_AUTO_PROFILE)
+        self._cmp_profile_combo = ttk.Combobox(
+            mode, textvariable=self._cmp_profile_var, state=tk.DISABLED, width=24)
+        self._cmp_profile_combo.pack(side=tk.LEFT)
+        self._cmp_detect_var = tk.StringVar(value="")
+        ttk.Label(mode, textvariable=self._cmp_detect_var,
+                  style="Muted.TLabel").pack(side=tk.LEFT, padx=10)
+
+        # ---- 來源（A / B 各可加入多份 descriptor）----
+        top = ttk.Frame(win, padding=(8, 6, 8, 0))
+        top.pack(fill=tk.X)
+        self._cmp_lists: Dict[str, tk.Listbox] = {}
+        self._cmp_boxes: Dict[str, ttk.LabelFrame] = {}
+        self._cmp_buttons: Dict[str, List[ttk.Button]] = {"A": [], "B": []}
+        for col, side in enumerate(("A", "B")):
+            top.columnconfigure(col, weight=1, uniform="cmp")
+            box = ttk.LabelFrame(top, padding=(6, 4), text=f"{side} 側")
+            box.grid(row=0, column=col, sticky="nsew",
+                     padx=(0, 6) if col == 0 else (6, 0))
+            self._cmp_boxes[side] = box
+            bar = ttk.Frame(box)
+            bar.pack(fill=tk.X)
+            for text, cmd in (("加入檔案…", self._cmp_add_files),
+                              ("加入裝置…", self._cmp_add_device),
+                              ("貼上 Hex…", self._cmp_paste_hex)):
+                b = ttk.Button(bar, text=text, command=lambda c=cmd, s=side: c(s))
+                b.pack(side=tk.LEFT, padx=(0, 4))
+                self._cmp_buttons[side].append(b)
+            b = ttk.Button(bar, text="清除", command=lambda s=side: self._cmp_clear(s))
+            b.pack(side=tk.RIGHT)
+            self._cmp_buttons[side].append(b)
+            lb = tk.Listbox(box, height=3, font=self._FONT_MONO, activestyle="none",
+                            bg=self._SURFACE, relief=tk.FLAT, highlightthickness=1,
+                            highlightbackground=self._BORDER)
+            lb.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
+            self._cmp_lists[side] = lb
+
+        # ---- 動作列 ----
+        act = ttk.Frame(win, padding=(8, 6))
+        act.pack(fill=tk.X)
+        ttk.Button(act, text="重新比對", style="Accent.TButton",
+                   command=lambda: self._cmp_run(refill=True)).pack(side=tk.LEFT)
+        ttk.Button(act, text="匯出報告…", command=self._cmp_export).pack(side=tk.LEFT, padx=6)
+        self._cmp_only_diff = tk.BooleanVar(value=False)
+        ttk.Checkbutton(act, text="只顯示差異", variable=self._cmp_only_diff,
+                        command=self._cmp_render).pack(side=tk.LEFT, padx=(10, 0))
+        self._cmp_status = tk.StringVar(value="加入兩側 descriptor 後按「執行比對」。")
+        ttk.Label(act, textvariable=self._cmp_status, style="Muted.TLabel").pack(side=tk.LEFT, padx=12)
+
+        # ---- 結果分頁 ----
+        nb = ttk.Notebook(win)
+        nb.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+
+        sum_tab = ttk.Frame(nb)
+        nb.add(sum_tab, text="摘要")
+        self._cmp_summary = scrolledtext.ScrolledText(
+            sum_tab, font=("Consolas", 10), wrap=tk.NONE, relief=tk.FLAT)
+        self._style_log_text(self._cmp_summary)
+        self._cmp_summary.pack(fill=tk.BOTH, expand=True)
+        self._cmp_summary.tag_configure("header", foreground=self._ACCENT,
+                                        font=("Consolas", 10, "bold"))
+        self._cmp_summary.tag_configure("ok",   foreground=self._GREEN)
+        self._cmp_summary.tag_configure("ng",   foreground=self._RED)
+        self._cmp_summary.tag_configure("info", foreground="#b45309")
+        self._cmp_summary.config(state=tk.DISABLED)
+
+        layout_tab = ttk.Frame(nb)
+        nb.add(layout_tab, text="上報資料格式（逐 bit）")
+        self._cmp_layout_tree = self._cmp_make_tree(
+            layout_tab,
+            columns=("a_bit", "a_field", "b_bit", "b_field", "stat"),
+            headings=("A byte.bit", "A 欄位", "B byte.bit", "B 欄位", "狀態 / 原因"),
+            widths=(84, 330, 84, 330, 300),
+        )
+
+        item_tab = ttk.Frame(nb)
+        nb.add(item_tab, text="Descriptor 寫法")
+        self._cmp_item_tree = self._cmp_make_tree(
+            item_tab,
+            columns=("a_off", "a_hex", "a_item", "b_off", "b_hex", "b_item"),
+            headings=("A 位址", "A bytes", "A item", "B 位址", "B bytes", "B item"),
+            widths=(52, 108, 290, 52, 108, 290),
+        )
+
+        self._cmp_reload_profiles()
+        self._cmp_on_mode_change()   # 自動模式：直接抓目前裝置比對
+
+    def _close_descriptor_compare(self):
+        if self._cmp_win is not None:
+            self._cmp_win.destroy()
+        self._cmp_win = None
+
+    def _cmp_make_tree(self, parent, columns, headings, widths) -> ttk.Treeview:
+        tree = ttk.Treeview(parent, columns=columns, show="tree headings",
+                            style="Mono.Treeview")
+        tree.heading("#0", text="區段")
+        tree.column("#0", width=self._sx(240), stretch=False)
+        for col, head, w in zip(columns, headings, widths):
+            tree.heading(col, text=head)
+            tree.column(col, width=self._sx(w), stretch=False)
+        vs = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=tree.yview)
+        hs = ttk.Scrollbar(parent, orient=tk.HORIZONTAL, command=tree.xview)
+        tree.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
+        vs.pack(side=tk.RIGHT, fill=tk.Y)
+        hs.pack(side=tk.BOTTOM, fill=tk.X)
+        tree.pack(fill=tk.BOTH, expand=True)
+        tree.tag_configure("cmp_group",  font=self._FONT_UI_BOLD)
+        tree.tag_configure("cmp_ok",     foreground=self._TEXT)
+        tree.tag_configure("cmp_info",   foreground="#b45309")
+        tree.tag_configure("cmp_offset", foreground="#c2410c")
+        tree.tag_configure("cmp_diff",   foreground=self._RED)
+        tree.tag_configure("cmp_insert", foreground=self._GREEN_DARK)
+        return tree
+
+    # ---- 自動模式：目前監聽裝置 ↔ base target ----
+
+    _CMP_AUTO_PROFILE = "自動偵測"
+    _CMP_COL_RE = re.compile(r"&col[0-9a-f]+", re.IGNORECASE)
+
+    def _cmp_base_dirs(self) -> List[str]:
+        """base 目錄搜尋順序：exe/程式旁的 bases/ 優先（不重 build 就能換 base），
+        其次是打包進 exe 的 bases/。"""
+        dirs = []
+        if getattr(sys, "frozen", False):
+            dirs.append(os.path.join(os.path.dirname(sys.executable), "bases"))
+        dirs.append(self._resource_path("bases"))
+        return dirs
+
+    def _cmp_reload_profiles(self):
+        self._cmp_profiles = hid_desc_compare.find_profiles(self._cmp_base_dirs())
+        values = [self._CMP_AUTO_PROFILE] + sorted(self._cmp_profiles)
+        self._cmp_profile_combo.configure(values=values)
+        if self._cmp_profile_var.get() not in values:
+            self._cmp_profile_var.set(self._CMP_AUTO_PROFILE)
+
+    def _cmp_dev_group_key(self, dev: dict) -> str:
+        """同一顆實體裝置的 key：拿掉 collection 編號與其造成的 instance 尾碼。"""
+        s = self._dev_match_key(self._get_dev_path_str(dev))
+        s = self._CMP_COL_RE.sub("", s)
+        return re.sub(r"&\d+&\d+$", "", s)
+
+    def _cmp_device_group(self, dev: dict) -> List[dict]:
+        """選定裝置 + 同一顆裝置的其他 digitizer collection（finger / pen / config）。
+
+        hidapi 每個介面只會回傳自己那個 top-level collection 的 descriptor，
+        要合併起來才是這顆 IC 完整的 descriptor。
+        """
+        key = self._cmp_dev_group_key(dev)
+        group = [d for d in self._hidapi_devices
+                 if d.get("usage_page") == 0x0D and self._cmp_dev_group_key(d) == key]
+        if dev not in group:
+            group.insert(0, dev)
+        return sorted(group, key=lambda d: (d.get("usage_page", 0), d.get("usage", 0)))
+
+    @staticmethod
+    def _cmp_dev_label(dev: dict) -> str:
+        """比對來源清單用的短標籤：format_device_label 去掉尾巴那串完整路徑，
+        再補上這個 collection 的 usage（finger / pen 一眼分得出來）。"""
+        label = format_device_label(dev).split("  [\\\\?\\")[0].strip()
+        page, usage = dev.get("usage_page", 0), dev.get("usage", 0)
+        return f"{label}  <{hid_desc_compare.usage_name(page, usage)}>"
+
+    def _cmp_read_descriptor(self, dev: dict) -> bytes:
+        path_str = self._get_dev_path_str(dev)
+        raw = self._raw_descriptors.get(path_str)
+        if not raw:
+            raw = read_descriptor_via_hidapi(dev.get("path", b"")) or b""
+            if raw:
+                self._raw_descriptors[path_str] = raw
+        return bytes(raw)
+
+    def _cmp_on_mode_change(self):
+        auto = self._cmp_auto.get()
+        self._cmp_boxes["A"].configure(
+            text="A 側：目前監聽裝置（自動）" if auto else "A 側（可加入多份）")
+        self._cmp_boxes["B"].configure(
+            text="B 側：Base target（自動）" if auto else "B 側（可加入多份）")
+        state = tk.DISABLED if auto else tk.NORMAL
+        for buttons in self._cmp_buttons.values():
+            for b in buttons:
+                b.configure(state=state)
+        self._cmp_profile_combo.configure(state=tk.DISABLED)
+        if auto:
+            self._cmp_run(refill=True)
+        else:
+            self._cmp_detect_var.set("")
+            self._cmp_refresh_lists()
+
+    def _cmp_auto_refresh(self, force: bool = False):
+        """監聽分頁換裝置時由 _on_device_selected 呼叫；視窗沒開就不做事。"""
+        if self._cmp_win is None or not self._cmp_win.winfo_exists():
+            return
+        if force or self._cmp_auto.get():
+            self._cmp_run(refill=True)
+
+    def _cmp_fill_auto_sources(self) -> bool:
+        """自動填 A（目前裝置）與 B（base profile）。回傳是否可以比對。"""
+        dev = None if self._all_digi_mode else self._selected_dev
+        if dev is None:
+            self._cmp_detect_var.set("")
+            self._cmp_status.set("請先在「監聽」分頁選一個裝置（不能選「全部 digitizer」）。")
+            self._cmp_sources["A"] = []
+            self._cmp_sources["B"] = []
+            self._cmp_refresh_lists()
+            return False
+        if not self._cmp_is_supported_device(dev):
+            self._cmp_detect_var.set("")
+            self._cmp_status.set("僅支援 VID 2808 的 Touch Screen 裝置。")
+            self._cmp_sources["A"] = []
+            self._cmp_sources["B"] = []
+            self._cmp_refresh_lists()
+            return False
+
+        sources = []
+        for d in self._cmp_device_group(dev):
+            raw = self._cmp_read_descriptor(d)
+            if raw:
+                sources.append((self._cmp_dev_label(d), raw))
+        self._cmp_sources["A"] = sources
+        if not sources:
+            self._cmp_detect_var.set("")
+            self._cmp_status.set("讀不到這個裝置的 descriptor（可能需要管理員權限）。")
+            self._cmp_sources["B"] = []
+            self._cmp_refresh_lists()
+            return False
+
+        side_a = hid_desc_compare.make_side("A", sources)
+        types = hid_desc_compare.detect_device_types(side_a.collections)
+        # 同一實體裝置只要有 Pen TLC 就使用 touchscreen_pen；否則使用 touchscreen。
+        # 先看 HID 列舉資訊，再以實際 descriptor collection 補強判斷。
+        has_pen = (any((d.get("usage_page", 0), d.get("usage", 0)) == (0x0D, 0x02)
+                       for d in self._cmp_device_group(dev))
+                   or "Pen" in types)
+        stem = "touchscreen_pen" if has_pen else "touchscreen"
+        self._cmp_profile_var.set(stem)
+        detected = "、".join(types) or "未知"
+        self._cmp_detect_var.set(f"偵測: {detected} → base: {stem or '（無對應 base）'}")
+
+        if stem is None or stem not in self._cmp_profiles:
+            self._cmp_sources["B"] = []
+            self._cmp_refresh_lists()
+            self._cmp_status.set(
+                f"偵測到 {detected}，但 bases/ 裡缺少自動分類 {stem}。")
+            return False
+
+        base_sources, errors = hid_desc_compare.load_profile(self._cmp_profiles[stem])
+        self._cmp_sources["B"] = base_sources
+        self._cmp_refresh_lists()
+        if errors:
+            messagebox.showwarning("Base 讀取問題", "\n".join(errors), parent=self._cmp_win)
+        return bool(base_sources)
+
+    # ---- 來源管理 ----
+
+    def _cmp_refresh_lists(self):
+        for side, lb in self._cmp_lists.items():
+            lb.delete(0, tk.END)
+            for name, raw in self._cmp_sources[side]:
+                lb.insert(tk.END, f"{name}  ({len(raw)} bytes)")
+
+    def _cmp_add_source(self, side: str, name: str, raw: bytes):
+        self._cmp_sources[side].append((name, raw))
+        self._cmp_refresh_lists()
+        self._cmp_status.set(f"{side} 側已加入 {name}（{len(raw)} bytes）")
+
+    def _cmp_clear(self, side: str):
+        self._cmp_sources[side].clear()
+        self._cmp_refresh_lists()
+
+    def _cmp_add_files(self, side: str):
+        paths = filedialog.askopenfilenames(
+            parent=self._cmp_win, title=f"選擇 {side} 側 descriptor（hex 文字檔，可多選）",
+            filetypes=[("Descriptor 文字檔", "*.txt"), ("所有檔案", "*.*")])
+        for path in paths:
+            try:
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    raw = hid_desc_compare.clean_hex_string(fh.read())
+            except OSError as e:
+                messagebox.showerror("讀取失敗", f"{path}\n{e}", parent=self._cmp_win)
+                continue
+            if not raw:
+                messagebox.showwarning(
+                    "格式錯誤",
+                    f"{os.path.basename(path)} 沒有可解析的 hex 內容。\n"
+                    "支援「05 0D …」、「0x05, 0x0D, …」與 // 、/* */ 註解。",
+                    parent=self._cmp_win)
+                continue
+            self._cmp_add_source(side, os.path.basename(path), raw)
+
+    def _cmp_paste_hex(self, side: str):
+        dlg = tk.Toplevel(self._cmp_win)
+        dlg.title(f"貼上 {side} 側 Descriptor Hex")
+        self._set_window_icon(dlg)
+        dlg.transient(self._cmp_win)
+        dlg.geometry(f"{self._sx(620)}x{self._sx(360)}")
+        dlg.configure(bg=self._BG)
+        frm = ttk.Frame(dlg, padding=(8, 8))
+        frm.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frm, text="支援「05 0D …」、「0x05, 0x0D, …」與 // 、/* */ 註解",
+                  style="Muted.TLabel").pack(anchor="w")
+        txt = scrolledtext.ScrolledText(frm, font=("Consolas", 10), wrap=tk.WORD, height=12)
+        self._style_log_text(txt)
+        txt.pack(fill=tk.BOTH, expand=True, pady=6)
+        txt.focus_set()
+
+        def ok():
+            raw = hid_desc_compare.clean_hex_string(txt.get("1.0", tk.END))
+            if not raw:
+                messagebox.showwarning("格式錯誤", "沒有可解析的 hex 內容。", parent=dlg)
+                return
+            n = sum(1 for nm, _ in self._cmp_sources[side] if nm.startswith("貼上"))
+            dlg.destroy()
+            self._cmp_add_source(side, f"貼上 Hex {n + 1}", raw)
+
+        row = ttk.Frame(frm)
+        row.pack(fill=tk.X)
+        ttk.Button(row, text="加入", style="Accent.TButton", command=ok).pack(side=tk.RIGHT)
+        ttk.Button(row, text="取消", command=dlg.destroy).pack(side=tk.RIGHT, padx=6)
+
+    def _cmp_add_device(self, side: str):
+        if not self._hidapi_devices:
+            messagebox.showinfo("加入裝置", "目前沒有列舉到 HID 裝置。", parent=self._cmp_win)
+            return
+        dlg = tk.Toplevel(self._cmp_win)
+        dlg.title(f"選擇要加入 {side} 側的裝置")
+        self._set_window_icon(dlg)
+        dlg.transient(self._cmp_win)
+        dlg.geometry(f"{self._sx(760)}x{self._sx(400)}")
+        dlg.configure(bg=self._BG)
+        frm = ttk.Frame(dlg, padding=(8, 8))
+        frm.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frm, text="可多選（Ctrl / Shift）；讀不到 descriptor 的介面會跳過。",
+                  style="Muted.TLabel").pack(anchor="w", pady=(0, 4))
+        lb = tk.Listbox(frm, selectmode=tk.EXTENDED, font=self._FONT_MONO,
+                        bg=self._SURFACE, relief=tk.FLAT, highlightthickness=1,
+                        highlightbackground=self._BORDER)
+        sb = ttk.Scrollbar(frm, orient=tk.VERTICAL, command=lb.yview)
+        lb.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        lb.pack(fill=tk.BOTH, expand=True)
+        for dev in self._hidapi_devices:
+            lb.insert(tk.END, format_device_label(dev))
+        if self._selected_dev in self._hidapi_devices:
+            idx = self._hidapi_devices.index(self._selected_dev)
+            lb.selection_set(idx)
+            lb.see(idx)
+
+        def ok():
+            picked = [self._hidapi_devices[i] for i in lb.curselection()]
+            dlg.destroy()
+            skipped = []
+            for dev in picked:
+                path_str = self._get_dev_path_str(dev)
+                raw = self._raw_descriptors.get(path_str)
+                if not raw:
+                    raw = read_descriptor_via_hidapi(dev.get("path", b""))
+                    if raw:
+                        self._raw_descriptors[path_str] = raw
+                if not raw:
+                    skipped.append(format_device_label(dev))
+                    continue
+                self._cmp_add_source(side, self._cmp_dev_label(dev), bytes(raw))
+            if skipped:
+                messagebox.showwarning(
+                    "部分裝置略過",
+                    "讀不到 descriptor（可能需要管理員權限）：\n" + "\n".join(skipped),
+                    parent=self._cmp_win)
+
+        row = ttk.Frame(frm)
+        row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(row, text="加入", style="Accent.TButton", command=ok).pack(side=tk.RIGHT)
+        ttk.Button(row, text="取消", command=dlg.destroy).pack(side=tk.RIGHT, padx=6)
+
+    # ---- 執行與呈現 ----
+
+    def _cmp_run(self, refill: bool = False):
+        if refill and self._cmp_auto.get():
+            if not self._cmp_fill_auto_sources():
+                self._cmp_result = None
+                self._cmp_clear_views()
+                return
+        if not self._cmp_sources["A"] or not self._cmp_sources["B"]:
+            if not self._cmp_auto.get():
+                messagebox.showwarning("尚未選擇", "A、B 兩側都要至少加入一份 descriptor。",
+                                       parent=self._cmp_win)
+            return
+        self._cmp_status.set("比對中…")
+        self._cmp_win.update_idletasks()
+        try:
+            side_a = hid_desc_compare.make_side("A", self._cmp_sources["A"])
+            side_b = hid_desc_compare.make_side("B", self._cmp_sources["B"])
+            self._cmp_result = hid_desc_compare.compare_sides(side_a, side_b)
+        except Exception as e:
+            self._cmp_result = None
+            self._cmp_status.set(f"比對失敗: {e}")
+            messagebox.showerror("比對失敗", traceback.format_exc(), parent=self._cmp_win)
+            return
+        self._cmp_render()
+
+    def _cmp_clear_views(self):
+        for tree in (self._cmp_layout_tree, self._cmp_item_tree):
+            tree.delete(*tree.get_children())
+        self._cmp_summary.config(state=tk.NORMAL)
+        self._cmp_summary.delete("1.0", tk.END)
+        self._cmp_summary.config(state=tk.DISABLED)
+
+    def _cmp_render(self):
+        res = self._cmp_result
+        if res is None:
+            return
+        only_diff = self._cmp_only_diff.get()
+        self._cmp_fill_summary(res)
+        self._cmp_fill_layout(res, only_diff)
+        self._cmp_fill_items(res, only_diff)
+        st = res.bitstat
+        self._cmp_status.set(
+            f"逐 bit：{st.text()}　欄位 NG {res.count('DIFF', 'OFFSET', 'LEN')} / "
+            f"INFO {res.count('INFO')}")
+
+    def _cmp_fill_summary(self, res):
+        w = self._cmp_summary
+        w.config(state=tk.NORMAL)
+        w.delete("1.0", tk.END)
+
+        def log(text, tag="normal"):
+            w.insert(tk.END, text, tag)
+
+        log("=== 來源 ===\n", "header")
+        for side, tag in ((res.side_a, "A"), (res.side_b, "B")):
+            log(f"[{tag}] 共 {side.total_bytes} bytes\n")
+            for s in side.sources:
+                cols = ", ".join(c.label for c in s.collections) or "(無 collection)"
+                log(f"      {s.name}  {len(s.raw)} bytes  →  {cols}\n")
+            for d in side.diagnostics:
+                log(f"      ! {d}\n", "ng")
+
+        st = res.bitstat
+        log("\n=== 總結 ===\n", "header")
+        log("Binary        : ")
+        log("完全相同\n" if res.identical_bytes else "不同\n",
+            "ok" if res.identical_bytes else "ng")
+        log(f"逐 bit 比對   : {st.text()}\n", "ok" if st.is_clean else "ng")
+        log(f"欄位 DIFF     : {res.count('DIFF')}   usage / size / flags 不同\n",
+            "ng" if res.count("DIFF") else "ok")
+        log(f"欄位 OFFSET   : {res.count('OFFSET')}   結構相同但 bit 位置錯開\n",
+            "ng" if res.count("OFFSET") else "ok")
+        log(f"欄位 LEN      : {res.count('LEN')}   只有單邊有的欄位\n",
+            "ng" if res.count("LEN") else "ok")
+        log(f"欄位 INFO     : {res.count('INFO')}   logical / physical / unit 等面板參數\n",
+            "info" if res.count("INFO") else "ok")
+        n_item = sum(p.n_item_diff for p in res.pairs)
+        log(f"寫法差異項目  : {n_item} / {sum(len(p.item_rows) for p in res.pairs)}\n",
+            "info" if n_item else "ok")
+
+        log("\n=== 各 collection / report ===\n", "header")
+        for p in res.pairs:
+            log(f"\n[{p.label}]\n", "header")
+            if p.a is None:
+                log("  只有 B 側有此 collection\n", "ng")
+            elif p.b is None:
+                log("  只有 A 側有此 collection\n", "ng")
+            for g in p.groups:
+                ng = sum(1 for r in g.rows if r.status in ("DIFF", "OFFSET", "LEN"))
+                log(f"  {g.label:<28} {g.wire_text()}\n",
+                    "ok" if ng == 0 else "ng")
+                log(f"      逐 bit：{g.bitstat.text()}\n",
+                    "ok" if g.bitstat.is_clean else "ng")
+            log(f"  寫法：差異 {p.n_item_diff} / 共 {len(p.item_rows)} 項\n",
+                "info" if p.n_item_diff else "ok")
+        w.config(state=tk.DISABLED)
+
+    def _cmp_fill_layout(self, res, only_diff: bool):
+        tree = self._cmp_layout_tree
+        tree.delete(*tree.get_children())
+        span = hid_desc_compare.bit_span
+        fstr = hid_desc_compare.field_str
+        for p in res.pairs:
+            ng = p.n_diff
+            root = tree.insert("", tk.END, open=True, tags=("cmp_group",),
+                               text=f"[{p.label}]",
+                               values=("", "", "", "", f"NG {ng} / INFO {p.n_info}"))
+            for g in p.groups:
+                g_ng = sum(1 for r in g.rows if r.status in ("DIFF", "OFFSET", "LEN"))
+                node = tree.insert(root, tk.END, open=True, tags=("cmp_group",),
+                                   text=f"  {g.label}",
+                                   values=("", g.wire_text(), "", g.bitstat.text(),
+                                           "OK" if g_ng == 0 else f"NG {g_ng}"))
+                for r in g.rows:
+                    if only_diff and r.status == "OK":
+                        continue
+                    tree.insert(node, tk.END, text="", tags=(self._CMP_TAGS[r.status],),
+                                values=(span(r.a, True), fstr(r.a),
+                                        span(r.b, True), fstr(r.b),
+                                        r.status + (f"  {r.reason}" if r.reason else "")))
+
+    def _cmp_fill_items(self, res, only_diff: bool):
+        tree = self._cmp_item_tree
+        tree.delete(*tree.get_children())
+        sections = [(p.label, p.item_rows) for p in res.pairs]
+        if res.loose_items:
+            sections.append(("(collection 外)", res.loose_items))
+        for label, rows in sections:
+            ndiff = sum(1 for r in rows if r.op != "equal")
+            root = tree.insert("", tk.END, open=True, tags=("cmp_group",),
+                               text=f"[{label}]",
+                               values=("", "", f"差異 {ndiff} / 共 {len(rows)} 項",
+                                       "", "", ""))
+            marks = {"equal": "", "replace": "    ~ 改寫", "delete": "    − 只有 A",
+                     "insert": "    + 只有 B"}
+            for r in rows:
+                if only_diff and r.op == "equal":
+                    continue
+                a, b = r.a, r.b
+                tree.insert(root, tk.END, text=marks[r.op], tags=(self._CMP_ITEM_TAGS[r.op],),
+                            values=(f"{a.offset:04X}" if a else "", a.hex_bytes if a else "",
+                                    ("  " * a.depth + a.text) if a else "",
+                                    f"{b.offset:04X}" if b else "", b.hex_bytes if b else "",
+                                    ("  " * b.depth + b.text) if b else ""))
+
+    def _cmp_export(self):
+        if self._cmp_result is None:
+            messagebox.showinfo("匯出報告", "尚無結果可匯出，請先執行比對。",
+                                parent=self._cmp_win)
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self._cmp_win, title="匯出比對報告", defaultextension=".txt",
+            initialfile=f"descriptor_compare_{datetime.datetime.now():%Y%m%d_%H%M%S}.txt",
+            filetypes=[("文字檔", "*.txt"), ("所有檔案", "*.*")])
+        if not path:
+            return
+        text = hid_desc_compare.format_text_report(
+            self._cmp_result, only_diff=self._cmp_only_diff.get())
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(f"{self._APP_NAME} {self._APP_VERSION_LABEL} — "
+                         f"Report Descriptor 比對\n{'=' * 72}\n")
+                fh.write(text + "\n")
+        except OSError as e:
+            messagebox.showerror("匯出失敗", str(e), parent=self._cmp_win)
+            return
+        self._cmp_status.set(f"已匯出: {path}")
+
+    # ------------------------------------------------------------------
     # Monitor: Table columns
     # ------------------------------------------------------------------
 
@@ -2381,6 +3157,7 @@ class HIDToolApp(tk.Tk):
         input_fields = [
             f for f in fields
             if f.report_type == REPORT_TYPE_INPUT
+            and (not self._is_customer() or f.usage_page != 0xFF01)
             and (target_rid is None or f.report_id == target_rid)
             and (
                 not f.is_const

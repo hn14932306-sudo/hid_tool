@@ -1,0 +1,13 @@
+# RE024 Touch Inspector 執行與打包相依
+#
+# 打包請用裝了這些套件的 Python 3.13：
+#   pip install -r requirements.txt
+#   pyinstaller --noconfirm --clean HID_Tool.spec
+#
+# 少裝任何一個都會打包出「看起來正常、實際壞掉」的 exe，
+# 所以 HID_Tool.spec 開頭會先檢查、缺了就讓 build 失敗。
+
+hid            # hidapi 綁定；缺了 enumerate_hid_devices() 會永遠回空 list
+sv-ttk         # Sun Valley 主題
+truststore     # 走 Windows 系統信任庫；公司網路 TLS 攔截下自動更新必需
+pyinstaller

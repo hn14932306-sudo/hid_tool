@@ -103,15 +103,16 @@ def _http_json(url: str) -> dict:
 def _pick_asset(assets: list, edition: str):
     """依 edition 從 release 資產中挑對應的 exe。
 
-    約定：FAE 版資產檔名含 'FAE'（不分大小寫）；工程版資產名不含 'FAE'。
+    約定：FAE / Customer 資產檔名分別含 edition 名稱；Engineer 不含兩者。
     """
     exes = [a for a in assets if str(a.get("name", "")).lower().endswith(".exe")]
     if not exes:
         return None
-    want_fae = (edition != "Engineer")
     for a in exes:
-        is_fae = "fae" in str(a.get("name", "")).lower()
-        if is_fae == want_fae:
+        name = str(a.get("name", "")).lower()
+        asset_edition = ("Customer" if "customer" in name else
+                         "FAE" if "fae" in name else "Engineer")
+        if asset_edition == edition:
             return a
     return exes[0]   # 找不到對應的就回第一個，總比不更新好
 

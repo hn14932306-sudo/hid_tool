@@ -1,7 +1,10 @@
 # PyInstaller
 build/
 dist/
+dist_release/
+# 發版用的 spec 要進版控（唯一那個），其餘實驗性 spec 不要
 *.spec
+!HID_Tool.spec
 
 # Python
 __pycache__/
