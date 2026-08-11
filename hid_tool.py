@@ -73,7 +73,7 @@ except Exception:
 class HIDToolApp(tk.Tk):
     _APP_NAME          = "RE024 Touch Inspector"
     _APP_AUTHOR        = "Shane.Lin"
-    _APP_VERSION_LABEL = "v1.9.13"
+    _APP_VERSION_LABEL = "v1.9.14"
     _APP_VERSION_TIME  = "2026-08-11"
 
     # 版本(edition)：Engineer = 全功能；FAE / Customer = 閹割版
