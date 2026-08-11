@@ -73,7 +73,7 @@ except Exception:
 class HIDToolApp(tk.Tk):
     _APP_NAME          = "RE024 Touch Inspector"
     _APP_AUTHOR        = "Shane.Lin"
-    _APP_VERSION_LABEL = "v1.9.11"
+    _APP_VERSION_LABEL = "v1.9.12"
     _APP_VERSION_TIME  = "2026-08-10"
 
     # 版本(edition)：Engineer = 全功能；FAE / Customer = 閹割版
@@ -131,7 +131,8 @@ class HIDToolApp(tk.Tk):
 
     def _set_window_icon(self, window=None):
         window = window or self
-        icon_path = self._resource_path("assets", "RE024_icon_heatmap.ico")
+        icon_name = "focaltech_official.ico" if self._is_customer() else "RE024_icon_heatmap.ico"
+        icon_path = self._resource_path("assets", icon_name)
         if not os.path.exists(icon_path):
             return
         try:
@@ -859,6 +860,17 @@ class HIDToolApp(tk.Tk):
         # Device command strip
         row1 = ttk.Frame(top, style="Top.TFrame")
         row1.pack(fill=tk.X)
+
+        if self._is_customer():
+            try:
+                logo_path = self._resource_path("assets", "focaltech_customer_logo.png")
+                self._customer_logo_img = tk.PhotoImage(file=logo_path)
+                tk.Label(
+                    row1, image=self._customer_logo_img,
+                    bg=self._SURFACE_ALT, bd=0, highlightthickness=0,
+                ).pack(side=tk.LEFT, padx=(0, 14))
+            except (OSError, tk.TclError):
+                self._customer_logo_img = None
 
         ttk.Label(row1, text="監聽裝置", style="FieldLabel.TLabel", width=8, anchor="w").pack(side=tk.LEFT)
         self._dev_var = tk.StringVar()

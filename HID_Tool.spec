@@ -65,7 +65,11 @@ def _assert_edition(analysis, edition, expect_dir):
 
 
 # sv_ttk 的主題 .tcl 檔必須一起打包，否則執行檔找不到主題
-datas = collect_data_files("sv_ttk") + [("assets\\RE024_icon_heatmap.ico", "assets")]
+datas = collect_data_files("sv_ttk") + [
+    ("assets\\RE024_icon_heatmap.ico", "assets"),
+    ("assets\\focaltech_customer_logo.png", "assets"),
+    ("assets\\focaltech_official.ico", "assets"),
+]
 
 # Descriptor 比對的 base target（bases/<profile>/*.txt）。
 # exe 旁另放 bases/ 會優先於打包進來的這份，換 base 不用重 build。
@@ -134,5 +138,5 @@ pyz_customer = PYZ(a_customer.pure)
 exe_customer = EXE(
     pyz_customer, a_customer.scripts, a_customer.binaries, a_customer.datas, [],
     name="RE024 Touch Inspector (Customer)",
-    **_EXE_COMMON,
+    **{**_EXE_COMMON, "icon": "assets\\focaltech_official.ico"},
 )
