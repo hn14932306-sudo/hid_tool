@@ -108,13 +108,20 @@ def _pick_asset(assets: list, edition: str):
     exes = [a for a in assets if str(a.get("name", "")).lower().endswith(".exe")]
     if not exes:
         return None
+    wanted = str(edition or "").strip().casefold()
     for a in exes:
         name = str(a.get("name", "")).lower()
-        asset_edition = ("Customer" if "customer" in name else
-                         "FAE" if "fae" in name else "Engineer")
-        if asset_edition == edition:
+        asset_edition = ("customer" if "customer" in name else
+                         "fae" if "fae" in name else "engineer")
+        if asset_edition == wanted:
             return a
-    return exes[0]   # 找不到對應的就回第一個，總比不更新好
+    # 找不到完全相符的版本時禁止更新，避免 Engineer/FAE 被其他版本覆蓋。
+    return None
+
+
+def normalize_release_notes(notes: str) -> str:
+    """清理舊版發布流程留下的字面換行符號，供 UI 正常顯示。"""
+    return str(notes or "").replace("`r`n", "\n").replace("`n", "\n")
 
 
 def check_latest(current_label: str, edition: str):
@@ -132,7 +139,7 @@ def check_latest(current_label: str, edition: str):
         return None
     return {
         "version": tag,
-        "notes": (data.get("body") or "").strip(),
+        "notes": normalize_release_notes(data.get("body") or "").strip(),
         "url": asset["browser_download_url"],
         "name": asset["name"],
         "size": int(asset.get("size", 0) or 0),
