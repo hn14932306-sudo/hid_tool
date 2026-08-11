@@ -73,8 +73,8 @@ except Exception:
 class HIDToolApp(tk.Tk):
     _APP_NAME          = "RE024 Touch Inspector"
     _APP_AUTHOR        = "Shane.Lin"
-    _APP_VERSION_LABEL = "v1.9.12"
-    _APP_VERSION_TIME  = "2026-08-10"
+    _APP_VERSION_LABEL = "v1.9.13"
+    _APP_VERSION_TIME  = "2026-08-11"
 
     # 版本(edition)：Engineer = 全功能；FAE / Customer = 閹割版
     # 由 build 時產生的 _edition.py 決定（見 .spec），開發/沒有該檔時預設 Engineer。
@@ -4543,6 +4543,9 @@ class HIDToolApp(tk.Tk):
         self._monitor_log_rows.clear()
         self._table_pending.clear()
         self._table.clear()
+        # FastTable.clear() only marks the widget dirty.  Flush immediately so
+        # the old rows do not remain visible until another packet/resize event.
+        self._table.flush()
         self._clear_ff01_stats()
         self._frame_seq = 0
         self._frame_contact_target = None
@@ -4735,6 +4738,10 @@ class HIDToolApp(tk.Tk):
         self._monitor_log_rows.clear()
         self._table_pending.clear()
         self._table.clear()
+        # This path is used by the Monitor "Clear" button.  Without an
+        # explicit flush FastTable has no reason to repaint while monitoring is
+        # stopped, leaving stale Monitor Data on screen.
+        self._table.flush()
         self._clear_ff01_stats()
         self._frame_seq = 0
         self._frame_contact_target = None
