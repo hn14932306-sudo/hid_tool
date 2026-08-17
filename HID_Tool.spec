@@ -138,5 +138,8 @@ pyz_customer = PYZ(a_customer.pure)
 exe_customer = EXE(
     pyz_customer, a_customer.scripts, a_customer.binaries, a_customer.datas, [],
     name="RE024 Touch Inspector (Customer)",
-    **{**_EXE_COMMON, "icon": "assets\\focaltech_official.ico"},
+    # 不用 UPX：Customer 版曾被 Trend Micro Apex One 誤判為 Troj.Win32.TRX.XXPE50FFF108，
+    # UPX 加殼是常見的誘因之一，Customer 版對外分發最在意這個所以先關掉；Engineer/FAE
+    # 內部使用維持原樣。
+    **{**_EXE_COMMON, "icon": "assets\\focaltech_official.ico", "upx": False},
 )

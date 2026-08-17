@@ -581,13 +581,16 @@ class HIDToolApp(tk.Tk):
         ).pack(anchor="w", pady=(6, 14))
         btn_row = ttk.Frame(frm)
         btn_row.pack(fill=tk.X)
-        chk = ttk.Button(
-            btn_row, text="檢查更新",
-            command=lambda: self._check_update_async(silent=False, parent=dlg),
-        )
-        chk.pack(side=tk.LEFT)
-        if not updater.is_frozen():
-            chk.state(["disabled"])   # 開發模式（非打包 exe）不做自我替換
+        if not self._is_customer():
+            # Customer 版不做自動更新（避免自我替換的行為模式觸發防毒誤判），
+            # 所以連按鈕都不出現，而不是出現一個按下去沒反應的按鈕。
+            chk = ttk.Button(
+                btn_row, text="檢查更新",
+                command=lambda: self._check_update_async(silent=False, parent=dlg),
+            )
+            chk.pack(side=tk.LEFT)
+            if not updater.is_frozen():
+                chk.state(["disabled"])   # 開發模式（非打包 exe）不做自我替換
         ttk.Button(btn_row, text="關閉", command=dlg.destroy).pack(side=tk.RIGHT)
         dlg.update_idletasks()
         x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
@@ -600,6 +603,8 @@ class HIDToolApp(tk.Tk):
     # ------------------------------------------------------------------
     def _check_update_async(self, silent: bool = True, parent=None):
         """背景查最新版。silent=True 時只有「有新版」才跳窗；False 會回報結果。"""
+        if self._is_customer():
+            return   # Customer 版不做自動更新
         if not updater.is_frozen() and not silent:
             messagebox.showinfo("檢查更新", "開發模式（未打包）不支援自動更新。", parent=parent or self)
             return
@@ -838,12 +843,14 @@ class HIDToolApp(tk.Tk):
             self.attributes("-alpha", 1.0)
         except tk.TclError:
             pass
-        # 自動更新：先清掉上次自我替換留下的殘檔
-        updater.cleanup_old()
-        # 若剛從更新重啟，顯示「更新內容」
-        self.after(400, self._show_post_update_notes)
-        # 背景靜默檢查新版
-        self.after(3000, lambda: self._check_update_async(silent=True))
+        # 自動更新（Customer 版不啟用，見 _check_update_async / _show_about）
+        if not self._is_customer():
+            # 先清掉上次自我替換留下的殘檔
+            updater.cleanup_old()
+            # 若剛從更新重啟，顯示「更新內容」
+            self.after(400, self._show_post_update_notes)
+            # 背景靜默檢查新版
+            self.after(3000, lambda: self._check_update_async(silent=True))
 
     def _build_ui(self):
         # ---- Top bar (shared) ----
