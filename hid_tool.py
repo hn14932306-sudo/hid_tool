@@ -74,8 +74,8 @@ except Exception:
 class HIDToolApp(tk.Tk):
     _APP_NAME          = "RE024 Touch Inspector"
     _APP_AUTHOR        = "Shane.Lin"
-    _APP_VERSION_LABEL = "v1.9.15"
-    _APP_VERSION_TIME  = "2026-08-11"
+    _APP_VERSION_LABEL = "v1.9.16"
+    _APP_VERSION_TIME  = "2026-08-17"
 
     # 版本(edition)：Engineer = 全功能；FAE / Customer = 閹割版
     # 由 build 時產生的 _edition.py 決定（見 .spec），開發/沒有該檔時預設 Engineer。
@@ -7071,7 +7071,10 @@ class HIDToolApp(tk.Tk):
         ("dir",  "方向",        46),
         ("kind", "種類",       100),
         ("reg",  "暫存器",      70),
-        ("len",  "長度",        50),
+        # 跟 data 欄同理，改用「顯示寬度」截斷後最長一句大約要 72 個顯示寬度單位
+        # （中文字算 2），420px 換算不到 60，會把 "VC5"/"ContactCountMax" 這種
+        # 結尾字硬生生切掉，給到 900px 留足夠餘裕。
+        ("desc", "說明",       900),
         # FastTable 是照字元數截斷內容（不像 Treeview 可以左右捲動看到完整內容），
         # 給到 8000px（約 1000+ 字元）足夠放下實測過最長的一筆（259 bytes 的
         # Feature Report，含前綴 776 字元）而不被吃掉尾巴。
@@ -7131,7 +7134,7 @@ class HIDToolApp(tk.Tk):
         self._la_tx_table.set_columns([(cid_, lbl, self._col_width(w, lbl))
                                        for cid_, lbl, w in self._LA_TX_COLS])
         for cid_, lbl, w in self._LA_TX_COLS:
-            self._la_tx_table.column(cid_, anchor="w" if cid_ in ("time", "data") else "center")
+            self._la_tx_table.column(cid_, anchor="w" if cid_ in ("time", "data", "desc") else "center")
         tvsb = ttk.Scrollbar(tx_wrap, orient=tk.VERTICAL, command=self._la_tx_table.yview)
         thsb = ttk.Scrollbar(tx_frame, orient=tk.HORIZONTAL, command=self._la_tx_table.xview)
         self._la_tx_table.configure_scroll(yscrollcommand=tvsb.set, xscrollcommand=thsb.set)
@@ -7162,6 +7165,7 @@ class HIDToolApp(tk.Tk):
 
         self._la_analysis = None       # la_saleae.LAAnalysis
         self._la_ctx = None            # dict: report_id -> digi ctx（依目前選定的 descriptor）
+        self._la_field_summary = {}    # (report_id, report_type) -> usage 名稱摘要，補在「說明」欄
         self._la_desc_choices = {}     # 顯示字串 -> ("auto"|"device"|"manual", key)
         self._la_rows_cache = []       # 目前交易表格資料，供匯出 CSV 用
         self._la_decode_rows_cache = []  # 目前解碼表格資料，供匯出 CSV 用
@@ -7295,7 +7299,26 @@ class HIDToolApp(tk.Tk):
                     return
 
         self._la_ctx = self._build_digi_ctx(fields) if fields else None
+        self._la_field_summary = self._build_la_field_summary(fields) if fields else {}
         self._la_refresh_table()
+
+    @staticmethod
+    def _build_la_field_summary(fields: List[HIDField]) -> Dict[tuple, str]:
+        """(report_id, report_type) -> 這個 report 裡有哪些欄位（usage 名稱），
+        給「說明」欄補一句人看得懂的字，例如 Feature id=0x0A -> ContactCountMax。
+        FF00/FFF4 這類廠商頁沒有公開定義，get_usage_name 會退回 'V10' 這種代號，
+        只能標出「這是哪個 bit/array」，猜不出實際控制什麼。"""
+        groups: Dict[tuple, List[str]] = {}
+        for f in fields:
+            if f.is_const:
+                continue
+            key = (f.report_id, f.report_type)
+            names = groups.setdefault(key, [])
+            for u in (f.usages or [])[:max(1, f.report_count)]:
+                nm = get_usage_name(f.usage_page, u)
+                if nm not in names:
+                    names.append(nm)
+        return {k: "/".join(v[:6]) + ("…" if len(v) > 6 else "") for k, v in groups.items() if v}
 
     # ---- 表格 / 匯出 ----
 
@@ -7325,7 +7348,23 @@ class HIDToolApp(tk.Tk):
             # 的 "1E 00"（wHIDDescLength）就會被吃掉，看起來完全認不出來。
             data_s = ev.raw.hex(" ").upper() if ev.raw else ""
 
-            tx_batch.append((ev.time, direction, ev.kind, reg_s, len_s, data_s))
+            desc = la_saleae.describe_event(ev, regmap)
+            desc_s = desc.text
+            if desc.report_id is not None and self._la_field_summary:
+                extra = self._la_field_summary.get((desc.report_id, desc.report_type_name))
+                if extra is None and desc.report_type_name is None:
+                    # Command Register 讀回沒有 report type（讀回資料裡沒帶 type），
+                    # 三種 type 都試一次，抓到哪個就是哪個
+                    for rtn in ("Input", "Output", "Feature"):
+                        extra = self._la_field_summary.get((desc.report_id, rtn))
+                        if extra:
+                            break
+                if extra:
+                    desc_s = f"{desc_s}｜{extra}" if desc_s else extra
+            if len_s:
+                desc_s = f"{desc_s}（長度={len_s}）" if desc_s else f"長度={len_s}"
+
+            tx_batch.append((ev.time, direction, ev.kind, reg_s, desc_s, data_s))
 
             if self._la_ctx is not None and ev.payload and la_saleae.is_input_report_event(ev, regmap):
                 rid = ev.payload[0]
@@ -7333,16 +7372,17 @@ class HIDToolApp(tk.Tk):
                 if rc is not None:
                     decode_batch.extend(self._decode_digi_rows(rc, ev.payload[1:], ev.time))
 
-        # 跟監聽分頁一樣：舊 -> 新 insert，最新一筆會排在最上面
+        # 離線分析要照時間順序看（最早在最上面），跟監聽分頁「最新在最上面」相反，
+        # 所以反過來餵給 insert_rows（它是「最後塞進去的排最上面」）。
         self._la_tx_table.clear()
         self._la_tx_table.set_max_rows(max(200, len(tx_batch)))
-        self._la_tx_table.insert_rows([(row, ()) for row in tx_batch])
+        self._la_tx_table.insert_rows([(row, ()) for row in reversed(tx_batch)])
         self._la_tx_table.flush()
         self._la_rows_cache = tx_batch
 
         self._la_decode_table.clear()
         self._la_decode_table.set_max_rows(max(200, len(decode_batch)))
-        self._la_decode_table.insert_rows([(row, ()) for row in decode_batch])
+        self._la_decode_table.insert_rows([(row, ()) for row in reversed(decode_batch)])
         self._la_decode_table.flush()
         self._la_decode_rows_cache = decode_batch
 
@@ -7359,7 +7399,7 @@ class HIDToolApp(tk.Tk):
         try:
             with open(path, "w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.writer(f)
-                writer.writerow(["time", "dir", "kind", "register", "length", "data_hex"])
+                writer.writerow(["time", "dir", "kind", "register", "desc", "data_hex"])
                 writer.writerows(self._la_rows_cache)
         except Exception as exc:
             messagebox.showerror("匯出失敗", f"無法匯出 CSV:\n{exc}")

@@ -82,11 +82,12 @@ class FastTable(tk.Frame):
         self._cols = [c[0] for c in cols]
         self._display = None
         self._labels = {c[0]: c[1] for c in cols}
-        self._widths = {c[0]: max(_MIN_COL_CHARS,
-                                  max(int(round(c[2] / self._char_w)), len(str(c[1]))))
+        self._widths = {c[0]: max(_MIN_COL_CHARS, int(round(c[2] / self._char_w)),
+                                  -(-self._font.measure(str(c[1])) // self._char_w))
                         for c in cols}
         self._anchors = {c[0]: "center" for c in cols}
         self.clear()
+        self._recompute_tabs()
         self._redraw_header()
         self._dirty = True
         self._render()
@@ -99,6 +100,7 @@ class FastTable(tk.Frame):
     def set_display_columns(self, col_ids: Optional[Sequence[str]]):
         """只顯示這些欄位（None = 全部）。資料不受影響，純顯示層。"""
         self._display = list(col_ids) if col_ids is not None else None
+        self._recompute_tabs()
         self._redraw_header()
         self._dirty = True
         self._render()
@@ -112,10 +114,39 @@ class FastTable(tk.Frame):
             self._widths[col_id] = max(_MIN_COL_CHARS, int(round(width / self._char_w)))
         if anchor is not None:
             self._anchors[col_id] = anchor
+        self._recompute_tabs()
         self._redraw_header()
         self._dirty = True
         self._render()
         return None
+
+    _ANCHOR_TO_TK_TAB = {"w": "left", "e": "right", "center": "center"}
+
+    def _recompute_tabs(self):
+        """欄位對齊改交給 Tk Text 原生的 tab stop（像素位置，Tk 排版引擎直接
+        算，不是我們自己拿字型測量去湊空白）——用手動補空白對齊，字型量出來的
+        寬度跟空白字元本身的寬度只要有一點點誤差，多欄接在一起就會慢慢飄掉；
+        tab stop 是 Tk 排版時的絕對像素位置，沒有這個累積誤差的問題。"""
+        gap_px = _COL_GAP * self._char_w
+        x = 0
+        stops = []
+        for c in self._active_cols():
+            w_px = self._widths.get(c, 8) * self._char_w
+            a = self._ANCHOR_TO_TK_TAB.get(self._anchors.get(c, "center"), "center")
+            pos = x if a == "left" else (x + w_px if a == "right" else x + w_px // 2)
+            # Tk 的 -tabs 選項規定每個 stop 都要是「正距離」，0 會直接丟
+            # TclError；第一欄如果是靠左對齊，算出來就剛好是 0，之前這裡
+            # try/except 吞掉例外，整組 tabs 沒套用成功，落回舊設定，
+            # 才會看起來像是欄位對齊設定沒生效。
+            pos = max(1, pos)
+            stops.append(f"{pos} {a}")
+            x += w_px + gap_px
+        tabs_str = " ".join(stops)
+        for w in (self._body, self._header):
+            try:
+                w.configure(tabs=tabs_str)
+            except tk.TclError:
+                pass
 
     def heading(self, col_id: str, text: str):
         self._labels[col_id] = text
@@ -180,7 +211,27 @@ class FastTable(tk.Frame):
     def _active_cols(self) -> List[str]:
         return self._display if self._display is not None else self._cols
 
+    def _fit_truncate(self, s: str, w_chars: int) -> str:
+        """照這個字型『實際渲染出來的像素寬度』截斷，而不是字元數——中文字在
+        等寬字型底下的畫面寬度不保證剛好是半形字元的整數倍（實際倍率看系統幫
+        CJK 字元代換成哪個字型），用真正的 font.measure() 才不會兩列對不齊。"""
+        target_px = w_chars * self._char_w
+        if self._font.measure(s) <= target_px:
+            return s
+        lo, hi = 0, len(s)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if self._font.measure(s[:mid]) <= target_px:
+                lo = mid
+            else:
+                hi = mid - 1
+        return s[:lo]
+
     def _fmt_row(self, values: Sequence) -> str:
+        """每欄前面放一個 \t，靠 _recompute_tabs() 設好的 tab stop 對齊——
+        不再自己拼空白，Tk 排版引擎的 tab 定位是像素級精準，不會累積誤差。
+        還是要截斷過長內容，不然這一列的字會蓋過下一欄的 tab stop，讓
+        Tk 直接跳去下下一欄的位置，反而讓這一整列歪掉。"""
         cols = self._active_cols()
         idx = {c: i for i, c in enumerate(self._cols)}
         parts = []
@@ -189,25 +240,14 @@ class FastTable(tk.Frame):
             i = idx.get(c, -1)
             v = "" if i < 0 or i >= len(values) else values[i]
             s = "" if v is None else str(v)
-            if len(s) > w:
-                s = s[:w]
-            a = self._anchors.get(c, "center")
-            if a == "w":
-                parts.append(s.ljust(w))
-            elif a == "e":
-                parts.append(s.rjust(w))
-            else:
-                parts.append(s.center(w))
-        return (" " * _COL_GAP).join(parts)
+            parts.append(self._fit_truncate(s, w))
+        return "\t" + "\t".join(parts)
 
     def _redraw_header(self):
         cols = self._active_cols()
-        parts = []
-        for c in cols:
-            w = self._widths.get(c, 8)
-            s = str(self._labels.get(c, c))
-            parts.append(s[:w].center(w))
-        line = (" " * _COL_GAP).join(parts)
+        parts = [self._fit_truncate(str(self._labels.get(c, c)), self._widths.get(c, 8))
+                 for c in cols]
+        line = "\t" + "\t".join(parts)
         self._header.configure(state="normal")
         self._header.delete("1.0", "end")
         self._header.insert("1.0", line)
