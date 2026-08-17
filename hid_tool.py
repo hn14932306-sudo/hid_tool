@@ -30,6 +30,7 @@ from fast_table import FastTable
 import hid_desc_compare
 import heatmap_frame
 import digiinfo_parse
+import la_saleae
 import updater
 
 from hid_descriptor import (
@@ -1049,6 +1050,10 @@ class HIDToolApp(tk.Tk):
             digi_sub = ttk.Frame(replay_nb, style="Surface.TFrame")
             replay_nb.add(digi_sub, text="DigiInfo")
             self._build_digi_tab(digi_sub)
+
+            la_sub = ttk.Frame(replay_nb, style="Surface.TFrame")
+            replay_nb.add(la_sub, text="Logic Analysis")
+            self._build_la_tab(la_sub)
 
             # 切換分頁時，自動暫停已切走的回放（Differ / DigiInfo）
             self._replay_nb.bind("<<NotebookTabChanged>>", self._on_tab_changed, add="+")
@@ -7031,6 +7036,355 @@ class HIDToolApp(tk.Tk):
             return
         self._digi_status_var.set(f"已匯出 {len(rows)} 列到 {os.path.basename(path)}")
         messagebox.showinfo("匯出 CSV", f"已匯出 {len(rows)} 列（{mode}）。")
+
+    # ------------------------------------------------------------------
+    # Logic Analysis：匯入 Saleae I2C analyzer 匯出的 CSV，重組成 I2C-HID
+    # 交易（register read/write、length-prefixed Input Report），能自動判斷
+    # HID Descriptor / Input / Output / Command register 位址；若 CSV 內剛好
+    # 也擷取到完整的 Report Descriptor 讀取，就自動拿來解碼觸控欄位。
+    # ------------------------------------------------------------------
+
+    # 解碼結果表：欄位與監聽分頁「全部 digitizer」模式的 _ALL_DIGI_COLS 同一組
+    # （第一欄借來放時間戳，因為離線分析沒有「目前裝置」這件事，時間點才是
+    # 使用者定位這筆交易的依據），這樣 _decode_digi_rows() 回傳的 row 可以直接塞。
+    _LA_DECODE_COLS = [
+        ("__time__",     "時間",       150),
+        ("ScanTime",     "ScanTime",   80),
+        ("ContactCount", "Cnt",        45),
+        ("__slot__",     "Slot",       42),
+        ("ContactID",    "CID",        55),
+        ("X",            "X",          70),
+        ("Y",            "Y",          70),
+        ("TipPressure",  "Press",      60),
+        ("Width",        "W",          48),
+        ("Height",       "H",          48),
+        ("XTilt",        "XTilt",      55),
+        ("YTilt",        "YTilt",      55),
+        ("Azimuth",      "Azim",       55),
+        ("Status",       "Status",    150),
+    ]
+
+    # I2C-HID 指令解析表：跟監聽分頁一樣改用 FastTable（Text 自繪），
+    # 不用 ttk.Treeview——理由跟監聽表格一樣，重繪成本才不會隨列數線性增加。
+    _LA_TX_COLS = [
+        ("time", "時間",       150),
+        ("dir",  "方向",        46),
+        ("kind", "種類",       100),
+        ("reg",  "暫存器",      70),
+        ("len",  "長度",        50),
+        # FastTable 是照字元數截斷內容（不像 Treeview 可以左右捲動看到完整內容），
+        # 給到 8000px（約 1000+ 字元）足夠放下實測過最長的一筆（259 bytes 的
+        # Feature Report，含前綴 776 字元）而不被吃掉尾巴。
+        ("data", "資料 (hex)", 8000),
+    ]
+
+    def _build_la_tab(self, parent):
+        file_row = ttk.LabelFrame(parent, text="Saleae I2C CSV", padding=(8, 6),
+                                  style="Section.TLabelframe")
+        file_row.pack(fill=tk.X, padx=10, pady=(12, 6))
+        ttk.Label(file_row, text="CSV 檔案:", width=8, anchor="e").pack(side=tk.LEFT)
+        self._la_path_var = tk.StringVar()
+        ttk.Entry(file_row, textvariable=self._la_path_var).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 6))
+        ttk.Button(file_row, text="瀏覽…", command=self._la_browse).pack(side=tk.LEFT)
+        ttk.Button(file_row, text="載入", command=self._la_load).pack(side=tk.LEFT, padx=(4, 0))
+
+        desc_row = ttk.LabelFrame(parent, text="Report Descriptor 來源（用於解碼 Input Report）",
+                                  padding=(8, 6), style="Section.TLabelframe")
+        desc_row.pack(fill=tk.X, padx=10, pady=6)
+        self._la_desc_var = tk.StringVar()
+        self._la_desc_combo = ttk.Combobox(desc_row, textvariable=self._la_desc_var,
+                                           state="readonly", width=40)
+        self._la_desc_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._la_desc_combo.bind("<<ComboboxSelected>>", self._la_on_desc_selected)
+        ttk.Button(desc_row, text="重新整理清單", command=self._la_refresh_desc_choices).pack(
+            side=tk.LEFT, padx=(6, 0))
+
+        info = ttk.LabelFrame(parent, text="HID-over-I2C 協商資訊", padding=(8, 6),
+                              style="Section.TLabelframe")
+        info.pack(fill=tk.X, padx=10, pady=6)
+        self._la_info_var = tk.StringVar(value="尚未載入 CSV。")
+        ttk.Label(info, textvariable=self._la_info_var, style="Muted.TLabel",
+                  justify=tk.LEFT, wraplength=760).pack(anchor="w")
+
+        bottom = ttk.Frame(parent)
+        bottom.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 12))
+        ttk.Button(bottom, text="匯出交易 CSV", command=self._la_export_csv).pack(side=tk.LEFT)
+        ttk.Button(bottom, text="匯出解碼 CSV", command=self._la_export_decode_csv).pack(
+            side=tk.LEFT, padx=(6, 0))
+        self._la_status_var = tk.StringVar(value="尚未載入檔案")
+        ttk.Label(bottom, textvariable=self._la_status_var, style="Muted.TLabel",
+                  anchor=tk.E).pack(side=tk.RIGHT)
+
+        split = ttk.PanedWindow(parent, orient=tk.VERTICAL)
+        split.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 6))
+
+        # -- 上半：I2C-HID 指令解析（跟監聽分頁同一種 FastTable）--
+        tx_frame = ttk.LabelFrame(split, text="I2C 交易", padding=(4, 4),
+                                  style="Section.TLabelframe")
+        split.add(tx_frame, weight=1)
+        tx_wrap = ttk.Frame(tx_frame)
+        tx_wrap.pack(fill=tk.BOTH, expand=True)
+        self._la_tx_table = FastTable(tx_wrap, font=self._FONT_MONO,
+                                      bg=self._SURFACE, fg=self._TEXT,
+                                      header_bg=self._SURFACE_ALT)
+        self._la_tx_table.set_columns([(cid_, lbl, self._col_width(w, lbl))
+                                       for cid_, lbl, w in self._LA_TX_COLS])
+        for cid_, lbl, w in self._LA_TX_COLS:
+            self._la_tx_table.column(cid_, anchor="w" if cid_ in ("time", "data") else "center")
+        tvsb = ttk.Scrollbar(tx_wrap, orient=tk.VERTICAL, command=self._la_tx_table.yview)
+        thsb = ttk.Scrollbar(tx_frame, orient=tk.HORIZONTAL, command=self._la_tx_table.xview)
+        self._la_tx_table.configure_scroll(yscrollcommand=tvsb.set, xscrollcommand=thsb.set)
+        tvsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._la_tx_table.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        thsb.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # -- 下半：解碼結果（跟監聽分頁「全部 digitizer」模式同一張表：FastTable + 同組欄位）--
+        dec_frame = ttk.LabelFrame(split, text="解碼結果（Input Report）", padding=(4, 4),
+                                   style="Section.TLabelframe")
+        split.add(dec_frame, weight=1)
+        dec_wrap = ttk.Frame(dec_frame)
+        dec_wrap.pack(fill=tk.BOTH, expand=True)
+        self._la_decode_table = FastTable(dec_wrap, font=self._FONT_MONO,
+                                          bg=self._SURFACE, fg=self._TEXT,
+                                          header_bg=self._SURFACE_ALT)
+        self._la_decode_table.set_columns([(cid_, lbl, self._col_width(w, lbl))
+                                           for cid_, lbl, w in self._LA_DECODE_COLS])
+        for cid_, lbl, w in self._LA_DECODE_COLS:
+            self._la_decode_table.column(cid_, anchor="w" if cid_ == "__time__" else "center")
+        dvsb = ttk.Scrollbar(dec_wrap, orient=tk.VERTICAL, command=self._la_decode_table.yview)
+        dhsb = ttk.Scrollbar(dec_frame, orient=tk.HORIZONTAL,
+                             command=self._la_decode_table.xview)
+        self._la_decode_table.configure_scroll(yscrollcommand=dvsb.set, xscrollcommand=dhsb.set)
+        dvsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._la_decode_table.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        dhsb.pack(side=tk.BOTTOM, fill=tk.X)
+
+        self._la_analysis = None       # la_saleae.LAAnalysis
+        self._la_ctx = None            # dict: report_id -> digi ctx（依目前選定的 descriptor）
+        self._la_desc_choices = {}     # 顯示字串 -> ("auto"|"device"|"manual", key)
+        self._la_rows_cache = []       # 目前交易表格資料，供匯出 CSV 用
+        self._la_decode_rows_cache = []  # 目前解碼表格資料，供匯出 CSV 用
+
+    # ---- 載入 / 解析 ----
+
+    def _la_browse(self):
+        path = filedialog.askopenfilename(
+            title="選擇 Saleae I2C CSV",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if path:
+            self._la_path_var.set(path)
+            self._la_load()
+
+    def _la_load(self):
+        path = self._la_path_var.get().strip()
+        if not path or not os.path.isfile(path):
+            messagebox.showerror("載入", "請先選擇有效的 CSV 檔。")
+            return
+        self._la_status_var.set("解析中…")
+
+        def worker():
+            try:
+                analysis = la_saleae.analyze_capture(path)
+            except Exception as exc:
+                self.after(0, lambda: self._la_status_var.set(f"解析失敗: {exc}"))
+                return
+            self.after(0, lambda: self._la_apply(analysis))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _la_apply(self, analysis: la_saleae.LAAnalysis):
+        self._la_analysis = analysis
+        regmap = analysis.regmap
+        if regmap:
+            info = (f"偵測到 HID Descriptor（來源暫存器 0x{regmap.get('_source_register', 0):02X}）："
+                    f"InputReg=0x{regmap['wInputRegister']:02X}  "
+                    f"OutputReg=0x{regmap['wOutputRegister']:02X}  "
+                    f"CommandReg=0x{regmap['wCommandRegister']:02X}  "
+                    f"ReportDescReg=0x{regmap['wReportDescRegister']:02X}"
+                    f"（長度 {regmap['wReportDescLength']}）  "
+                    f"VID=0x{regmap['wVendorID']:04X} PID=0x{regmap['wProductID']:04X}")
+            if analysis.report_descriptor:
+                info += "\nCSV 內含完整的 Report Descriptor 讀取，已自動用它來解碼 Input Report。"
+            else:
+                info += ("\n這份 CSV 沒有包含完整的 Report Descriptor 讀取，"
+                         "請在上方手動選擇 descriptor 來源才能解碼觸控欄位"
+                         "（時間/暫存器/資料仍會照樣列出）。")
+        else:
+            info = ("沒有在這份 CSV 裡找到 HID Descriptor 協商（讀到的內容不像合法的 "
+                    "HID-over-I2C descriptor）。仍會列出所有 I2C 交易，但無法自動判斷 "
+                    "哪個暫存器是 Input Report，也無法自動抓 Report Descriptor。")
+        self._la_info_var.set(info)
+
+        self._la_refresh_desc_choices()
+        self._la_refresh_table()
+
+        n_input = sum(1 for e in analysis.events if la_saleae.is_input_report_event(e, regmap))
+        self._la_status_var.set(
+            f"已載入 {len(analysis.events)} 筆交易，其中 {n_input} 筆判定為 Input Report，"
+            f"解出 {len(self._la_decode_rows_cache)} 筆接觸點")
+
+    # ---- Report Descriptor 來源 ----
+
+    def _la_refresh_desc_choices(self):
+        self._la_desc_choices = {}
+        values = []
+
+        if self._la_analysis and self._la_analysis.report_descriptor:
+            label = f"自動（LA 擷取，{len(self._la_analysis.report_descriptor)} bytes）"
+            values.append(label)
+            self._la_desc_choices[label] = ("auto", None)
+
+        for path_str, fields in self._descriptors.items():
+            if not fields:
+                continue
+            label = f"裝置: {self._label_from_name(path_str)}"
+            if label in self._la_desc_choices:
+                continue
+            values.append(label)
+            self._la_desc_choices[label] = ("device", path_str)
+
+        manual_label = "手動選擇檔案（hex）…"
+        values.append(manual_label)
+        self._la_desc_choices[manual_label] = ("manual", None)
+
+        self._la_desc_combo.configure(values=values)
+        if self._la_desc_var.get() not in self._la_desc_choices:
+            # 只有「自動 / 裝置」可以無感套用；「手動選擇檔案」需要使用者自己點選，
+            # 不然一載入就跳出檔案選取視窗會卡住整個流程。
+            auto_or_device = [v for v in values if self._la_desc_choices[v][0] != "manual"]
+            if auto_or_device:
+                self._la_desc_var.set(auto_or_device[0])
+                self._la_apply_desc_choice(auto_or_device[0])
+            elif values:
+                self._la_desc_var.set(values[0])
+
+    def _la_on_desc_selected(self, _event=None):
+        self._la_apply_desc_choice(self._la_desc_var.get())
+
+    def _la_apply_desc_choice(self, label: str):
+        choice = self._la_desc_choices.get(label)
+        fields = None
+        if choice:
+            kind, key = choice
+            if kind == "auto" and self._la_analysis and self._la_analysis.report_descriptor:
+                try:
+                    fields = parse_report_descriptor(self._la_analysis.report_descriptor)
+                except Exception as exc:
+                    messagebox.showerror("解析 Descriptor 失敗", str(exc))
+            elif kind == "device":
+                fields = self._descriptors.get(key)
+            elif kind == "manual":
+                path = filedialog.askopenfilename(
+                    title="選擇 Report Descriptor（hex 文字檔或二進位）",
+                    filetypes=[("All files", "*.*")])
+                if not path:
+                    return
+                try:
+                    with open(path, "rb") as f:
+                        raw = f.read()
+                    try:
+                        hexed = bytes(parse_hex_bytes(raw.decode("utf-8")))
+                        raw_bytes = hexed if hexed else raw
+                    except UnicodeDecodeError:
+                        raw_bytes = raw
+                    fields = parse_report_descriptor(raw_bytes)
+                except Exception as exc:
+                    messagebox.showerror("載入失敗", f"無法解析 report descriptor:\n{exc}")
+                    return
+
+        self._la_ctx = self._build_digi_ctx(fields) if fields else None
+        self._la_refresh_table()
+
+    # ---- 表格 / 匯出 ----
+
+    def _la_refresh_table(self):
+        self._la_rows_cache = []
+        self._la_decode_rows_cache = []
+        if not self._la_analysis:
+            self._la_tx_table.clear()
+            self._la_tx_table.flush()
+            self._la_decode_table.clear()
+            self._la_decode_table.flush()
+            return
+        regmap = self._la_analysis.regmap
+        tx_batch: List[tuple] = []
+        decode_batch: List[list] = []
+        for ev in self._la_analysis.events:
+            if ev.kind in ("input_report", "register_read"):
+                direction = "讀"
+            elif ev.kind in ("register_write", "register_select"):
+                direction = "寫"
+            else:
+                direction = "?"
+            reg_s = f"0x{ev.register:02X}" if ev.register is not None else ""
+            len_s = str(ev.length_field) if ev.length_field is not None else ""
+            # 顯示 ev.raw（bus 上實際擷取到的完整位元組），不是拿掉 2-byte 長度
+            # 前綴後的 ev.payload —— 不然像 HID Descriptor 開頭那組辨識度很高
+            # 的 "1E 00"（wHIDDescLength）就會被吃掉，看起來完全認不出來。
+            data_s = ev.raw.hex(" ").upper() if ev.raw else ""
+
+            tx_batch.append((ev.time, direction, ev.kind, reg_s, len_s, data_s))
+
+            if self._la_ctx is not None and ev.payload and la_saleae.is_input_report_event(ev, regmap):
+                rid = ev.payload[0]
+                rc = self._la_ctx.get(rid)
+                if rc is not None:
+                    decode_batch.extend(self._decode_digi_rows(rc, ev.payload[1:], ev.time))
+
+        # 跟監聽分頁一樣：舊 -> 新 insert，最新一筆會排在最上面
+        self._la_tx_table.clear()
+        self._la_tx_table.set_max_rows(max(200, len(tx_batch)))
+        self._la_tx_table.insert_rows([(row, ()) for row in tx_batch])
+        self._la_tx_table.flush()
+        self._la_rows_cache = tx_batch
+
+        self._la_decode_table.clear()
+        self._la_decode_table.set_max_rows(max(200, len(decode_batch)))
+        self._la_decode_table.insert_rows([(row, ()) for row in decode_batch])
+        self._la_decode_table.flush()
+        self._la_decode_rows_cache = decode_batch
+
+    def _la_export_csv(self):
+        if not self._la_rows_cache:
+            messagebox.showinfo("匯出交易 CSV", "沒有可匯出的資料，請先載入 CSV。")
+            return
+        default_name = f"la_transactions_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        path = filedialog.asksaveasfilename(
+            title="匯出交易 CSV", defaultextension=".csv", initialfile=default_name,
+            filetypes=[("CSV", "*.csv"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow(["time", "dir", "kind", "register", "length", "data_hex"])
+                writer.writerows(self._la_rows_cache)
+        except Exception as exc:
+            messagebox.showerror("匯出失敗", f"無法匯出 CSV:\n{exc}")
+            return
+        self._la_status_var.set(f"已匯出到 {os.path.basename(path)}")
+
+    def _la_export_decode_csv(self):
+        if not self._la_decode_rows_cache:
+            messagebox.showinfo("匯出解碼 CSV", "目前沒有解碼結果可匯出。")
+            return
+        default_name = f"la_decode_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        path = filedialog.asksaveasfilename(
+            title="匯出解碼 CSV", defaultextension=".csv", initialfile=default_name,
+            filetypes=[("CSV", "*.csv"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow([lbl for _cid, lbl, _w in self._LA_DECODE_COLS])
+                writer.writerows(self._la_decode_rows_cache)
+        except Exception as exc:
+            messagebox.showerror("匯出失敗", f"無法匯出 CSV:\n{exc}")
+            return
+        self._la_status_var.set(f"已匯出到 {os.path.basename(path)}")
 
     # ------------------------------------------------------------------
     # Cleanup
