@@ -25,13 +25,24 @@ from tkinter import filedialog, messagebox, ttk, scrolledtext
 from typing import Dict, List, Optional, Tuple
 from xml.sax.saxutils import escape
 
+# Customer builds must not import updater.  HID_Tool.spec also excludes the
+# module, which keeps its downloader/self-replacement code out of the EXE.
+try:
+    from _edition import EDITION as _BUILD_EDITION
+except Exception:
+    _BUILD_EDITION = "Engineer"
+
+if _BUILD_EDITION != "Customer":
+    import updater
+else:
+    updater = None
+
 import sv_ttk
 from fast_table import FastTable
 import hid_desc_compare
 import heatmap_frame
 import digiinfo_parse
 import la_saleae
-import updater
 
 from hid_descriptor import (
     HIDField,
@@ -56,15 +67,6 @@ from hid_device import (
     read_interrupt,
     parse_hex_bytes,
 )
-
-
-# ---------------------------------------------------------------------------
-# Edition（版本）：由 build 時產生的 _edition.py 決定，預設 Engineer
-# ---------------------------------------------------------------------------
-try:
-    from _edition import EDITION as _BUILD_EDITION
-except Exception:
-    _BUILD_EDITION = "Engineer"
 
 
 # ---------------------------------------------------------------------------
