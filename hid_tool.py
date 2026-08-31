@@ -142,8 +142,8 @@ class _HangWatchdog:
 class HIDToolApp(tk.Tk):
     _APP_NAME          = "RE024 Touch Inspector"
     _APP_AUTHOR        = "Shane.Lin"
-    _APP_VERSION_LABEL = "v1.9.16"
-    _APP_VERSION_TIME  = "2026-08-17"
+    _APP_VERSION_LABEL = "v1.9.17"
+    _APP_VERSION_TIME  = "2026-08-31"
 
     # 版本(edition)：Engineer = 全功能；FAE / Customer = 閹割版
     # 由 build 時產生的 _edition.py 決定（見 .spec），開發/沒有該檔時預設 Engineer。
