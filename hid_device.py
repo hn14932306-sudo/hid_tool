@@ -202,12 +202,14 @@ def _hid_error(dev) -> str:
         return "unknown error"
 
 
-def send_output_report(path, report_id: int, data: List[int]) -> int:
-    """Send an Output report via hid.write(). Raises RuntimeError on failure."""
+def send_output_report(path, report_id: int, data: List[int], include_report_id: bool = True) -> int:
+    """Send an Output report via hid.write(). Raises RuntimeError on failure.
+    include_report_id=False：不在 data 前面加上 report_id byte，直接送出 data。"""
     dev = hid.device()
     dev.open_path(path if isinstance(path, bytes) else path.encode())
     try:
-        result = dev.write([report_id] + data)
+        buf = ([report_id] + data) if include_report_id else list(data)
+        result = dev.write(buf)
         if result < 0:
             raise RuntimeError(_hid_error(dev))
         return result
@@ -215,12 +217,14 @@ def send_output_report(path, report_id: int, data: List[int]) -> int:
         dev.close()
 
 
-def send_feature_report(path, report_id: int, data: List[int]) -> int:
-    """Send a Feature report via hid.send_feature_report(). Raises RuntimeError on failure."""
+def send_feature_report(path, report_id: int, data: List[int], include_report_id: bool = True) -> int:
+    """Send a Feature report via hid.send_feature_report(). Raises RuntimeError on failure.
+    include_report_id=False：不在 data 前面加上 report_id byte，直接送出 data。"""
     dev = hid.device()
     dev.open_path(path if isinstance(path, bytes) else path.encode())
     try:
-        result = dev.send_feature_report([report_id] + data)
+        buf = ([report_id] + data) if include_report_id else list(data)
+        result = dev.send_feature_report(buf)
         if result < 0:
             raise RuntimeError(_hid_error(dev))
         return result
@@ -250,13 +254,14 @@ def read_interrupt(path, length: int, timeout_ms: int = 1000) -> bytes:
         dev.close()
 
 
-def set_output_report_cmd(path, report_id: int, data: List[int]) -> None:
-    """Send a SET_REPORT(Output) via HidD_SetOutputReport (generates 05 00 26 03 ... on I2C bus)."""
+def set_output_report_cmd(path, report_id: int, data: List[int], include_report_id: bool = True) -> None:
+    """Send a SET_REPORT(Output) via HidD_SetOutputReport (generates 05 00 26 03 ... on I2C bus)。
+    include_report_id=False：不在 data 前面加上 report_id byte，直接送出 data。"""
     if sys.platform != "win32":
         raise RuntimeError("set_output_report_cmd 僅支援 Windows")
     h = _open_win_handle(path)
     try:
-        buf_data = bytes([report_id] + data)
+        buf_data = bytes(([report_id] + data) if include_report_id else data)
         buf = (ctypes.c_ubyte * len(buf_data))(*buf_data)
         ok = _hid_dll.HidD_SetOutputReport(h, buf, len(buf))
         if not ok:

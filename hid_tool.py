@@ -70,6 +70,72 @@ from hid_device import (
 
 
 # ---------------------------------------------------------------------------
+# 卡頓診斷（預設關閉，零成本）：設環境變數 HID_TOOL_HANG_DEBUG=1 才會啟用。
+# 用來抓「縮小視窗一段時間、還原後變卡」這類難以在開發機重現的問題——
+# 背景執行緒每 20ms 檢查一次主執行緒（Tk 事件迴圈）多久沒跳動，
+# 超過門檻就把當下主執行緒的呼叫堆疊採樣寫進 log，事後直接看是卡在哪一行。
+# ---------------------------------------------------------------------------
+_HANG_DEBUG = os.environ.get("HID_TOOL_HANG_DEBUG") == "1"
+
+
+class _HangWatchdog:
+    _STALL_THRESHOLD = 0.3   # 秒；主迴圈超過這麼久沒跳動視為卡住
+    _SAMPLE_INTERVAL = 0.05  # 秒；卡住期間多久採樣一次呼叫堆疊
+
+    def __init__(self, log_path: str):
+        self._log_path   = log_path
+        self._main_ident  = threading.get_ident()
+        self._last_tick   = time.monotonic()
+        self._lock        = threading.Lock()
+        try:
+            with open(self._log_path, "a", encoding="utf-8") as f:
+                f.write(f"\n=== hang watchdog started {datetime.datetime.now()} pid={os.getpid()} ===\n")
+        except OSError:
+            pass
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def tick(self):
+        with self._lock:
+            self._last_tick = time.monotonic()
+
+    def _run(self):
+        in_stall = False
+        stall_started = 0.0
+        samples: List[str] = []
+        while True:
+            time.sleep(self._SAMPLE_INTERVAL)
+            with self._lock:
+                gap = time.monotonic() - self._last_tick
+            if gap > self._STALL_THRESHOLD:
+                if not in_stall:
+                    in_stall = True
+                    stall_started = time.monotonic() - gap
+                    samples = []
+                frame = sys._current_frames().get(self._main_ident)
+                if frame is not None:
+                    samples.append("".join(traceback.format_stack(frame, limit=12)))
+            elif in_stall:
+                in_stall = False
+                dur = time.monotonic() - stall_started
+                self._dump(dur, samples)
+
+    def _dump(self, duration: float, samples: List[str]):
+        try:
+            with open(self._log_path, "a", encoding="utf-8") as f:
+                f.write(f"\n--- stall {duration*1000:.0f}ms at {datetime.datetime.now()} "
+                        f"({len(samples)} samples) ---\n")
+                if samples:
+                    # 取最後一個樣本（卡住尾聲最接近實際卡點）＋堆疊出現次數最多的當代表
+                    counts: Dict[str, int] = {}
+                    for s in samples:
+                        counts[s] = counts.get(s, 0) + 1
+                    top = max(counts.items(), key=lambda kv: kv[1])
+                    f.write(f"most common stack ({top[1]}/{len(samples)} samples):\n{top[0]}\n")
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Unified GUI Application
 # ---------------------------------------------------------------------------
 
@@ -475,6 +541,13 @@ class HIDToolApp(tk.Tk):
         self._digi_redraw_pending: bool        = False
         self._digi_table_visible:  bool        = False
         self._digi_render_token:   int         = 0
+
+        self._hang_watchdog: Optional[_HangWatchdog] = None
+        if _HANG_DEBUG:
+            log_dir = (os.path.dirname(os.path.abspath(sys.executable))
+                       if getattr(sys, "frozen", False)
+                       else os.path.dirname(os.path.abspath(__file__)))
+            self._hang_watchdog = _HangWatchdog(os.path.join(log_dir, "hid_tool_hang.log"))
 
         self._build_ui()
         self._refresh_devices_async()
@@ -1248,7 +1321,10 @@ class HIDToolApp(tk.Tk):
         ttk.Label(param_frame, text="Report ID (hex):").grid(row=1, column=0, sticky="w", padx=4, pady=4)
         self._report_id_var = tk.StringVar(value="01")
         ttk.Entry(param_frame, textvariable=self._report_id_var, width=10).grid(
-            row=1, column=1, columnspan=2, sticky="w")
+            row=1, column=1, sticky="w")
+        self._add_rid_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(param_frame, text="送出時加上 Report ID", variable=self._add_rid_var).grid(
+            row=1, column=2, sticky="w", padx=(12, 0))
 
         ttk.Label(param_frame, text="Data (hex):").grid(row=2, column=0, sticky="w", padx=4)
         self._send_data_var = tk.StringVar()
@@ -3557,6 +3633,8 @@ class HIDToolApp(tk.Tk):
         self._digi_rate_var.set("scan/s   " + "   ".join(parts) if parts else "")
 
     def _poll_queue(self):
+        if self._hang_watchdog is not None:
+            self._hang_watchdog.tick()
         # 整段包 try/finally：單一封包/處理出錯也絕不讓 poll 迴圈停掉
         next_delay = 20
         try:
@@ -4960,20 +5038,21 @@ class HIDToolApp(tk.Tk):
 
         threading.Thread(
             target=self._send_report,
-            args=(self._get_cmd_dev()["path"], report_id, data, self._report_type.get()),
+            args=(self._get_cmd_dev()["path"], report_id, data, self._report_type.get(),
+                  self._add_rid_var.get()),
             daemon=True,
         ).start()
 
-    def _send_report(self, path, report_id: int, data: list, rtype: str):
+    def _send_report(self, path, report_id: int, data: list, rtype: str, add_rid: bool = True):
         self._send_log_append(f"\n發送 {rtype} Report")
-        self._send_log_append(f"  Report ID : 0x{report_id:02X}")
+        self._send_log_append(f"  Report ID : 0x{report_id:02X}" + ("" if add_rid else "（不加在送出資料前）"))
         self._send_log_append(f"  Data (輸入) : {' '.join(f'{b:02X}' for b in data) or '(空)'}")
         try:
             if rtype == "Feature":
                 required = self._report_length(report_id, REPORT_TYPE_FEATURE) - 1
                 padded = (data + [0] * required)[:required]
-                self._log_payload(report_id, padded)
-                sent = send_feature_report(path, report_id, padded)
+                self._log_payload(report_id, padded, add_rid)
+                sent = send_feature_report(path, report_id, padded, include_report_id=add_rid)
                 if sent < 0:
                     self._send_log_append(f"  [錯誤] 發送失敗 (回傳 {sent})")
                 else:
@@ -4981,12 +5060,12 @@ class HIDToolApp(tk.Tk):
             elif rtype == "Input":
                 required = self._report_length(report_id, REPORT_TYPE_OUTPUT) - 1
                 padded = (data + [0] * required)[:required]
-                self._log_payload(report_id, padded)
-                set_output_report_cmd(path, report_id, padded)
+                self._log_payload(report_id, padded, add_rid)
+                set_output_report_cmd(path, report_id, padded, include_report_id=add_rid)
                 self._send_log_append(f"  [成功] SET_REPORT(Output) command 已送出")
             else:
-                self._log_payload(report_id, data)
-                sent = send_output_report(path, report_id, data)
+                self._log_payload(report_id, data, add_rid)
+                sent = send_output_report(path, report_id, data, include_report_id=add_rid)
                 if sent < 0:
                     self._send_log_append(f"  [錯誤] 發送失敗 (回傳 {sent})")
                 else:
@@ -5064,8 +5143,8 @@ class HIDToolApp(tk.Tk):
                 chunk = data[off:off + 66]
                 append_fn(f"    {off:04X}:  {' '.join(f'{b:02X}' for b in chunk)}")
 
-    def _log_payload(self, report_id: int, payload: list):
-        full = [report_id] + list(payload)
+    def _log_payload(self, report_id: int, payload: list, add_rid: bool = True):
+        full = ([report_id] + list(payload)) if add_rid else list(payload)
         self._send_log_append(f"  實際送出 ({len(full)} bytes):")
         self._log_bytes(full, self._send_log_append)
 
