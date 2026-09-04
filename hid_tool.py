@@ -154,7 +154,7 @@ class _HangWatchdog:
 class HIDToolApp(tk.Tk):
     _APP_NAME          = "RE024 Touch Inspector"
     _APP_AUTHOR        = "Shane.Lin"
-    _APP_VERSION_LABEL = "v1.9.22"
+    _APP_VERSION_LABEL = "v1.9.23"
     _APP_VERSION_TIME  = "2026-09-04"
 
     # 版本(edition)：Engineer = 全功能；FAE / Customer = 閹割版
@@ -1156,7 +1156,8 @@ class HIDToolApp(tk.Tk):
             # 切換分頁時，自動暫停已切走的回放（Differ / DigiInfo）
             self._replay_nb.bind("<<NotebookTabChanged>>", self._on_tab_changed, add="+")
  
-        if self._is_engineer():
+        # 調適分頁：Engineer 與 FAE 版皆可用（Customer 隱藏）
+        if self._is_engineer() or self._is_fae():
             hover_tab = ttk.Frame(self._notebook, style="Surface.TFrame")
             self._notebook.add(hover_tab, text="調適")
             self._build_hover_palm_tab(hover_tab)
@@ -3607,6 +3608,22 @@ class HIDToolApp(tk.Tk):
                         break
         return entries
 
+    def _find_phy_button_entries(self, fields: List[HIDField]) -> List[Tuple[HIDField, int]]:
+        """找出 usage page 0x09（實體按鍵，排除 FF01-like 廠商欄位）的所有欄位項目。
+        單一裝置 Hybrid 檢視與全裝置模式共用，避免兩邊各寫一份而漏掉其中一邊。"""
+        entries: List[Tuple[HIDField, int]] = []
+        for hf in fields:
+            if hf.is_vendor or self._is_byte_expanded_field(hf):
+                continue
+            if hf.usage_page != 0x09:
+                continue
+            first_usage = hf.usages[0] if hf.usages else 0
+            if (hf.usage_page, first_usage) in self._FF01_LIKE:
+                continue
+            for i in range(hf.report_count):
+                entries.append((hf, i))
+        return entries
+
     def _setup_hybrid_columns(self, input_fields: List[HIDField]) -> bool:
         usage_entries = self._build_touch_usage_entries(input_fields)
         if not usage_entries["ContactID"] or not (usage_entries["X"] and usage_entries["Y"]):
@@ -3689,23 +3706,15 @@ class HIDToolApp(tk.Tk):
             col_defs.append({"col_id": "ContactCount", "label": "Count", "width": 60, "kind": "common", "field_ref": None, "value_index": -1, "byte_index": -1})
 
         # Button fields (usage page 0x09) — stored in _hybrid_common for value reading, merged into ConfTip
-        for hf in input_fields:
-            if hf.is_vendor or self._is_byte_expanded_field(hf):
-                continue
-            if hf.usage_page != 0x09:
-                continue
-            first_usage = hf.usages[0] if hf.usages else 0
-            if (hf.usage_page, first_usage) in self._FF01_LIKE:
-                continue
-            for i in range(hf.report_count):
-                usage = hf.usages[i] if i < len(hf.usages) else (hf.usages[-1] if hf.usages else 0)
-                key = f"btn_{usage:02X}"
-                if key not in self._hybrid_common:
-                    self._hybrid_common[key] = (hf, i)
+        for hf, i in self._find_phy_button_entries(input_fields):
+            usage = hf.usages[i] if i < len(hf.usages) else (hf.usages[-1] if hf.usages else 0)
+            key = f"btn_{usage:02X}"
+            if key not in self._hybrid_common:
+                self._hybrid_common[key] = (hf, i)
 
         # Status column goes here — after touch/common fields, before FF01
         # 合併 InRange / Tip / Eraser / Invert / BarrelSwitch，僅列出值為 1 的旗標名稱
-        col_defs.append({"col_id": "Status", "label": "Status", "width": 180, "kind": "group", "field_ref": None, "value_index": -1, "byte_index": -1})
+        col_defs.append({"col_id": "Status", "label": "Status", "width": 260, "kind": "group", "field_ref": None, "value_index": -1, "byte_index": -1})
 
         _vu_col_w = {"Hex": 58, "Dec": 42, "Bin": 78}.get(self._ff01_fmt.get(), 58)
         for hf in input_fields:
@@ -4070,7 +4079,7 @@ class HIDToolApp(tk.Tk):
                             col_defs.append({
                                 "col_id":      "Status",
                                 "label":       "Status",
-                                "width":       180,
+                                "width":       260,
                                 "field_ref":   None,
                                 "value_index": -1,
                                 "byte_index":  -1,
@@ -4248,7 +4257,7 @@ class HIDToolApp(tk.Tk):
     def _ingest_packet(self, pkt: dict, gap_threshold: float):
         """單一封包進管線：判斷新幀、更新狀態、填表格與畫布。
         即時監聽與回放共用，確保兩者行為完全一致。"""
-        if self._is_engineer():
+        if self._is_engineer() or self._is_fae():
             self._hover_handle_packet(pkt)
         if self._all_digi_mode:
             self._handle_digi_packet(pkt)
@@ -4569,7 +4578,7 @@ class HIDToolApp(tk.Tk):
         ("XTilt",        "XTilt",      55),
         ("YTilt",        "YTilt",      55),
         ("Azimuth",      "Azim",       55),
-        ("Status",       "Status",    150),
+        ("Status",       "Status",    260),
     ]
 
     def _setup_all_digi_columns(self):
@@ -4606,7 +4615,15 @@ class HIDToolApp(tk.Tk):
         for rid in sorted(set(f.report_id for f in input_fields)):
             rf = [f for f in input_fields if f.report_id == rid]
             entries = self._build_touch_usage_entries(rf)
+            buttons = self._find_phy_button_entries(rf)
             if not (entries["X"] and entries["Y"]):
+                if buttons:
+                    # 沒有 X/Y 的獨立實體按鍵 report（沒有觸控接點），
+                    # 仍要記錄下來，回放/監聽時才有辦法顯示 phyButton。
+                    by_rid[rid] = {"groups": [], "buttons": buttons,
+                                   "scan": None, "count": None, "press": None,
+                                   "xtilt": None, "ytilt": None, "azim": None,
+                                   "xr": (0, 0), "yr": (0, 0)}
                 continue
             gc = max(len(entries["ContactID"]), len(entries["X"]),
                      len(entries["Y"]), len(entries["TipSwitch"]), 1)
@@ -4626,6 +4643,7 @@ class HIDToolApp(tk.Tk):
             xhf = entries["X"][0][0]
             yhf = entries["Y"][0][0]
             by_rid[rid] = {"groups": groups,
+                           "buttons": buttons,
                            "scan":  _find(0x0D, 0x56),   # ScanTime
                            "count": _find(0x0D, 0x54),   # ContactCount
                            "press": _find(0x0D, 0x30),   # TipPressure（手寫筆）
@@ -4758,6 +4776,10 @@ class HIDToolApp(tk.Tk):
         xtilt = rd(ctx.get("xtilt"))
         ytilt = rd(ctx.get("ytilt"))
         azim  = rd(ctx.get("azim"))
+        btn_active = next(
+            (v for v in (rd(e) for e in ctx.get("buttons", ())) if v not in ("", 0, None)),
+            None,
+        )
         try:
             active = int(count)
         except (TypeError, ValueError):
@@ -4778,9 +4800,15 @@ class HIDToolApp(tk.Tk):
                 "Confidence": rd(g["Confidence"]), "InRange": rd(g["InRange"]),
                 "TipSwitch": tip, "Eraser": rd(g["Eraser"]),
                 "Invert": rd(g["Invert"]), "BarrelSwitch": rd(g["BarrelSwitch"]),
+                "phyButton": btn_active,
             })
             rows.append([label, scan, count, slot, cid, x, y,
                          press, w, h, xtilt, ytilt, azim, status])
+        if not rows and btn_active:
+            # 沒有觸控接點但有實體按鍵事件（獨立按鍵 report），仍要顯示一列
+            rows.append([label, scan, count, "", "", "", "",
+                         press, "", "", xtilt, ytilt, azim,
+                         self._merge_status({"phyButton": btn_active})])
         return rows
 
     def _handle_digi_packet(self, pkt: dict):
@@ -7792,7 +7820,7 @@ class HIDToolApp(tk.Tk):
         ("XTilt",        "XTilt",      55),
         ("YTilt",        "YTilt",      55),
         ("Azimuth",      "Azim",       55),
-        ("Status",       "Status",    150),
+        ("Status",       "Status",    260),
     ]
 
     # I2C-HID 指令解析表：跟監聽分頁一樣改用 FastTable（Text 自繪），
