@@ -214,8 +214,7 @@ def extract_hover_report(data: bytes, fields=(), cached_offset=None):
                 )
                 if sample:
                     return sample, "descriptor", offset
-    sample = decode_hover_payload(payload[-PAYLOAD_SIZE:], strict=True)
-    return (sample, "tail fallback", None) if sample else None
+    return None
 
 
 MAIN_FLAG_KEYS = (
