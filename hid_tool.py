@@ -515,8 +515,11 @@ class HIDToolApp(tk.Tk):
         self._hover_raw_samples = collections.deque(maxlen=self._MONITOR_LOG_MAX)
         self._hover_rows = collections.deque(maxlen=self._MONITOR_LOG_MAX)
         self._hover_first_time: Optional[float] = None
-        self._hover_tree_rows = 0
         self._hover_field_cache = {}
+        # 即時完成段數：逐封包增量更新（見 _hover_update_seq_progress），
+        # 避免每個封包都把 _hover_raw_samples（上限 10 萬筆）整個重新掃一次。
+        self._hover_seq_active = {}
+        self._hover_seq_counts = {label: 0 for label in ("Finger", "Hover", "Thumb")}
 
         # Command device (separate from monitor device)
         self._cmd_dev:           Optional[dict] = None  # None = use _selected_dev
@@ -1166,42 +1169,34 @@ class HIDToolApp(tk.Tk):
         self._notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed, add="+")
 
     def _build_hover_palm_tab(self, parent):
-        intro = ttk.Frame(parent)
-        intro.pack(fill=tk.X, padx=10, pady=(10, 4))
-        ttk.Label(
-            intro,
-            text="FT5452 ReportHoverPalmTune（12 bytes 調適資料）",
-            font=self._FONT_UI_BOLD,
-        ).pack(side=tk.LEFT)
-        ttk.Label(
-            intro,
-            text="  HoverPalm 直接對應 AppHoverFingerVote 判斷條件。",
-            style="Muted.TLabel",
-        ).pack(side=tk.LEFT)
-
         self._hover_param_cells = {}
-        param_nb = ttk.Notebook(parent, height=self._sx(180))
-        param_nb.pack(fill=tk.X, padx=10, pady=(0, 5))
-        for group_name, items in HOVER_PARAMETER_GROUPS[:1]:
-            page = ttk.Frame(param_nb, padding=(8, 6))
-            param_nb.add(page, text=group_name)
-            for index, (key, label) in enumerate(items):
-                row, pair = divmod(index, 3)
-                col = pair * 2
-                ttk.Label(page, text=label + ":").grid(
-                    row=row, column=col, sticky="e", padx=(3, 2), pady=2
-                )
-                var = tk.StringVar(value=str(HOVER_DEFAULT_PARAMS[key]))
-                self._hover_param_vars[key] = var
-                cell = ttk.Frame(page)
-                cell.grid(row=row, column=col + 1, sticky="w", padx=(0, 8), pady=2)
-                self._hover_param_cells[key] = cell
-                ttk.Label(cell, textvariable=var, width=8, anchor="w").pack(
-                    side=tk.LEFT
-                )
+        group_name, items = HOVER_PARAMETER_GROUPS[0]
+        param_box = ttk.LabelFrame(
+            parent, text="{}（FT5452 ReportHoverPalmTune，對應 AppHoverFingerVote 判斷條件）".format(group_name),
+            padding=(8, 6), style="Section.TLabelframe",
+        )
+        param_box.pack(fill=tk.X, padx=10, pady=(10, 6))
+        for index, (key, label) in enumerate(items):
+            row, pair = divmod(index, 3)
+            col = pair * 2
+            ttk.Label(param_box, text=label + ":").grid(
+                row=row, column=col, sticky="e", padx=(3, 2), pady=2
+            )
+            var = tk.StringVar(value=str(HOVER_DEFAULT_PARAMS[key]))
+            self._hover_param_vars[key] = var
+            cell = ttk.Frame(param_box)
+            cell.grid(row=row, column=col + 1, sticky="w", padx=(0, 8), pady=2)
+            self._hover_param_cells[key] = cell
+            ttk.Label(cell, textvariable=var, width=8, anchor="w").pack(
+                side=tk.LEFT
+            )
 
-        controls = ttk.Frame(parent)
-        controls.pack(fill=tk.X, padx=10, pady=(2, 6))
+        record_box = ttk.LabelFrame(
+            parent, text="錄製 / 分析", padding=(8, 6), style="Section.TLabelframe",
+        )
+        record_box.pack(fill=tk.X, padx=10, pady=(0, 6))
+        controls = ttk.Frame(record_box)
+        controls.pack(fill=tk.X)
         ttk.Label(controls, text="錄製標籤：").pack(side=tk.LEFT)
         self._hover_label_var = tk.StringVar(value="未標記")
         ttk.Combobox(
@@ -1215,18 +1210,21 @@ class HIDToolApp(tk.Tk):
         ttk.Button(
             controls, text="清除", command=self._hover_clear
         ).pack(side=tk.RIGHT)
+
+        status_row = ttk.Frame(record_box)
+        status_row.pack(fill=tk.X, pady=(6, 0))
         self._hover_status_var = tk.StringVar(
             value="等待 ReportHoverPalmTune 除錯資料…"
         )
         ttk.Label(
-            controls, textvariable=self._hover_status_var, style="Muted.TLabel"
-        ).pack(side=tk.LEFT, padx=12)
+            status_row, textvariable=self._hover_status_var, style="Muted.TLabel"
+        ).pack(side=tk.LEFT)
         self._hover_progress_var = tk.StringVar(value="")
         self._hover_progress_label = ttk.Label(
-            controls, textvariable=self._hover_progress_var, style="Muted.TLabel"
+            status_row, textvariable=self._hover_progress_var, style="Muted.TLabel"
         )
         self._hover_progress_bar = ttk.Progressbar(
-            controls, mode="determinate", length=150, maximum=1
+            status_row, mode="determinate", length=150, maximum=1
         )
         self._hover_progress_label.pack(side=tk.LEFT, padx=(8, 2))
         self._hover_progress_bar.pack(side=tk.LEFT, padx=(0, 8))
@@ -1234,32 +1232,39 @@ class HIDToolApp(tk.Tk):
         self._hover_progress_bar.pack_forget()
 
         ttk.Label(
-            parent,
+            record_box,
             text="調適資料會在背景保留供分析；此頁不顯示逐筆 log。僅支援單 point 錄製；兩指或多 point 會排除，不計入 30 段。每類需完成 30 段 Touch#1〜6 才能分析。",
             style="Muted.TLabel",
             justify=tk.LEFT,
-        ).pack(fill=tk.X, padx=12, pady=(12, 8))
+            wraplength=self._sx(1100),
+        ).pack(fill=tk.X, pady=(6, 0))
+
+        result_box = ttk.LabelFrame(
+            parent, text="分析結果", padding=(8, 6), style="Section.TLabelframe",
+        )
+        result_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
         self._hover_accuracy_var = tk.StringVar(
             value="成功率：尚未分析"
         )
         ttk.Label(
-            parent,
+            result_box,
             textvariable=self._hover_accuracy_var,
             style="FieldLabel.TLabel",
+            font=self._FONT_UI_BOLD,
             justify=tk.LEFT,
             anchor="w",
-        ).pack(fill=tk.X, padx=12, pady=(4, 2))
+        ).pack(fill=tk.X, pady=(0, 6))
         self._hover_result_var = tk.StringVar(
             value="尚未執行參數分析。"
         )
         ttk.Label(
-            parent,
+            result_box,
             textvariable=self._hover_result_var,
             style="FieldLabel.TLabel",
             justify=tk.LEFT,
             anchor="nw",
             wraplength=self._sx(1100),
-        ).pack(fill=tk.X, padx=12, pady=(4, 10))
+        ).pack(fill=tk.X)
 
     def _hover_read_params(self):
         values = {}
@@ -1304,6 +1309,12 @@ class HIDToolApp(tk.Tk):
         device_key = self._dev_match_key(device_name)
         cache_key = (device_key, report_id, len(data) - 1)
         cached = self._hover_field_cache.get(cache_key)
+        if cached is not None:
+            # offset 已知：不用重建欄位候選清單（extract_hover_report 命中
+            # cache 時根本不會用到 fields），這條路徑每個封包都會跑一次。
+            found = extract_hover_report(data, (), cached)
+            if found:
+                return found[0], found[1]
         candidates = []
         for path, fields in self._descriptors.items():
             rank = 0 if device_key and self._dev_match_key(path) == device_key else 1
@@ -1331,49 +1342,52 @@ class HIDToolApp(tk.Tk):
         label = getattr(self, "_hover_label_var", tk.StringVar(value="Unlabeled")).get()
         raw_item = (sample, rx_time, device, source, label)
         self._hover_raw_samples.append(raw_item)
+        self._hover_update_seq_progress(raw_item)
         evaluation = self._hover_evaluator.process(sample, device)
         self._hover_store_result(raw_item, evaluation)
 
-    def _hover_completed_sequence_counts(self):
-        counts = {label: 0 for label in ("Finger", "Hover", "Thumb")}
-        active = {}
+    def _hover_update_seq_progress(self, raw_item):
+        """增量更新「完成段數」計數，供即時狀態列顯示用（O(1) 而非重掃全部樣本）。
 
-        def complete(samples):
-            # A mixed contact ID means a multi-point operation; exclude it.
-            return (
-                {item.touch_count for item in samples} >= set(range(1, 7))
-                and len({item.contact_id for item in samples}) == 1
-            )
-
-        for raw_item in list(self._hover_raw_samples):
-            sample, _rx_time, device, _source = raw_item[:4]
-            label = raw_item[4] if len(raw_item) > 4 else "Unlabeled"
-            label = str(label).strip().title()
-            if label not in counts:
-                continue
-            key = (device, label)
-            current = active.get(key)
-            if (
-                current is None
-                or current["label"] != label
-                or sample.touch_count <= current["last_count"]
-            ):
-                if current and complete(current["samples"]):
-                    counts[current["label"]] += 1
-                current = {"label": label, "last_count": 0, "samples": []}
-                active[key] = current
-            current["samples"].append(sample)
-            current["last_count"] = sample.touch_count
-
-        for current in active.values():
-            if complete(current["samples"]):
-                counts[current["label"]] += 1
-        return counts
+        邏輯對應 _hover_completed_sequence_counts：同一個 (device, label) 底下，
+        touch_count 沒有下降就算同一段；一旦該段涵蓋 Touch#1~6 且只有單一
+        contact_id 就算完成一次，若後續混入第二個 contact_id 則視為多指操作、
+        取消這次計數（保留與原本全量重算相同的排除規則）。
+        """
+        sample, _rx_time, device, _source = raw_item[:4]
+        label = raw_item[4] if len(raw_item) > 4 else "Unlabeled"
+        label = str(label).strip().title()
+        if label not in self._hover_seq_counts:
+            return
+        key = (device, label)
+        current = self._hover_seq_active.get(key)
+        if (
+            current is None
+            or current["label"] != label
+            or sample.touch_count <= current["last_count"]
+        ):
+            current = {
+                "label": label, "last_count": 0,
+                "touch_counts": set(), "contact_ids": set(), "counted": False,
+            }
+            self._hover_seq_active[key] = current
+        current["touch_counts"].add(sample.touch_count)
+        current["contact_ids"].add(sample.contact_id)
+        current["last_count"] = sample.touch_count
+        complete = (
+            current["touch_counts"] >= set(range(1, 7))
+            and len(current["contact_ids"]) == 1
+        )
+        if complete and not current["counted"]:
+            current["counted"] = True
+            self._hover_seq_counts[label] += 1
+        elif not complete and current["counted"]:
+            current["counted"] = False
+            self._hover_seq_counts[label] -= 1
 
     def _hover_progress_text(self):
-        counts = self._hover_completed_sequence_counts()
         return " / ".join(
-            "{} {}/30".format(label, counts[label])
+            "{} {}/30".format(label, self._hover_seq_counts.get(label, 0))
             for label in ("Finger", "Hover", "Thumb")
         )
 
@@ -1420,60 +1434,21 @@ class HIDToolApp(tk.Tk):
             "raw_hex": sample.raw.hex(" ").upper(),
         }
         self._hover_rows.append(record)
-        if display:
-            if hasattr(self, "_hover_tree"):
-                self._hover_insert_tree(record)
-            if hasattr(self, "_hover_status_var"):
-                self._hover_status_var.set(
-                    "已收到 {} 筆除錯資料；完成段數：{}（每類目標 30 段）".format(
-                        len(self._hover_rows), self._hover_progress_text()
-                    )
+        if display and hasattr(self, "_hover_status_var"):
+            self._hover_status_var.set(
+                "已收到 {} 筆除錯資料；完成段數：{}（每類目標 30 段）".format(
+                    len(self._hover_rows), self._hover_progress_text()
                 )
-
-
-    def _hover_insert_tree(self, row):
-        values = (
-            row["seq"], f'{row["time_s"]:.4f}', row["source"],
-            row["label"], row["contact_id"], row["touch_count"], row["area"], row["area50"],
-            row["area20"], row["area10"], row["peak_diff"], row["tx_range"],
-            row["rx_range"], row["fill_rate"], row["confidence"], row["fw_vote"],
-            row["thumb_score"], row["ratio_x10"], row["hover_base"],
-            row["low_peak_hover"], row["high_peak_hover"], row["hover_flag"],
-            row["wide_hover_flag"], row["finger_flag"],
-            row["strong_thumb_flag"], row["area_sum"],
-            row["scope_sum"], row["hover_count"], row["wide_count"],
-            row["thumb_count"], row["direct_guard"], row["calculated_vote"],
-            row["match"],
-        )
-        tag = (
-            "mismatch" if row["match"] == "DIFF"
-            else "hover" if row["calculated_vote"] == 3
-            else "palm" if row["calculated_vote"] == 2 else ""
-        )
-        self._hover_tree.insert("", tk.END, values=values, tags=(tag,) if tag else ())
-        self._hover_tree_rows += 1
-        if self._hover_tree_rows > 2500:
-            children = self._hover_tree.get_children()
-            if children:
-                self._hover_tree.delete(children[0])
-                self._hover_tree_rows -= 1
-        self._hover_tree.yview_moveto(1.0)
+            )
 
     def _hover_recalculate(self):
         raw_samples = list(self._hover_raw_samples)
         self._hover_evaluator = HoverPalmEvaluator(self._hover_params)
         self._hover_rows.clear()
         self._hover_first_time = raw_samples[0][1] if raw_samples else None
-        if hasattr(self, "_hover_tree"):
-            for item in self._hover_tree.get_children():
-                self._hover_tree.delete(item)
-        self._hover_tree_rows = 0
         for raw_item in raw_samples:
             evaluation = self._hover_evaluator.process(raw_item[0], raw_item[2])
             self._hover_store_result(raw_item, evaluation, display=False)
-        if hasattr(self, "_hover_tree"):
-            for row in list(self._hover_rows)[-2500:]:
-                self._hover_insert_tree(row)
         if hasattr(self, "_hover_status_var"):
             self._hover_status_var.set(
                 "已用目前參數重新計算背景資料 {} 筆；完成段數：{}（每類目標 30 段）".format(
@@ -1481,17 +1456,14 @@ class HIDToolApp(tk.Tk):
                 )
             )
 
-
     def _hover_clear(self, silent=False):
         self._hover_raw_samples.clear()
         self._hover_rows.clear()
         self._hover_evaluator = HoverPalmEvaluator(self._hover_params)
         self._hover_first_time = None
-        self._hover_tree_rows = 0
         self._hover_field_cache.clear()
-        if hasattr(self, "_hover_tree"):
-            for item in self._hover_tree.get_children():
-                self._hover_tree.delete(item)
+        self._hover_seq_active.clear()
+        self._hover_seq_counts = {label: 0 for label in ("Finger", "Hover", "Thumb")}
         if hasattr(self, "_hover_accuracy_var"):
             self._hover_accuracy_var.set("成功率：尚未分析")
         if not silent and hasattr(self, "_hover_status_var"):
@@ -1625,46 +1597,32 @@ class HIDToolApp(tk.Tk):
         )
         if hasattr(self, "_hover_accuracy_var"):
             self._hover_accuracy_var.set(short_summary)
-        if hasattr(self, "_hover_result_var"):
-            self._hover_result_var.set(short_summary)
         if hasattr(self, "_hover_status_var"):
             self._hover_status_var.set("分析完成：" + short_summary)
-        changes = []
-        macro_names = dict(HOVER_FW_DEFINE_MAP)
-        for key in HOVER_MAIN_FLAG_KEYS:
-            if old_main[key] != best[key]:
-                changes.append("{}: {} -> {}".format(
-                    macro_names.get(key, key), old_main[key], best[key]))
-        change_text = "\n".join(changes) or "\u76ee\u524d\u4e3b\u8981 Hover Flags \u4e0d\u9700\u4fee\u6b63"
-        confusion = ", ".join("{}:{} ".format(key, value)
-                              for key, value in sorted(after["confusion"].items())).strip() or "\u7121"
-        counts = before.get("class_counts", {})
-        frames = before.get("class_frames", {})
-        data_summary = " / ".join(
-            "{} {} \u6bb5/{} \u5e40".format(label, counts.get(label, 0), frames.get(label, 0))
-            for label in ("Finger", "Hover", "Thumb"))
-        delta = after["accuracy"] - before["accuracy"]
-        if hasattr(self, "_hover_accuracy_var"):
-            self._hover_accuracy_var.set(
-                "成功率：修改前 {:.1%} ({}/{})  →  修改後 {:.1%} ({}/{})  提升 {:+.1%}".format(
-                    before["accuracy"], before["correct"], before["total"],
-                    after["accuracy"], after["correct"], after["total"], delta,
-                )
-            )
-        result_text = (
-            "\u5206\u6790\u7d50\u679c\uff08\u5df2\u5b8c\u6210\uff09\n"
-            "\u9304\u88fd\u8cc7\u6599\uff1a{}\n"
-            "\u4fee\u6539\u524d\u6210\u529f\u7387\uff08\u6e96\u78ba\u7387\uff09\uff1a{:.1%} ({}/{})\n"
-            "\u4fee\u6539\u5f8c\u6210\u529f\u7387\uff08\u6e96\u78ba\u7387\uff09\uff1a{:.1%} ({}/{})  ({:+.1%})\n"
-            "\u6df7\u6dc6\uff08\u4fee\u6539\u5f8c\uff09\uff1a{}\n"
-            "PeakDiff \u53c3\u6578\u4e5f\u6709\u53c3\u8207\u6700\u4f73\u5316\uff1b\u672a\u5217\u51fa\u4ee3\u8868\u7dad\u6301\u539f\u503c\u3002\n"
-            "\u5efa\u8b70\u8b8a\u66f4\uff08\u7d05\u8272\u820a\u503c -> \u7da0\u8272\u65b0\u503c\uff09\uff1a\n{}"
-        ).format(
-            data_summary,
-            before["accuracy"], before["correct"], before["total"],
-            after["accuracy"], after["correct"], after["total"], delta,
-            confusion, change_text,
-        )
+        try:
+            changes = []
+            macro_names = dict(HOVER_FW_DEFINE_MAP)
+            for key in HOVER_MAIN_FLAG_KEYS:
+                if old_main[key] != best[key]:
+                    changes.append("{}: {} -> {}".format(
+                        macro_names.get(key, key), old_main[key], best[key]))
+            change_text = "\n".join(changes) or "目前主要 Hover Flags 不需修正"
+            confusion = ", ".join("{}:{} ".format(key, value)
+                                  for key, value in sorted(after["confusion"].items())).strip() or "無"
+            counts = before.get("class_counts", {})
+            frames = before.get("class_frames", {})
+            data_summary = " / ".join(
+                "{} {} 段/{} 幀".format(label, counts.get(label, 0), frames.get(label, 0))
+                for label in ("Finger", "Hover", "Thumb"))
+            result_text = (
+                "錄製資料：{}\n"
+                "混淆（修改後）：{}\n"
+                "PeakDiff 參數也有參與最佳化；未列出代表維持原值。\n"
+                "建議變更（紅色舊值 -> 綠色新值）：\n{}"
+            ).format(data_summary, confusion, change_text)
+        except Exception as exc:
+            traceback.print_exc()
+            result_text = "詳細分析結果整理失敗：{}\n請查看主控台錯誤訊息。".format(exc)
         if hasattr(self, "_hover_result_var"):
             self._hover_result_var.set(result_text)
         # Recalculate the retained rows after the summary is visible.
