@@ -154,7 +154,7 @@ class _HangWatchdog:
 class HIDToolApp(tk.Tk):
     _APP_NAME          = "RE024 Touch Inspector"
     _APP_AUTHOR        = "Shane.Lin"
-    _APP_VERSION_LABEL = "v1.9.25"
+    _APP_VERSION_LABEL = "v1.9.26"
     _APP_VERSION_TIME  = "2026-09-07"
 
     # 版本(edition)：Engineer = 全功能；FAE / Customer = 閹割版
@@ -492,6 +492,7 @@ class HIDToolApp(tk.Tk):
 
         # Descriptor conformance-check state（比對實際回報值 vs descriptor 宣告的格式）
         self._field_error_count:   int                     = 0
+        self._field_error_history: List[str]                = []  # 供右上角 FMT 點擊查看明細
 
         # Record / replay state（監聽回放）
         self._record_buf:       collections.deque        = collections.deque(maxlen=self._RECORD_MAX)
@@ -1017,6 +1018,8 @@ class HIDToolApp(tk.Tk):
         self._top_desc_result_chip.bind("<Button-1>", self._cmp_show_quick_summary)
         self._top_desc_result_chip.pack(side=tk.RIGHT, padx=(6, 0))
         self._top_field_error_chip = _chip(self._top_field_error_var, "#fff1d6", "#b45309")
+        self._top_field_error_chip.configure(cursor="hand2")
+        self._top_field_error_chip.bind("<Button-1>", self._field_error_show_summary)
         self._top_field_error_chip.pack(side=tk.RIGHT, padx=(6, 0))
         _chip(self._top_error_var,  "#fce9e9", self._RED_DARK).pack(side=tk.RIGHT, padx=(6, 0))
         _chip(self._top_rate_var,   "#e5f5eb", self._GREEN_DARK).pack(side=tk.RIGHT, padx=(6, 0))
@@ -2845,6 +2848,32 @@ class HIDToolApp(tk.Tk):
         text.config(state=tk.DISABLED)
         ttk.Button(body, text="關閉", command=win.destroy).pack(anchor=tk.E, pady=(8, 0))
 
+    def _field_error_show_summary(self, event=None):
+        """點擊右上角 FMT 計數，列出目前累積的欄位格式錯誤明細（哪個 frame、哪裡不符 descriptor）。"""
+        lines = [f"FMT 格式錯誤：共 {self._field_error_count} 筆", ""]
+        if not self._field_error_history:
+            lines.append("目前沒有記錄到格式錯誤。")
+        else:
+            lines.extend(self._field_error_history[-500:])
+            if len(self._field_error_history) > 500:
+                lines.insert(2, f"（只顯示最近 500 筆，共 {len(self._field_error_history)} 筆）")
+
+        win = tk.Toplevel(self)
+        win.title("欄位格式錯誤明細")
+        self._set_window_icon(win)
+        win.geometry(f"{self._sx(720)}x{self._sx(480)}")
+        win.minsize(self._sx(520), self._sx(320))
+        win.configure(bg=self._BG)
+        body = ttk.Frame(win, padding=10)
+        body.pack(fill=tk.BOTH, expand=True)
+        text = scrolledtext.ScrolledText(body, font=("Consolas", 10), wrap=tk.WORD,
+                                         relief=tk.FLAT)
+        self._style_log_text(text)
+        text.pack(fill=tk.BOTH, expand=True)
+        text.insert("1.0", "\n".join(lines))
+        text.config(state=tk.DISABLED)
+        ttk.Button(body, text="關閉", command=win.destroy).pack(anchor=tk.E, pady=(8, 0))
+
     def _cmp_start_quick_check(self):
         """背景自動比對目前裝置，供右上角 PASS / FAIL 使用，不必開啟比對視窗。"""
         dev = self._selected_dev
@@ -3910,6 +3939,7 @@ class HIDToolApp(tk.Tk):
         self._frame_contact_seen = 0
         self._error_count = 0
         self._field_error_count = 0
+        self._field_error_history = []
         self._error_var.set("")
         self._field_error_var.set("")
         if hasattr(self, "_top_error_var"):
@@ -5175,6 +5205,10 @@ class HIDToolApp(tk.Tk):
                     row_tags_final = row_tags + ("field_error",)
                     self._field_error_count += 1
                     self._field_error_var.set(f"FMT:{self._field_error_count} | {field_errors[0]}")
+                    self._field_error_history.append(
+                        f"#{self._field_error_count} Frame {self._frame_seq} 0x{report_id:02X} "
+                        f"slot {group['slot']}: {'; '.join(field_errors)}"
+                    )
                     if hasattr(self, "_top_field_error_var"):
                         self._top_field_error_var.set(f"FMT {self._field_error_count}")
                 self._append_monitor_row(pkt, headers, row, row_tags_final, error_reasons)
@@ -5279,6 +5313,7 @@ class HIDToolApp(tk.Tk):
         self._table_row_seq = 0
         self._error_count = 0
         self._field_error_count = 0
+        self._field_error_history = []
         self._error_var.set("")
         self._field_error_var.set("")
         if hasattr(self, "_top_error_var"):
@@ -5477,6 +5512,7 @@ class HIDToolApp(tk.Tk):
         self._table_row_seq = 0
         self._error_count = 0
         self._field_error_count = 0
+        self._field_error_history = []
         self._error_var.set("")
         self._field_error_var.set("")
         if hasattr(self, "_top_error_var"):
