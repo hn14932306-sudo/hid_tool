@@ -122,6 +122,23 @@ def device_collection(dev: dict) -> int:
     return int(m.group(1)) if m else -1
 
 
+def device_path_to_instance_id(path) -> Optional[str]:
+    """把 hidapi 裝置介面路徑轉成裝置管理員用的 PnP Instance ID，
+    可直接餵給 PowerShell Disable-PnpDevice / Enable-PnpDevice -InstanceId。
+
+    例：\\\\?\\hid#vid_0911&pid_1234&col01#7&2a1b3c4d&0&0000#{4d1e...}
+     -> HID\\VID_0911&PID_1234&COL01\\7&2A1B3C4D&0&0000
+    """
+    if isinstance(path, bytes):
+        path = path.decode("utf-8", errors="replace")
+    if not path.startswith("\\\\?\\"):
+        return None
+    parts = path[4:].split("#")
+    if len(parts) < 3:
+        return None
+    return "\\".join(parts[:-1]).upper()
+
+
 def format_device_label(dev: dict) -> str:
     vid  = dev.get("vendor_id",  0)
     pid  = dev.get("product_id", 0)

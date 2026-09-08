@@ -13,6 +13,7 @@ import math
 import os
 import queue
 import re
+import subprocess
 import sys
 import traceback
 import threading
@@ -78,7 +79,94 @@ from hid_device import (
     set_output_report_cmd,
     read_interrupt,
     parse_hex_bytes,
+    device_path_to_instance_id,
 )
+
+
+# ---------------------------------------------------------------------------
+# 模擬拔插裝置：對裝置管理員裡的裝置停用/啟用。需要本程式以系統管理員身分
+# 執行，否則會收到拒絕存取錯誤。
+#
+# 停用/啟用本身改用 pnputil.exe（/disable-device、/enable-device），不用
+# PowerShell 的 Disable-PnpDevice/Enable-PnpDevice cmdlet ——那組 cmdlet 是
+# 靠底層 WMI Win32_PnPEntity.Disable()/Enable() 實作，對不少裝置（尤其是
+# USB composite 裝置底下的 MI_xx 子裝置）會回一般性失敗 HRESULT
+# 0x80041001，是 Windows 已知限制；pnputil 走 CM_Disable_DevNode 這條路，
+# 同樣的裝置改用它就能動。查上層裝置（DEVPKEY_Device_Parent）維持用
+# PowerShell 的 Get-PnpDeviceProperty，那個沒有這個問題。
+# ---------------------------------------------------------------------------
+
+def _pnp_device_action(action: str, instance_id: str) -> Tuple[bool, str]:
+    """action: 'disable' 或 'enable'。"""
+    flag = "/disable-device" if action == "disable" else "/enable-device"
+    try:
+        result = subprocess.run(
+            ["pnputil", flag, instance_id],
+            capture_output=True, text=True, timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+    except Exception as e:
+        return False, str(e)
+    output = ((result.stdout or "") + (result.stderr or "")).strip()
+    if result.returncode == 0:
+        return True, output or "OK"
+    return False, output or f"exit code {result.returncode}"
+
+
+def _pnp_get_parent_instance_id(instance_id: str) -> Tuple[bool, str]:
+    """把 HID Collection 的 instance id 轉成上一層『USB 輸入裝置』的 instance id
+    （DEVPKEY_Device_Parent）。停用/啟用要對這一層下手，Collection 只是同一個
+    USB 裝置底下的其中一個 Top Level Collection，停用它不會讓裝置真的斷線。"""
+    safe_id = instance_id.replace("'", "''")
+    ps_cmd = (
+        f"(Get-PnpDeviceProperty -InstanceId '{safe_id}' "
+        "-KeyName 'DEVPKEY_Device_Parent' -ErrorAction Stop).Data"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+            capture_output=True, text=True, timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+    except Exception as e:
+        return False, str(e)
+    if result.returncode != 0:
+        return False, (result.stderr or result.stdout or f"exit code {result.returncode}").strip()
+    parent = result.stdout.strip()
+    if not parent:
+        return False, "找不到父裝置（DEVPKEY_Device_Parent 為空）"
+    return True, parent
+
+
+def _pnp_get_status(instance_id: str) -> Tuple[bool, str]:
+    """查裝置目前的 Status/Problem（Get-PnpDevice）。回傳
+    (is_ok, detail)：is_ok=True 代表裝置狀態正常（沒有裝置管理員那顆黃色
+    驚嘆號）；enable 動作本身回成功只代表指令送達，不代表裝置真的啟動成
+    功，要另外查這個才知道有沒有黃色驚嘆號。"""
+    safe_id = instance_id.replace("'", "''")
+    ps_cmd = (
+        f"$d = Get-PnpDevice -InstanceId '{safe_id}' -ErrorAction Stop; "
+        "\"$($d.Status)|$($d.Problem)\""
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+            capture_output=True, text=True, timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+    except Exception as e:
+        return False, f"查詢裝置狀態失敗：{e}"
+    if result.returncode != 0:
+        return False, (result.stderr or result.stdout or f"exit code {result.returncode}").strip()
+    out = result.stdout.strip()
+    if "|" not in out:
+        return False, f"無法解析裝置狀態：{out}"
+    status, problem = out.split("|", 1)
+    status = status.strip()
+    problem = problem.strip()
+    is_ok = status.upper() == "OK"
+    detail = f"Status={status}" + (f", Problem={problem}" if problem and problem.upper() != "CM_PROB_NONE" else "")
+    return is_ok, detail
 
 
 # ---------------------------------------------------------------------------
@@ -154,8 +242,8 @@ class _HangWatchdog:
 class HIDToolApp(tk.Tk):
     _APP_NAME          = "RE024 Touch Inspector"
     _APP_AUTHOR        = "Shane.Lin"
-    _APP_VERSION_LABEL = "v1.9.26"
-    _APP_VERSION_TIME  = "2026-09-07"
+    _APP_VERSION_LABEL = "v1.9.27"
+    _APP_VERSION_TIME  = "2026-09-08"
 
     # 版本(edition)：Engineer = 全功能；FAE / Customer = 閹割版
     # 由 build 時產生的 _edition.py 決定（見 .spec），開發/沒有該檔時預設 Engineer。
@@ -1133,11 +1221,21 @@ class HIDToolApp(tk.Tk):
             self._notebook.add(send_tab, text="發送")
             self._build_send_tab(send_tab)
 
-        # 壓測分頁：Engineer 與 FAE 版皆可用（Customer 隱藏）
+        # 壓測分頁：Engineer 與 FAE 版皆可用（Customer 隱藏），內含
+        # 壓測 / 模擬拔插兩個子分頁
         if self._is_engineer() or self._is_fae():
             stress_tab = ttk.Frame(self._notebook, style="Surface.TFrame")
             self._notebook.add(stress_tab, text="壓測")
-            self._build_stress_tab(stress_tab)
+            stress_nb = ttk.Notebook(stress_tab)
+            stress_nb.pack(fill=tk.BOTH, expand=True)
+
+            stress_sub = ttk.Frame(stress_nb, style="Surface.TFrame")
+            stress_nb.add(stress_sub, text="壓測")
+            self._build_stress_tab(stress_sub)
+
+            unplug_sub = ttk.Frame(stress_nb, style="Surface.TFrame")
+            stress_nb.add(unplug_sub, text="模擬拔插")
+            self._build_unplug_tab(unplug_sub)
 
         if self._is_engineer():
             # 回放分頁：內含 Differ / DigiInfo 兩個子分頁
@@ -1941,6 +2039,9 @@ class HIDToolApp(tk.Tk):
         btn_row = ttk.Frame(parent)
         btn_row.pack(fill=tk.X, padx=8, pady=(0, 6))
         ttk.Button(btn_row, text="發送 (Set Report)", command=self._on_send).pack(side=tk.LEFT, padx=4)
+        self._add_checksum_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(btn_row, text="加上 Checksum", variable=self._add_checksum_var).pack(
+            side=tk.LEFT, padx=(8, 4))
         self._get_btn = ttk.Button(btn_row, text="Get Report", command=self._on_get_report)
         # 初始隱藏，切到 Feature 才顯示
 
@@ -5688,6 +5789,13 @@ class HIDToolApp(tk.Tk):
                 except Exception:
                     pass
 
+    @staticmethod
+    def _compute_checksum(data: list) -> int:
+        checksum = 0
+        for b in data[:5]:
+            checksum ^= b
+        return (checksum + 1) & 0xFF
+
     def _on_send(self):
         if not self._get_cmd_dev():
             self._send_log_append("[錯誤] 請先選擇一個裝置")
@@ -5707,6 +5815,11 @@ class HIDToolApp(tk.Tk):
         except ValueError:
             self._send_log_append("[錯誤] Data 格式錯誤，請使用十六進位")
             return
+
+        if self._add_checksum_var.get():
+            checksum = self._compute_checksum(data)
+            self._send_log_append(f"  [Checksum] 前5 bytes XOR+1 = 0x{checksum:02X}")
+            data = data + [checksum]
 
         threading.Thread(
             target=self._send_report,
@@ -5766,6 +5879,179 @@ class HIDToolApp(tk.Tk):
                 self._log_bytes(resp, self._send_log_append)
         except Exception as e:
             self._send_log_append(f"  [INT 錯誤] {e}")
+
+    # ------------------------------------------------------------------
+    # 模擬拔插裝置（壓測分頁的子分頁）
+    # ------------------------------------------------------------------
+
+    def _unplug_log_append(self, msg: str):
+        def _append():
+            self._unplug_log.configure(state="normal")
+            self._unplug_log.insert("end", msg + "\n")
+            self._unplug_log.see("end")
+            self._unplug_log.configure(state="disabled")
+        self.after(0, _append)
+
+    @staticmethod
+    def _pnp_denied_hint(msg: str) -> str:
+        if any(s in msg for s in (
+            "Access is denied", "拒絕存取", "存取被拒", "AccessDenied", "0x80070005",
+        )):
+            return "（提示：此功能需以系統管理員身分執行本程式）"
+        return ""
+
+    def _resolve_usb_parent_from_path(self, path) -> Tuple[Optional[str], Optional[str]]:
+        """從裝置路徑解析出對應的『USB 輸入裝置』（而非其中一個 Collection）
+        instance id。回傳 (instance_id, error_message)。"""
+        collection_id = device_path_to_instance_id(path)
+        if not collection_id:
+            return None, "無法從裝置路徑解析 PnP Instance ID"
+        ok, result = _pnp_get_parent_instance_id(collection_id)
+        if not ok:
+            return None, f"解析上層 USB 裝置失敗：{result} {self._pnp_denied_hint(result)}"
+        return result, None
+
+    def _resolve_unplug_target(self) -> Tuple[Optional[str], Optional[str]]:
+        """解析要操作的 USB 輸入裝置 Instance ID：優先即時解析目前選取的裝置；
+        解析不到時（常見情況：剛做完一輪拔插，裝置在停用期間從清單消失，UI
+        的裝置選擇被清空，重新上線後也沒有自動配回去）退回沿用上一次成功解析
+        過的 Instance ID——同一顆裝置軟體停用/啟用不會換 Instance ID，可以
+        放心沿用，這樣才能對同一顆裝置連續做拔插而不必每次都手動重選。"""
+        dev = self._get_cmd_dev()
+        if dev is not None:
+            instance_id, err = self._resolve_usb_parent_from_path(dev.get("path", b""))
+            if instance_id:
+                self._unplug_last_instance_id = instance_id
+                return instance_id, None
+            if self._unplug_last_instance_id:
+                self._unplug_log_append(f"  [警告] {err}，改用上次記住的 Instance ID")
+                return self._unplug_last_instance_id, None
+            return None, err
+        if self._unplug_last_instance_id:
+            self._unplug_log_append("  裝置清單中目前看不到裝置，沿用上次記住的 Instance ID")
+            return self._unplug_last_instance_id, None
+        return None, "請先選擇一個裝置"
+
+    def _check_enable_status(self, instance_id: str) -> bool:
+        """Enable 動作回成功後，另外查裝置的 Status/Problem 確認有沒有裝置
+        管理員的黃色驚嘆號（enable 指令送達 != 裝置真的啟動成功）。回傳
+        True 表示狀態正常。"""
+        is_ok, detail = _pnp_get_status(instance_id)
+        if is_ok:
+            self._unplug_log_append(f"  [狀態] 正常，無黃色驚嘆號（{detail}）")
+        else:
+            self._unplug_log_append(f"  [警告] 裝置狀態異常，疑似黃色驚嘆號（{detail}）")
+        return is_ok
+
+    def _run_pnp_action(self, action: str, verb: str):
+        instance_id, err = self._resolve_unplug_target()
+        if not instance_id:
+            self._unplug_log_append(f"  [錯誤] {err}")
+            return
+        self._unplug_log_append(f"  USB 輸入裝置 Instance ID：{instance_id}")
+        ok, msg = _pnp_device_action(action, instance_id)
+        if ok:
+            self._unplug_log_append(f"  [成功] 裝置已{verb}")
+            if action == "enable":
+                self._check_enable_status(instance_id)
+        else:
+            self._unplug_log_append(f"  [錯誤] {verb}失敗：{msg} {self._pnp_denied_hint(msg)}")
+
+    def _on_disable_device(self):
+        self._unplug_log_append("\n[模擬拔插] 停用 USB 輸入裝置")
+        threading.Thread(
+            target=self._run_pnp_action, args=("disable", "停用"),
+            daemon=True,
+        ).start()
+
+    def _on_enable_device(self):
+        self._unplug_log_append("\n[模擬拔插] 啟用 USB 輸入裝置")
+        threading.Thread(
+            target=self._run_pnp_action, args=("enable", "啟用"),
+            daemon=True,
+        ).start()
+
+    def _unplug_loop_toggle(self):
+        if self._unplug_loop_running:
+            self._unplug_loop_stop_requested = True
+            self._unplug_log_append("[連續拔插] 收到停止要求，完成目前這輪後停止...")
+        else:
+            self._unplug_loop_start()
+
+    def _unplug_loop_start(self):
+        try:
+            interval_ms = int(self._unplug_interval_var.get())
+            cycle_gap_ms = int(self._unplug_cycle_gap_var.get())
+            count = int(self._unplug_count_var.get())
+            if interval_ms < 0 or cycle_gap_ms < 0 or count < 0:
+                raise ValueError
+        except ValueError:
+            self._unplug_log_append("[錯誤] 間隔/次數必須是非負整數")
+            return
+        self._unplug_loop_running = True
+        self._unplug_loop_stop_requested = False
+        self._unplug_start_btn.config(text="停止", bg=self._RED, activebackground=self._RED_DARK)
+        count_label = str(count) if count else "無限"
+        self._unplug_progress_var.set(f"已完成 0 / {count_label} 次")
+        self._unplug_log_append(
+            f"\n[連續拔插] 開始（拔插間隔 {interval_ms}ms、每輪間隔 {cycle_gap_ms}ms、次數 {count_label}）"
+        )
+        threading.Thread(
+            target=self._unplug_loop_worker, args=(interval_ms, cycle_gap_ms, count),
+            daemon=True,
+        ).start()
+
+    def _unplug_loop_finish(self):
+        self._unplug_loop_running = False
+        self._unplug_start_btn.config(text="開始連續拔插", bg=self._GREEN, activebackground=self._GREEN_DARK)
+
+    def _unplug_loop_worker(self, interval_ms: int, cycle_gap_ms: int, count: int):
+        instance_id, err = self._resolve_unplug_target()
+        if not instance_id:
+            self._unplug_log_append(f"  [錯誤] {err}")
+            self.after(0, self._unplug_loop_finish)
+            return
+        self._unplug_log_append(f"  USB 輸入裝置 Instance ID：{instance_id}")
+        count_label = str(count) if count else "無限"
+        i = 0
+        problem_count = 0
+        while count == 0 or i < count:
+            i += 1
+            self._unplug_log_append(f"  -- 第 {i} 輪 --")
+            ok, msg = _pnp_device_action("disable", instance_id)
+            if not ok:
+                self._unplug_log_append(f"  [錯誤] 停用失敗：{msg} {self._pnp_denied_hint(msg)}")
+                break
+            self._unplug_log_append("  [成功] 裝置已停用")
+            time.sleep(interval_ms / 1000)
+            # 就算收到停止要求，也要把裝置重新啟用完再停，不留裝置在停用狀態。
+            ok, msg = _pnp_device_action("enable", instance_id)
+            had_problem = False
+            if ok:
+                self._unplug_log_append("  [成功] 裝置已重新啟用")
+                if not self._check_enable_status(instance_id):
+                    problem_count += 1
+                    had_problem = True
+            else:
+                self._unplug_log_append(f"  [錯誤] 啟用失敗：{msg} {self._pnp_denied_hint(msg)}")
+                break
+            problem_suffix = f"（異常 {problem_count} 次）" if problem_count else ""
+            self.after(0, lambda i=i, s=problem_suffix: self._unplug_progress_var.set(
+                f"已完成 {i} / {count_label} 次{s}"))
+            if had_problem and self._unplug_stop_on_problem_var.get():
+                self._unplug_log_append("[連續拔插] 偵測到黃色驚嘆號，自動停止")
+                break
+            if self._unplug_loop_stop_requested:
+                self._unplug_log_append("[連續拔插] 已依要求停止")
+                break
+            if count == 0 or i < count:
+                time.sleep(cycle_gap_ms / 1000)
+        else:
+            self._unplug_log_append(
+                f"[連續拔插] 已完成全部次數"
+                + (f"，其中 {problem_count} 次啟用後狀態異常" if problem_count else "")
+            )
+        self.after(0, self._unplug_loop_finish)
 
     def _pair_cols(self) -> Optional[int]:
         """2-byte 合併顯示時，每行的對數（含第一行開頭的 length field）。
@@ -6098,6 +6384,67 @@ class HIDToolApp(tk.Tk):
         self._stress_log.pack(fill=tk.BOTH, expand=True)
 
         self._stress_update_cmd_ui()
+
+    def _build_unplug_tab(self, parent):
+        self._unplug_last_instance_id: Optional[str] = None
+        self._unplug_loop_running = False
+        self._unplug_loop_stop_requested = False
+
+        ttk.Label(
+            parent,
+            text="需以系統管理員身分執行本程式，否則會拒絕存取。對象：與上方「指令裝置」相同。",
+        ).pack(anchor="w", padx=10, pady=(12, 6))
+
+        single_frame = ttk.LabelFrame(parent, text="單次操作", padding=8,
+                                      style="Section.TLabelframe")
+        single_frame.pack(fill=tk.X, padx=10, pady=6)
+        ttk.Button(single_frame, text="拔除 (Disable)", command=self._on_disable_device).pack(
+            side=tk.LEFT, padx=4)
+        ttk.Button(single_frame, text="插入 (Enable)", command=self._on_enable_device).pack(
+            side=tk.LEFT, padx=4)
+
+        loop_frame = ttk.LabelFrame(parent, text="連續拔插", padding=8,
+                                    style="Section.TLabelframe")
+        loop_frame.pack(fill=tk.X, padx=10, pady=6)
+
+        ttk.Label(loop_frame, text="拔插間隔 (ms):").grid(row=0, column=0, sticky="w", padx=4)
+        self._unplug_interval_var = tk.StringVar(value="1000")
+        ttk.Entry(loop_frame, textvariable=self._unplug_interval_var, width=8).grid(
+            row=0, column=1, sticky="w")
+
+        ttk.Label(loop_frame, text="每輪間隔 (ms):").grid(row=0, column=2, sticky="w", padx=(16, 4))
+        self._unplug_cycle_gap_var = tk.StringVar(value="500")
+        ttk.Entry(loop_frame, textvariable=self._unplug_cycle_gap_var, width=8).grid(
+            row=0, column=3, sticky="w")
+
+        ttk.Label(loop_frame, text="次數 (0=無限):").grid(row=0, column=4, sticky="w", padx=(16, 4))
+        self._unplug_count_var = tk.StringVar(value="1")
+        ttk.Spinbox(loop_frame, from_=0, to=99999, textvariable=self._unplug_count_var, width=7).grid(
+            row=0, column=5, sticky="w")
+
+        self._unplug_stop_on_problem_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            loop_frame, text="出現黃色驚嘆號時自動停止",
+            variable=self._unplug_stop_on_problem_var,
+        ).grid(row=1, column=0, columnspan=6, sticky="w", pady=(6, 0))
+
+        btn_row = ttk.Frame(loop_frame)
+        btn_row.grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        self._unplug_start_btn = self._mk_color_button(
+            btn_row, "開始連續拔插", self._unplug_loop_toggle, self._GREEN, self._GREEN_DARK)
+        self._unplug_start_btn.pack(side=tk.LEFT, padx=4)
+
+        self._unplug_progress_var = tk.StringVar(value="")
+        ttk.Label(loop_frame, textvariable=self._unplug_progress_var).grid(
+            row=2, column=4, columnspan=2, sticky="w", pady=(8, 0))
+
+        log_frame = ttk.LabelFrame(parent, text="操作記錄", padding=6,
+                                   style="Section.TLabelframe")
+        log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(6, 12))
+        self._unplug_log = scrolledtext.ScrolledText(
+            log_frame, height=14, state="disabled", font=("Consolas", 9))
+        self._style_log_text(self._unplug_log)
+        self._unplug_log.pack(fill=tk.BOTH, expand=True)
 
     def _update_canvas_range(self, path_str: str):
         """從 descriptor 取出 X/Y 的 logical 範圍並更新畫布標註。"""
