@@ -170,6 +170,84 @@ def _pnp_get_status(instance_id: str) -> Tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
+# 燒機（重開機耐久測試）：真的呼叫 Windows 重開機，並用工作排程器的
+# 「登入時觸發」任務把本程式在下次登入時自動叫回來繼續、檢查裝置有沒有
+# 黃色驚嘆號。跨重開機的進度靠一個小 JSON 檔（burnin state）保存，因為
+# 行程本身會隨著重開機整個消失，無法用記憶體內的迴圈跨重開機存活。
+#
+# 注意：這只能在「使用者登入 Windows」時觸發，不會幫忙自動登入（那需要
+# 在登錄檔存明碼密碼，本工具不做這件事）——如果電腦有密碼保護且沒有設定
+# 自動登入，重開機後要有人手動登入，任務才會執行。
+# ---------------------------------------------------------------------------
+
+def _burnin_schtasks_create(task_name: str, command_line: str) -> Tuple[bool, str]:
+    """建立一個「登入時觸發」的工作排程器任務，把本程式叫回來續測。
+    刻意不加 /rl highest：燒機續測流程只會查 Get-PnpDevice 狀態（免權限）
+    跟 shutdown /r（一般使用者本機重開機預設就有這個權限），用不到系統
+    管理員權限；而 /rl highest 這個旗標本身在「建立當下」就要求呼叫者已
+    經是系統管理員身分，不然 schtasks /create 會直接回 Access is denied
+    ——加了反而讓一般身分執行的使用者連任務都建立不起來，得不償失。"""
+    try:
+        result = subprocess.run(
+            ["schtasks", "/create", "/tn", task_name, "/sc", "onlogon",
+             "/f", "/tr", command_line],
+            capture_output=True, text=True, timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+    except Exception as e:
+        return False, str(e)
+    output = ((result.stdout or "") + (result.stderr or "")).strip()
+    if result.returncode == 0:
+        return True, output or "OK"
+    return False, output or f"exit code {result.returncode}"
+
+
+def _burnin_schtasks_delete(task_name: str) -> Tuple[bool, str]:
+    try:
+        result = subprocess.run(
+            ["schtasks", "/delete", "/tn", task_name, "/f"],
+            capture_output=True, text=True, timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+    except Exception as e:
+        return False, str(e)
+    output = ((result.stdout or "") + (result.stderr or "")).strip()
+    if result.returncode == 0:
+        return True, output or "OK"
+    return False, output or f"exit code {result.returncode}"
+
+
+def _burnin_shutdown_reboot(delay_sec: int, comment: str) -> Tuple[bool, str]:
+    try:
+        result = subprocess.run(
+            ["shutdown", "/r", "/t", str(delay_sec), "/c", comment],
+            capture_output=True, text=True, timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+    except Exception as e:
+        return False, str(e)
+    output = ((result.stdout or "") + (result.stderr or "")).strip()
+    if result.returncode == 0:
+        return True, output or "OK"
+    return False, output or f"exit code {result.returncode}"
+
+
+def _burnin_shutdown_abort() -> Tuple[bool, str]:
+    try:
+        result = subprocess.run(
+            ["shutdown", "/a"],
+            capture_output=True, text=True, timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+    except Exception as e:
+        return False, str(e)
+    output = ((result.stdout or "") + (result.stderr or "")).strip()
+    if result.returncode == 0:
+        return True, output or "OK"
+    return False, output or f"exit code {result.returncode}"
+
+
+# ---------------------------------------------------------------------------
 # 卡頓診斷（預設關閉，零成本）：設環境變數 HID_TOOL_HANG_DEBUG=1 才會啟用。
 # 用來抓「縮小視窗一段時間、還原後變卡」這類難以在開發機重現的問題——
 # 背景執行緒每 20ms 檢查一次主執行緒（Tk 事件迴圈）多久沒跳動，
@@ -242,8 +320,8 @@ class _HangWatchdog:
 class HIDToolApp(tk.Tk):
     _APP_NAME          = "RE024 Touch Inspector"
     _APP_AUTHOR        = "Shane.Lin"
-    _APP_VERSION_LABEL = "v1.9.27"
-    _APP_VERSION_TIME  = "2026-09-08"
+    _APP_VERSION_LABEL = "v1.9.28"
+    _APP_VERSION_TIME  = "2026-09-14"
 
     # 版本(edition)：Engineer = 全功能；FAE / Customer = 閹割版
     # 由 build 時產生的 _edition.py 決定（見 .spec），開發/沒有該檔時預設 Engineer。
@@ -261,6 +339,12 @@ class HIDToolApp(tk.Tk):
     @classmethod
     def _is_customer(cls) -> bool:
         return cls._EDITION == "Customer"
+
+    # 燒機（重開機耐久測試）：工作排程器任務名稱、跨重開機的狀態檔/記錄檔檔名
+    _BURNIN_TASK_NAME      = "HidTool_BurnInResume"
+    _BURNIN_STATE_FILENAME = "hid_tool_burnin_state.json"
+    _BURNIN_LOG_FILENAME   = "hid_tool_burnin_log.txt"
+    _BURNIN_RESUME_ARG     = "--burnin-resume"
 
     # ---- UI palette & fonts（配合 sv-ttk light 主題，重新調校過的層次與對比）----
     _BG            = "#eef0f4"   # 應用程式底色（比卡片深一階，讓區塊立體）
@@ -444,6 +528,8 @@ class HIDToolApp(tk.Tk):
             self._apply_font_scaling()
 
     def __init__(self):
+        # 是否由燒機工作排程器任務在登入時自動叫回來續測（見 _build_burnin_tab）
+        self._burnin_resume_launch = self._BURNIN_RESUME_ARG in sys.argv
         # 高 DPI 清晰度（必須在建立 Tk 視窗前設定）
         self._set_dpi_awareness()
         try:
@@ -1009,8 +1095,10 @@ class HIDToolApp(tk.Tk):
         return state["ok"]
 
     def _startup_finalize(self):
-        # 登入只在 Engineer 版要求；Customer/FAE 版免帳密
-        if self._is_engineer() and not self._do_login():
+        # 登入只在 Engineer 版要求；Customer/FAE 版免帳密。由燒機排程任務在
+        # 登入時自動叫回來續測時也跳過（無人在旁邊輸入帳密，且這不是換人
+        # 操作，只是同一支程式重開機後接續剛剛的測試）。
+        if self._is_engineer() and not self._burnin_resume_launch and not self._do_login():
             self.destroy()
             return
         # Report Descriptor 側欄預設收合
@@ -1042,6 +1130,9 @@ class HIDToolApp(tk.Tk):
             self.after(400, self._show_post_update_notes)
             # 背景靜默檢查新版
             self.after(3000, lambda: self._check_update_async(silent=True))
+        # 燒機排程任務叫回來的，接續上一輪重開機後的檢查
+        if hasattr(self, "_burnin_tab_frame"):
+            self.after(200, self._burnin_check_resume)
 
     def _build_ui(self):
         # ---- Top bar (shared) ----
@@ -1222,7 +1313,7 @@ class HIDToolApp(tk.Tk):
             self._build_send_tab(send_tab)
 
         # 壓測分頁：Engineer 與 FAE 版皆可用（Customer 隱藏），內含
-        # 壓測 / 模擬拔插兩個子分頁
+        # 壓測 / 模擬拔插 / 燒機三個子分頁
         if self._is_engineer() or self._is_fae():
             stress_tab = ttk.Frame(self._notebook, style="Surface.TFrame")
             self._notebook.add(stress_tab, text="壓測")
@@ -1236,6 +1327,14 @@ class HIDToolApp(tk.Tk):
             unplug_sub = ttk.Frame(stress_nb, style="Surface.TFrame")
             stress_nb.add(unplug_sub, text="模擬拔插")
             self._build_unplug_tab(unplug_sub)
+
+            burnin_sub = ttk.Frame(stress_nb, style="Surface.TFrame")
+            stress_nb.add(burnin_sub, text="燒機")
+            self._build_burnin_tab(burnin_sub)
+
+            self._stress_tab_frame = stress_tab
+            self._stress_nb = stress_nb
+            self._burnin_tab_frame = burnin_sub
 
         if self._is_engineer():
             # 回放分頁：內含 Differ / DigiInfo 兩個子分頁
@@ -5911,12 +6010,16 @@ class HIDToolApp(tk.Tk):
             return None, f"解析上層 USB 裝置失敗：{result} {self._pnp_denied_hint(result)}"
         return result, None
 
-    def _resolve_unplug_target(self) -> Tuple[Optional[str], Optional[str]]:
+    def _resolve_unplug_target(self, log_fn=None) -> Tuple[Optional[str], Optional[str]]:
         """解析要操作的 USB 輸入裝置 Instance ID：優先即時解析目前選取的裝置；
         解析不到時（常見情況：剛做完一輪拔插，裝置在停用期間從清單消失，UI
         的裝置選擇被清空，重新上線後也沒有自動配回去）退回沿用上一次成功解析
         過的 Instance ID——同一顆裝置軟體停用/啟用不會換 Instance ID，可以
-        放心沿用，這樣才能對同一顆裝置連續做拔插而不必每次都手動重選。"""
+        放心沿用，這樣才能對同一顆裝置連續做拔插而不必每次都手動重選。
+        log_fn 預設寫進「模擬拔插」記錄，燒機分頁呼叫時改傳自己的記錄函式，
+        兩個分頁共用同一個「上次記住的 Instance ID」（_unplug_last_instance_id），
+        因為兩者操作的都是同一顆『目前選取的 USB 輸入裝置』。"""
+        log_fn = log_fn or self._unplug_log_append
         dev = self._get_cmd_dev()
         if dev is not None:
             instance_id, err = self._resolve_usb_parent_from_path(dev.get("path", b""))
@@ -5924,11 +6027,11 @@ class HIDToolApp(tk.Tk):
                 self._unplug_last_instance_id = instance_id
                 return instance_id, None
             if self._unplug_last_instance_id:
-                self._unplug_log_append(f"  [警告] {err}，改用上次記住的 Instance ID")
+                log_fn(f"  [警告] {err}，改用上次記住的 Instance ID")
                 return self._unplug_last_instance_id, None
             return None, err
         if self._unplug_last_instance_id:
-            self._unplug_log_append("  裝置清單中目前看不到裝置，沿用上次記住的 Instance ID")
+            log_fn("  裝置清單中目前看不到裝置，沿用上次記住的 Instance ID")
             return self._unplug_last_instance_id, None
         return None, "請先選擇一個裝置"
 
@@ -6052,6 +6155,374 @@ class HIDToolApp(tk.Tk):
                 + (f"，其中 {problem_count} 次啟用後狀態異常" if problem_count else "")
             )
         self.after(0, self._unplug_loop_finish)
+
+    # ------------------------------------------------------------------
+    # 燒機（重開機耐久測試，壓測分頁的子分頁）
+    #
+    # 跟「模擬拔插」不同，這裡是真的重開機（shutdown /r），所以行程本身會
+    # 隨重開機消失，無法靠記憶體內的迴圈跨重開機存活。做法：
+    #   1. 按下開始 → 把測試設定寫進一個小 JSON 狀態檔、註冊一個「登入時
+    #      觸發、以最高權限執行」的工作排程任務（指向本程式 + 續測參數）、
+    #      倒數幾秒後重開機。
+    #   2. 下次登入 Windows 時，工作排程任務把本程式叫回來、帶著續測參數；
+    #      程式看到狀態檔存在就跳過登入畫面、等一段時間讓裝置列舉完成，
+    #      查裝置狀態（黃色驚嘆號）、更新狀態檔，判斷要繼續下一輪重開機
+    #      還是結束測試。
+    #   3. 結束（達到輪數 / 偵測到異常且勾了自動停止 / 使用者手動停止）時
+    #      刪掉工作排程任務與狀態檔，最後一輪的記錄留在使用者手動打開的
+    #      這個畫面上。
+    # ------------------------------------------------------------------
+
+    _BURNIN_REBOOT_GRACE_SEC = 15   # 按下開始/進入下一輪後，重開機前的倒數秒數（給使用者一個可視的取消窗口）
+
+    def _burnin_base_dir(self) -> str:
+        return (os.path.dirname(os.path.abspath(sys.executable))
+                if getattr(sys, "frozen", False)
+                else os.path.dirname(os.path.abspath(__file__)))
+
+    def _burnin_state_path(self) -> str:
+        return os.path.join(self._burnin_base_dir(), self._BURNIN_STATE_FILENAME)
+
+    def _burnin_log_path(self) -> str:
+        return os.path.join(self._burnin_base_dir(), self._BURNIN_LOG_FILENAME)
+
+    def _burnin_task_command_line(self) -> str:
+        """組出工作排程器 /tr 用的完整命令列字串（含續測參數）。開發環境下
+        （非打包 exe）要多帶一層 python.exe + 腳本路徑。"""
+        exe = sys.executable
+        if getattr(sys, "frozen", False):
+            return f'"{exe}" {self._BURNIN_RESUME_ARG}'
+        script = os.path.abspath(__file__)
+        return f'"{exe}" "{script}" {self._BURNIN_RESUME_ARG}'
+
+    def _burnin_load_state(self) -> Optional[dict]:
+        path = self._burnin_state_path()
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def _burnin_save_state(self, state: dict):
+        path = self._burnin_state_path()
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        except Exception as e:
+            self._burnin_log_append(f"  [警告] 寫入燒機狀態檔失敗：{e}")
+
+    def _burnin_clear_state(self):
+        try:
+            path = self._burnin_state_path()
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+
+    def _burnin_log_append(self, msg: str):
+        """記錄同時寫進畫面 log 與磁碟上的記錄檔——後者是因為重開機會讓
+        整個行程（含畫面上的 Text 內容）消失，只有寫在磁碟上的才跨得過
+        重開機，讓使用者事後能看到完整的燒機歷史。每行都加時間戳記，事後
+        才分得出兩行記錄之間是真的隔了一次重開機（間隔數分鐘），還是同一個
+        行程內瞬間發生的事（間隔數毫秒）。"""
+        # 前導的 "\n" 是呼叫端刻意留的分段空行，要留在時間戳記「之前」，
+        # 不然會變成一行只有時間戳記的空行。
+        lead = ""
+        while msg.startswith("\n"):
+            lead += "\n"
+            msg = msg[1:]
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        line = f"{lead}[{ts}] {msg}\n"
+        try:
+            with self._burnin_log_lock:
+                with open(self._burnin_log_path(), "a", encoding="utf-8") as f:
+                    f.write(line)
+        except Exception:
+            pass
+
+        def _append():
+            self._burnin_log.configure(state="normal")
+            self._burnin_log.insert("end", line)
+            self._burnin_log.see("end")
+            self._burnin_log.configure(state="disabled")
+        self.after(0, _append)
+
+    def _burnin_update_progress_label(self, state: dict):
+        total = state.get("total_cycles", 0)
+        total_label = str(total) if total else "無限"
+        done = state.get("completed_cycles", 0)
+        problems = state.get("problem_count", 0)
+        suffix = f"（異常 {problems} 次）" if problems else ""
+        self._burnin_progress_var.set(f"已完成 {done} / {total_label} 輪{suffix}")
+
+    def _burnin_set_running_ui(self, running: bool, state: Optional[dict]):
+        if running:
+            self._burnin_start_btn.config(text="停止燒機", bg=self._RED, activebackground=self._RED_DARK)
+        else:
+            self._burnin_start_btn.config(text="開始燒機", bg=self._GREEN, activebackground=self._GREEN_DARK)
+        if state:
+            self._burnin_update_progress_label(state)
+        else:
+            self._burnin_progress_var.set("尚未開始")
+
+    def _burnin_toggle(self):
+        if self._burnin_load_state() is not None:
+            self._burnin_stop(user_requested=True)
+        else:
+            self._burnin_start()
+
+    def _burnin_start(self):
+        try:
+            total_cycles = int(self._burnin_count_var.get())
+            wait_sec = int(self._burnin_wait_var.get())
+            if total_cycles < 0 or wait_sec <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("錯誤", "輪數必須是 0 或正整數、等待秒數必須是正整數")
+            return
+        instance_id, err = self._resolve_unplug_target(log_fn=self._burnin_log_append)
+        if not instance_id:
+            messagebox.showerror("錯誤", f"無法解析要燒機的裝置：{err}")
+            return
+        count_label = str(total_cycles) if total_cycles else "無限"
+        if not messagebox.askyesno(
+            "確認燒機",
+            f"即將開始燒機測試（共 {count_label} 輪），每一輪都會實際重開機這台電腦，"
+            "並用工作排程器在下次登入時自動叫回本程式繼續測試。\n\n"
+            "請先儲存好其他工作。若電腦有密碼保護，重開機後需要有人手動登入 Windows，"
+            "自動續測的排程才會執行（本工具不會、也不會幫忙設定自動登入）。\n\n"
+            "確定要開始嗎？",
+        ):
+            return
+        state = {
+            "instance_id": instance_id,
+            "total_cycles": total_cycles,
+            "completed_cycles": 0,
+            "problem_count": 0,
+            "stop_on_problem": bool(self._burnin_stop_on_problem_var.get()),
+            "wait_after_boot_sec": wait_sec,
+            "phase": "awaiting_check",
+            "started_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        }
+        self._burnin_save_state(state)
+        self._burnin_log_append(f"\n=== 燒機開始（USB 輸入裝置 Instance ID：{instance_id}，共 {count_label} 輪）===")
+        self._burnin_set_running_ui(True, state)
+        threading.Thread(target=self._burnin_start_worker, args=(state,), daemon=True).start()
+
+    def _burnin_start_worker(self, state: dict):
+        # 保險：先刪掉可能殘留的同名舊任務再建立新的。理論上 /create /f 本身
+        # 就會覆蓋同名任務，但如果上一輪測試結束時的自動刪除（見
+        # _burnin_finish/_burnin_stop_worker）沒有成功，殘留的舊任務可能會讓
+        # /f 覆蓋不掉而回 Access is denied——先顯式刪一次再建立，比較保險。
+        _burnin_schtasks_delete(self._BURNIN_TASK_NAME)
+        ok, msg = _burnin_schtasks_create(self._BURNIN_TASK_NAME, self._burnin_task_command_line())
+        if not ok:
+            self._burnin_log_append(f"  [錯誤] 建立登入時自動續測的工作排程失敗：{msg}")
+            self._burnin_clear_state()
+            self.after(0, lambda: self._burnin_set_running_ui(False, None))
+            self.after(0, lambda: messagebox.showerror(
+                "錯誤", f"建立工作排程失敗，燒機測試未開始：{msg}"))
+            return
+        self._burnin_log_append("  [成功] 已建立登入時自動續測的工作排程")
+        self.after(0, lambda: self._burnin_trigger_reboot(state))
+
+    def _burnin_stop(self, user_requested: bool = False):
+        if getattr(self, "_burnin_countdown_after_id", None) is not None:
+            try:
+                self.after_cancel(self._burnin_countdown_after_id)
+            except Exception:
+                pass
+            self._burnin_countdown_after_id = None
+        # 先清狀態檔，讓倒數/續測檢查馬上就能看到「已停止」，不必等下面
+        # 這兩個外部指令（可能要花零點幾秒）跑完。
+        state = self._burnin_load_state()
+        self._burnin_clear_state()
+        if user_requested:
+            self._burnin_log_append("\n=== 使用者手動停止燒機測試 ===")
+        self._burnin_set_running_ui(False, state)
+        threading.Thread(target=self._burnin_stop_worker, daemon=True).start()
+
+    def _burnin_stop_worker(self):
+        # 沒有排定中的重開機時 shutdown /a 會失敗，這是正常情況；但如果是
+        # 真的有排定中的重開機卻取消失敗（例如太晚按、已經過了可取消的時間
+        # 點），OS 那邊的重開機還是會照跑，只是不會自動續測了（工作排程
+        # 已經刪掉）——這種情況要讓使用者知道，不能默默吞掉。
+        ok, msg = _burnin_shutdown_abort()
+        if not ok:
+            self._burnin_log_append(
+                f"  [提示] 取消重開機失敗（{msg}）。若目前確實有排定中的重開機，"
+                "電腦稍後仍可能自行重開機，但續測工作排程已刪除、不會自動叫回程式。"
+            )
+        _burnin_schtasks_delete(self._BURNIN_TASK_NAME)
+
+    def _burnin_finish(self, state: dict, reason: str):
+        done = state.get("completed_cycles", 0)
+        problems = state.get("problem_count", 0)
+        self._burnin_log_append(
+            f"=== 燒機結束：{reason}（共完成 {done} 輪，其中 {problems} 次偵測到黃色驚嘆號）===\n"
+        )
+        self._burnin_clear_state()
+        self._burnin_set_running_ui(False, state)
+        threading.Thread(target=self._burnin_finish_delete_task_worker, daemon=True).start()
+
+    def _burnin_finish_delete_task_worker(self):
+        ok, msg = _burnin_schtasks_delete(self._BURNIN_TASK_NAME)
+        if not ok:
+            self._burnin_log_append(f"  [提示] 清理工作排程時失敗（{msg}），下次開始燒機時會再嘗試清除")
+
+    def _burnin_trigger_reboot(self, state: dict):
+        grace = self._BURNIN_REBOOT_GRACE_SEC
+        self._burnin_log_append(
+            f"  將於 {grace} 秒後重開機（可按「停止燒機」取消）..."
+        )
+        threading.Thread(target=self._burnin_trigger_reboot_worker, args=(state, grace), daemon=True).start()
+
+    def _burnin_trigger_reboot_worker(self, state: dict, grace: int):
+        # 保險：先取消任何殘留、尚未消化掉的重開機排程（例如上一輪按「停止
+        # 燒機」時取消失敗留下的），避免撞到 Windows「一次只能排一個重開機」
+        # 的限制（shutdown /r 在已有排程時會回 1190 already scheduled）。
+        # 沒有殘留排程時這通呼叫本身就會失敗，忽略即可，不影響接下來要排的
+        # 這一次。
+        _burnin_shutdown_abort()
+        ok, msg = _burnin_shutdown_reboot(grace, "hid_tool 燒機測試：自動重開機")
+        if not ok:
+            self._burnin_log_append(f"  [錯誤] 排定重開機失敗：{msg}")
+            self.after(0, lambda: self._burnin_finish(state, "排定重開機失敗，測試中止"))
+            return
+        self._burnin_countdown_remaining = grace
+        self.after(0, self._burnin_countdown_tick)
+
+    def _burnin_countdown_tick(self):
+        # 使用者可能在倒數期間按了「停止燒機」，狀態檔已經被刪掉
+        if self._burnin_load_state() is None:
+            self._burnin_countdown_after_id = None
+            return
+        self._burnin_progress_var.set(f"即將重開機（{self._burnin_countdown_remaining}s）...")
+        if self._burnin_countdown_remaining <= 0:
+            self._burnin_countdown_after_id = None
+            return
+        self._burnin_countdown_remaining -= 1
+        self._burnin_countdown_after_id = self.after(1000, self._burnin_countdown_tick)
+
+    def _burnin_check_resume(self):
+        """在 _startup_finalize 尾端呼叫：若偵測到燒機續測狀態檔，代表這次
+        啟動是由工作排程任務在登入時自動叫回來的，切到燒機分頁繼續流程。"""
+        state = self._burnin_load_state()
+        if not state or state.get("phase") != "awaiting_check":
+            return
+        try:
+            self._notebook.select(self._stress_tab_frame)
+            self._stress_nb.select(self._burnin_tab_frame)
+        except Exception:
+            pass
+        self._burnin_set_running_ui(True, state)
+        wait_sec = int(state.get("wait_after_boot_sec", 30))
+        self._burnin_log_append(
+            f"\n[續測] 偵測到燒機重開機後續測狀態，等待 {wait_sec} 秒讓裝置列舉完成後檢查裝置狀態..."
+        )
+        self.after(wait_sec * 1000, lambda: self._burnin_post_boot_check(state))
+
+    def _burnin_post_boot_check(self, state: dict):
+        if self._burnin_load_state() is None:
+            return   # 等待期間使用者按了「停止燒機」
+        threading.Thread(
+            target=self._burnin_post_boot_check_worker, args=(state,), daemon=True,
+        ).start()
+
+    def _burnin_post_boot_check_worker(self, state: dict):
+        instance_id = state["instance_id"]
+        is_ok, detail = _pnp_get_status(instance_id)
+        state["completed_cycles"] = state.get("completed_cycles", 0) + 1
+        cycle_no = state["completed_cycles"]
+        if is_ok:
+            self._burnin_log_append(f"  第 {cycle_no} 輪：裝置狀態正常，無黃色驚嘆號（{detail}）")
+        else:
+            state["problem_count"] = state.get("problem_count", 0) + 1
+            self._burnin_log_append(f"  第 {cycle_no} 輪：[警告] 裝置狀態異常，疑似黃色驚嘆號（{detail}）")
+
+        total = state.get("total_cycles", 0)
+        stop_on_problem = state.get("stop_on_problem", True)
+        problem_stop = (not is_ok) and stop_on_problem
+        finished = problem_stop or (total and cycle_no >= total)
+
+        if finished:
+            reason = "偵測到黃色驚嘆號，自動停止" if problem_stop else "已完成全部輪數"
+            self.after(0, lambda: self._burnin_finish(state, reason))
+            return
+        self._burnin_save_state(state)
+        self.after(0, lambda: self._burnin_update_progress_label(state))
+        self.after(0, lambda: self._burnin_trigger_reboot(state))
+
+    def _build_burnin_tab(self, parent):
+        self._burnin_countdown_after_id: Optional[str] = None
+        self._burnin_log_lock = threading.Lock()
+
+        ttk.Label(
+            parent,
+            text=("會實際重開機（shutdown /r）並用工作排程器在下次登入時自動把本程式叫回來續測，"
+                  "檢查裝置管理員裡的裝置有沒有出現黃色驚嘆號。對象：與上方「指令裝置」相同。\n"
+                  "重開機後若電腦有密碼保護，需要有人手動登入 Windows，續測排程才會執行；"
+                  "本工具不會、也不會幫忙設定自動登入。"),
+            wraplength=620, justify="left",
+        ).pack(anchor="w", padx=10, pady=(12, 6))
+
+        settings_frame = ttk.LabelFrame(parent, text="燒機設定", padding=8,
+                                        style="Section.TLabelframe")
+        settings_frame.pack(fill=tk.X, padx=10, pady=6)
+
+        ttk.Label(settings_frame, text="輪數 (0=無限):").grid(row=0, column=0, sticky="w", padx=4)
+        self._burnin_count_var = tk.StringVar(value="5")
+        ttk.Spinbox(settings_frame, from_=0, to=99999, textvariable=self._burnin_count_var, width=7).grid(
+            row=0, column=1, sticky="w", padx=(2, 20))
+
+        ttk.Label(settings_frame, text="開機後等待 (s):").grid(row=0, column=2, sticky="w", padx=4)
+        self._burnin_wait_var = tk.StringVar(value="30")
+        ttk.Spinbox(settings_frame, from_=5, to=600, textvariable=self._burnin_wait_var, width=7).grid(
+            row=0, column=3, sticky="w")
+
+        self._burnin_stop_on_problem_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            settings_frame, text="出現黃色驚嘆號時自動停止",
+            variable=self._burnin_stop_on_problem_var,
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+
+        btn_row = ttk.Frame(parent)
+        btn_row.pack(fill=tk.X, padx=10, pady=6)
+        self._burnin_start_btn = self._mk_color_button(
+            btn_row, "開始燒機", self._burnin_toggle, self._GREEN, self._GREEN_DARK)
+        self._burnin_start_btn.pack(side=tk.LEFT, padx=4)
+
+        self._burnin_progress_var = tk.StringVar(value="尚未開始")
+        ttk.Label(btn_row, textvariable=self._burnin_progress_var).pack(side=tk.LEFT, padx=(16, 0))
+
+        log_frame = ttk.LabelFrame(
+            parent, text=f"燒機記錄（跨重開機保留，存於 {self._BURNIN_LOG_FILENAME}）",
+            padding=6, style="Section.TLabelframe")
+        log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(6, 12))
+        self._burnin_log = scrolledtext.ScrolledText(
+            log_frame, height=14, state="disabled", font=("Consolas", 9))
+        self._style_log_text(self._burnin_log)
+        self._burnin_log.pack(fill=tk.BOTH, expand=True)
+
+        # 還原先前記錄檔內容：重開機會讓整個行程重來，Text 內容不寫回去就看不到歷史
+        try:
+            with open(self._burnin_log_path(), "r", encoding="utf-8") as f:
+                old = f.read()
+            if old:
+                self._burnin_log.configure(state="normal")
+                self._burnin_log.insert("end", old)
+                self._burnin_log.see("end")
+                self._burnin_log.configure(state="disabled")
+        except Exception:
+            pass
+
+        # 若上次關閉時測試仍在進行中（狀態檔還在），還原按鈕與進度顯示
+        state = self._burnin_load_state()
+        self._burnin_set_running_ui(state is not None, state)
 
     def _pair_cols(self) -> Optional[int]:
         """2-byte 合併顯示時，每行的對數（含第一行開頭的 length field）。
