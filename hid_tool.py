@@ -41,6 +41,7 @@ else:
 import sv_ttk
 from fast_table import FastTable
 import hid_desc_compare
+import code_merge
 import heatmap_frame
 import digiinfo_parse
 import la_saleae
@@ -180,26 +181,113 @@ def _pnp_get_status(instance_id: str) -> Tuple[bool, str]:
 # 自動登入，重開機後要有人手動登入，任務才會執行。
 # ---------------------------------------------------------------------------
 
-def _burnin_schtasks_create(task_name: str, command_line: str) -> Tuple[bool, str]:
-    """建立一個「登入時觸發」的工作排程器任務，把本程式叫回來續測。
-    刻意不加 /rl highest：燒機續測流程只會查 Get-PnpDevice 狀態（免權限）
-    跟 shutdown /r（一般使用者本機重開機預設就有這個權限），用不到系統
-    管理員權限；而 /rl highest 這個旗標本身在「建立當下」就要求呼叫者已
-    經是系統管理員身分，不然 schtasks /create 會直接回 Access is denied
-    ——加了反而讓一般身分執行的使用者連任務都建立不起來，得不償失。"""
+def _burnin_current_user() -> str:
+    domain = os.environ.get("USERDOMAIN", "")
+    user = os.environ.get("USERNAME", "")
+    return f"{domain}\\{user}" if domain and user else user
+
+
+def _burnin_build_task_xml(user: str, exe: str, arguments: str, workdir: str) -> str:
+    """工作排程任務的 XML 定義。不用 schtasks 的命令列旗標建任務，是因為：
+    1) /sc onlogon 沒指定使用者時是「任何使用者登入時」，一般身分建立會被
+       拒絕（Access is denied）；XML 把觸發器與執行身分都限定成目前使用者
+       就不需要系統管理員權限。
+    2) 命令列建出來的任務預設「只在接 AC 電源時才啟動」「切到電池就停止」
+       「執行超過 72 小時強制結束」——筆電用電池重開機時任務會靜默不跑、
+       不留任何錯誤，只有特定機台會發生，很難查。這裡明確全部關掉。
+    RunLevel 維持 LeastPrivilege：續測只查 Get-PnpDevice 與 shutdown /r，
+    不需要提升權限。"""
+    from xml.sax.saxutils import escape as _esc
+    u, e, a, w = _esc(user), _esc(exe), _esc(arguments), _esc(workdir)
+    return f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>hid_tool 燒機續測（測試期間自動建立，結束或停止時自動刪除）</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{u}</UserId>
+      <Delay>PT5S</Delay>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{u}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{e}</Command>
+      <Arguments>{a}</Arguments>
+      <WorkingDirectory>{w}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
+"""
+
+
+def _burnin_schtasks_create(task_name: str, exe: str, arguments: str, workdir: str) -> Tuple[bool, str]:
+    """建立「目前使用者登入時」觸發的工作排程任務，把本程式叫回來續測。"""
+    import tempfile
+    xml = _burnin_build_task_xml(_burnin_current_user(), exe, arguments, workdir)
+    fd, xml_path = tempfile.mkstemp(suffix=".xml", prefix="hid_tool_burnin_")
     try:
+        with os.fdopen(fd, "w", encoding="utf-16") as f:   # schtasks /xml 要 UTF-16
+            f.write(xml)
         result = subprocess.run(
-            ["schtasks", "/create", "/tn", task_name, "/sc", "onlogon",
-             "/f", "/tr", command_line],
+            ["schtasks", "/create", "/tn", task_name, "/xml", xml_path, "/f"],
             capture_output=True, text=True, timeout=15,
             creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
         )
     except Exception as e:
         return False, str(e)
+    finally:
+        try:
+            os.remove(xml_path)
+        except OSError:
+            pass
     output = ((result.stdout or "") + (result.stderr or "")).strip()
     if result.returncode == 0:
         return True, output or "OK"
     return False, output or f"exit code {result.returncode}"
+
+
+def _burnin_on_battery() -> Optional[bool]:
+    """True=使用電池、False=接 AC、None=查不到（桌機沒電池也是 False）。"""
+    try:
+        class _PS(ctypes.Structure):
+            _fields_ = [("ACLineStatus", ctypes.c_ubyte), ("BatteryFlag", ctypes.c_ubyte),
+                        ("BatteryLifePercent", ctypes.c_ubyte), ("SystemStatusFlag", ctypes.c_ubyte),
+                        ("BatteryLifeTime", ctypes.c_ulong), ("BatteryFullLifeTime", ctypes.c_ulong)]
+        ps = _PS()
+        if not ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(ps)):
+            return None
+        return ps.ACLineStatus == 0
+    except Exception:
+        return None
+
+
+def _burnin_is_admin() -> bool:
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
 
 
 def _burnin_schtasks_delete(task_name: str) -> Tuple[bool, str]:
@@ -320,8 +408,8 @@ class _HangWatchdog:
 class HIDToolApp(tk.Tk):
     _APP_NAME          = "RE024 Touch Inspector"
     _APP_AUTHOR        = "Shane.Lin"
-    _APP_VERSION_LABEL = "v1.9.28"
-    _APP_VERSION_TIME  = "2026-09-14"
+    _APP_VERSION_LABEL = "v1.9.29"
+    _APP_VERSION_TIME  = "2026-09-21"
 
     # 版本(edition)：Engineer = 全功能；FAE / Customer = 閹割版
     # 由 build 時產生的 _edition.py 決定（見 .spec），開發/沒有該檔時預設 Engineer。
@@ -1365,6 +1453,11 @@ class HIDToolApp(tk.Tk):
             self._notebook.add(hover_tab, text="調適")
             self._build_hover_palm_tab(hover_tab)
 
+        # 合Code 分頁：兩份原始碼資料夾比對＋左複製到右（開發用工具，僅 Engineer 版）
+        if self._is_engineer():
+            merge_tab = ttk.Frame(self._notebook, style="Surface.TFrame")
+            self._notebook.add(merge_tab, text="合Code")
+            self._build_code_merge_tab(merge_tab)
 
         self._notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed, add="+")
 
@@ -6186,14 +6279,20 @@ class HIDToolApp(tk.Tk):
     def _burnin_log_path(self) -> str:
         return os.path.join(self._burnin_base_dir(), self._BURNIN_LOG_FILENAME)
 
-    def _burnin_task_command_line(self) -> str:
-        """組出工作排程器 /tr 用的完整命令列字串（含續測參數）。開發環境下
-        （非打包 exe）要多帶一層 python.exe + 腳本路徑。"""
+    def _burnin_task_action(self) -> Tuple[str, str]:
+        """排程任務要執行的 (程式, 參數)。開發環境下（非打包 exe）要多帶一層
+        python.exe + 腳本路徑。"""
         exe = sys.executable
         if getattr(sys, "frozen", False):
-            return f'"{exe}" {self._BURNIN_RESUME_ARG}'
+            return exe, self._BURNIN_RESUME_ARG
         script = os.path.abspath(__file__)
-        return f'"{exe}" "{script}" {self._BURNIN_RESUME_ARG}'
+        return exe, f'"{script}" {self._BURNIN_RESUME_ARG}'
+
+    def _burnin_env_summary(self) -> str:
+        battery = _burnin_on_battery()
+        power = "電池" if battery else ("AC 電源" if battery is False else "未知")
+        return (f"使用者 {_burnin_current_user()}、系統管理員={'是' if _burnin_is_admin() else '否'}、"
+                f"電源={power}、程式 {sys.executable}")
 
     def _burnin_load_state(self) -> Optional[dict]:
         path = self._burnin_state_path()
@@ -6319,7 +6418,10 @@ class HIDToolApp(tk.Tk):
         # _burnin_finish/_burnin_stop_worker）沒有成功，殘留的舊任務可能會讓
         # /f 覆蓋不掉而回 Access is denied——先顯式刪一次再建立，比較保險。
         _burnin_schtasks_delete(self._BURNIN_TASK_NAME)
-        ok, msg = _burnin_schtasks_create(self._BURNIN_TASK_NAME, self._burnin_task_command_line())
+        exe, arguments = self._burnin_task_action()
+        self._burnin_log_append(f"  環境：{self._burnin_env_summary()}")
+        ok, msg = _burnin_schtasks_create(
+            self._BURNIN_TASK_NAME, exe, arguments, os.path.dirname(os.path.abspath(exe)))
         if not ok:
             self._burnin_log_append(f"  [錯誤] 建立登入時自動續測的工作排程失敗：{msg}")
             self._burnin_clear_state()
@@ -6412,6 +6514,13 @@ class HIDToolApp(tk.Tk):
         """在 _startup_finalize 尾端呼叫：若偵測到燒機續測狀態檔，代表這次
         啟動是由工作排程任務在登入時自動叫回來的，切到燒機分頁繼續流程。"""
         state = self._burnin_load_state()
+        if self._burnin_resume_launch:
+            # 由排程帶續測參數啟動：不論找不到狀態檔與否都先留一行，之後才分得
+            # 出「排程根本沒把程式叫起來」（log 完全沒這行）與「叫起來了但沒
+            # 接上」（有這行但後面沒續測）。
+            self._burnin_log_append(
+                f"\n[續測] 程式已由工作排程啟動（{self._burnin_env_summary()}），"
+                + ("已讀到燒機狀態檔" if state else "但找不到燒機狀態檔，無法續測"))
         if not state or state.get("phase") != "awaiting_check":
             return
         try:
@@ -6916,6 +7025,236 @@ class HIDToolApp(tk.Tk):
             log_frame, height=14, state="disabled", font=("Consolas", 9))
         self._style_log_text(self._unplug_log)
         self._unplug_log.pack(fill=tk.BOTH, expand=True)
+
+    # ---- 合Code：兩份原始碼資料夾比對＋左複製到右 ----
+
+    _CM_STATUS_LABEL = {
+        code_merge.STATUS_SAME:       "相同",
+        code_merge.STATUS_DIFF:       "不同",
+        code_merge.STATUS_ONLY_LEFT:  "只有左邊",
+        code_merge.STATUS_ONLY_RIGHT: "只有右邊",
+    }
+
+    def _build_code_merge_tab(self, parent):
+        self._cm_entries: List[code_merge.DiffEntry] = []
+        self._cm_row_to_entry: Dict[str, code_merge.DiffEntry] = {}
+        self._cm_scanning = False
+
+        dirs_frame = ttk.LabelFrame(parent, text="資料夾", padding=8,
+                                    style="Section.TLabelframe")
+        dirs_frame.pack(fill=tk.X, padx=10, pady=(10, 6))
+        dirs_frame.columnconfigure(1, weight=1)
+
+        self._cm_left_var = tk.StringVar(value="")
+        self._cm_right_var = tk.StringVar(value="")
+        ttk.Label(dirs_frame, text="左（來源）:").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        ttk.Entry(dirs_frame, textvariable=self._cm_left_var, state="readonly").grid(
+            row=0, column=1, sticky="ew")
+        ttk.Button(dirs_frame, text="選擇…", command=lambda: self._cm_choose_dir("left")).grid(
+            row=0, column=2, padx=(6, 0))
+
+        ttk.Label(dirs_frame, text="右（目標）:").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
+        ttk.Entry(dirs_frame, textvariable=self._cm_right_var, state="readonly").grid(
+            row=1, column=1, sticky="ew", pady=(6, 0))
+        ttk.Button(dirs_frame, text="選擇…", command=lambda: self._cm_choose_dir("right")).grid(
+            row=1, column=2, padx=(6, 0), pady=(6, 0))
+
+        act = ttk.Frame(parent, padding=(10, 0))
+        act.pack(fill=tk.X)
+        self._cm_scan_btn = ttk.Button(act, text="掃描比對", style="Accent.TButton",
+                                       command=self._cm_run_scan)
+        self._cm_scan_btn.pack(side=tk.LEFT)
+        self._cm_show_same_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(act, text="顯示相同檔案", variable=self._cm_show_same_var,
+                        command=self._cm_refresh_tree).pack(side=tk.LEFT, padx=(10, 0))
+        self._cm_status_var = tk.StringVar(value="選擇左右資料夾後按「掃描比對」。")
+        ttk.Label(act, textvariable=self._cm_status_var, style="Muted.TLabel").pack(
+            side=tk.LEFT, padx=12)
+
+        tree_frame = ttk.Frame(parent, padding=(10, 6, 10, 0))
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+        self._cm_tree = ttk.Treeview(
+            tree_frame, columns=("status", "left_size", "right_size"),
+            show="tree headings", style="Mono.Treeview", selectmode="extended")
+        self._cm_tree.heading("#0", text="相對路徑")
+        self._cm_tree.heading("status", text="狀態")
+        self._cm_tree.heading("left_size", text="左邊大小")
+        self._cm_tree.heading("right_size", text="右邊大小")
+        self._cm_tree.column("#0", width=self._sx(420), stretch=True)
+        self._cm_tree.column("status", width=self._sx(90), stretch=False, anchor="center")
+        self._cm_tree.column("left_size", width=self._sx(90), stretch=False, anchor="e")
+        self._cm_tree.column("right_size", width=self._sx(90), stretch=False, anchor="e")
+        vs = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self._cm_tree.yview)
+        self._cm_tree.configure(yscrollcommand=vs.set)
+        vs.pack(side=tk.RIGHT, fill=tk.Y)
+        self._cm_tree.pack(fill=tk.BOTH, expand=True)
+        self._cm_tree.tag_configure("cm_same",       foreground=self._TEXT_MUTED)
+        self._cm_tree.tag_configure("cm_diff",       foreground="#b45309")
+        self._cm_tree.tag_configure("cm_only_left",  foreground=self._GREEN_DARK)
+        self._cm_tree.tag_configure("cm_only_right",  foreground=self._ACCENT_DARK)
+        self._cm_tree.bind("<Double-1>", self._cm_on_double_click)
+
+        btn_row = ttk.Frame(parent, padding=(10, 6, 10, 10))
+        btn_row.pack(fill=tk.X)
+        ttk.Button(btn_row, text="查看差異…", command=self._cm_show_diff).pack(side=tk.LEFT)
+        ttk.Button(btn_row, text="複製選取到右邊", command=self._cm_copy_selected).pack(
+            side=tk.LEFT, padx=(6, 0))
+        ttk.Button(btn_row, text="複製全部差異到右邊", command=self._cm_copy_all).pack(
+            side=tk.LEFT, padx=(6, 0))
+
+    def _cm_choose_dir(self, side: str):
+        var = self._cm_left_var if side == "left" else self._cm_right_var
+        path = filedialog.askdirectory(title="選擇左邊資料夾" if side == "left" else "選擇右邊資料夾",
+                                       initialdir=var.get() or None)
+        if path:
+            var.set(path)
+
+    def _cm_run_scan(self):
+        left_dir = self._cm_left_var.get().strip()
+        right_dir = self._cm_right_var.get().strip()
+        if not left_dir or not right_dir:
+            messagebox.showinfo("合Code", "請先選擇左右兩個資料夾。")
+            return
+        if not os.path.isdir(left_dir) or not os.path.isdir(right_dir):
+            messagebox.showerror("合Code", "左右資料夾必須都存在。")
+            return
+        if self._cm_scanning:
+            return
+        self._cm_scanning = True
+        self._cm_scan_btn.configure(state=tk.DISABLED)
+        self._cm_status_var.set("掃描中…")
+
+        def worker():
+            try:
+                entries = code_merge.scan_diff(left_dir, right_dir)
+                err = None
+            except OSError as e:
+                entries, err = [], str(e)
+            self.after(0, lambda: self._cm_scan_done(entries, err))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _cm_scan_done(self, entries: List["code_merge.DiffEntry"], err: Optional[str]):
+        self._cm_scanning = False
+        self._cm_scan_btn.configure(state=tk.NORMAL)
+        if err:
+            self._cm_status_var.set("掃描失敗")
+            messagebox.showerror("合Code", f"掃描失敗：{err}")
+            return
+        self._cm_entries = entries
+        self._cm_refresh_tree()
+
+    def _cm_refresh_tree(self):
+        tree = self._cm_tree
+        tree.delete(*tree.get_children())
+        self._cm_row_to_entry.clear()
+        show_same = self._cm_show_same_var.get()
+        n_diff = n_only_left = n_only_right = n_same = 0
+        for entry in self._cm_entries:
+            if entry.status == code_merge.STATUS_SAME:
+                n_same += 1
+                if not show_same:
+                    continue
+            elif entry.status == code_merge.STATUS_DIFF:
+                n_diff += 1
+            elif entry.status == code_merge.STATUS_ONLY_LEFT:
+                n_only_left += 1
+            else:
+                n_only_right += 1
+            row_id = tree.insert(
+                "", tk.END, text=entry.rel_path,
+                values=(self._CM_STATUS_LABEL[entry.status],
+                        "" if entry.left_size is None else str(entry.left_size),
+                        "" if entry.right_size is None else str(entry.right_size)),
+                tags=("cm_" + entry.status,))
+            self._cm_row_to_entry[row_id] = entry
+        self._cm_status_var.set(
+            f"不同 {n_diff}　只有左邊 {n_only_left}　只有右邊 {n_only_right}　相同 {n_same}")
+
+    def _cm_selected_entries(self) -> List["code_merge.DiffEntry"]:
+        return [self._cm_row_to_entry[r] for r in self._cm_tree.selection()
+                if r in self._cm_row_to_entry]
+
+    def _cm_on_double_click(self, _event):
+        entries = self._cm_selected_entries()
+        if len(entries) == 1 and entries[0].status == code_merge.STATUS_DIFF:
+            self._cm_show_diff()
+
+    def _cm_show_diff(self):
+        entries = self._cm_selected_entries()
+        entries = [e for e in entries if e.status == code_merge.STATUS_DIFF]
+        if len(entries) != 1:
+            messagebox.showinfo("查看差異", "請選取一個「不同」的檔案再查看差異。")
+            return
+        entry = entries[0]
+        try:
+            lines = code_merge.unified_diff_lines(entry)
+        except (OSError, ValueError) as e:
+            messagebox.showerror("查看差異", f"無法產生差異：{e}")
+            return
+
+        win = tk.Toplevel(self)
+        win.title(f"差異 - {entry.rel_path}")
+        self._set_window_icon(win)
+        win.geometry(f"{self._sx(900)}x{self._sx(600)}")
+        win.configure(bg=self._BG)
+        text = scrolledtext.ScrolledText(win, font=("Consolas", 10), wrap=tk.NONE, relief=tk.FLAT)
+        self._style_log_text(text)
+        text.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        text.tag_configure("add",    foreground=self._GREEN_DARK)
+        text.tag_configure("remove", foreground=self._RED)
+        text.tag_configure("hunk",   foreground=self._ACCENT_DARK, font=("Consolas", 10, "bold"))
+        for line in lines:
+            tag = None
+            if line.startswith("+") and not line.startswith("+++"):
+                tag = "add"
+            elif line.startswith("-") and not line.startswith("---"):
+                tag = "remove"
+            elif line.startswith("@@"):
+                tag = "hunk"
+            text.insert(tk.END, line if line.endswith("\n") else line + "\n",
+                       tag if tag else ())
+        text.config(state=tk.DISABLED)
+
+    def _cm_copy_entries(self, entries: List["code_merge.DiffEntry"]):
+        right_dir = self._cm_right_var.get().strip()
+        left_dir = self._cm_left_var.get().strip()
+        copyable = [e for e in entries
+                   if e.status in (code_merge.STATUS_DIFF, code_merge.STATUS_ONLY_LEFT)]
+        if not copyable:
+            messagebox.showinfo("合Code", "選取項目中沒有可從左邊複製到右邊的檔案。")
+            return
+        n_ok = 0
+        errors: List[str] = []
+        for entry in copyable:
+            try:
+                code_merge.copy_left_to_right(entry, right_dir)
+                n_ok += 1
+                idx = self._cm_entries.index(entry)
+                self._cm_entries[idx] = code_merge.rescan_entry(entry, left_dir, right_dir)
+            except (OSError, ValueError) as e:
+                errors.append(f"{entry.rel_path}: {e}")
+        self._cm_refresh_tree()
+        msg = f"已複製 {n_ok} 個檔案到右邊。"
+        if errors:
+            msg += "\n\n失敗：\n" + "\n".join(errors)
+            messagebox.showwarning("合Code", msg)
+        else:
+            self._cm_status_var.set(msg)
+
+    def _cm_copy_selected(self):
+        self._cm_copy_entries(self._cm_selected_entries())
+
+    def _cm_copy_all(self):
+        diffs = [e for e in self._cm_entries
+                if e.status in (code_merge.STATUS_DIFF, code_merge.STATUS_ONLY_LEFT)]
+        if not diffs:
+            messagebox.showinfo("合Code", "目前沒有左右不同或只有左邊的檔案。")
+            return
+        if not messagebox.askyesno(
+                "合Code", f"要把 {len(diffs)} 個檔案從左邊複製覆蓋到右邊嗎？"):
+            return
+        self._cm_copy_entries(diffs)
 
     def _update_canvas_range(self, path_str: str):
         """從 descriptor 取出 X/Y 的 logical 範圍並更新畫布標註。"""
