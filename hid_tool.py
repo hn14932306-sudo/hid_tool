@@ -41,7 +41,6 @@ else:
 import sv_ttk
 from fast_table import FastTable
 import hid_desc_compare
-import code_merge
 import heatmap_frame
 import digiinfo_parse
 import la_saleae
@@ -408,7 +407,7 @@ class _HangWatchdog:
 class HIDToolApp(tk.Tk):
     _APP_NAME          = "RE024 Touch Inspector"
     _APP_AUTHOR        = "Shane.Lin"
-    _APP_VERSION_LABEL = "v1.9.29"
+    _APP_VERSION_LABEL = "v1.9.30"
     _APP_VERSION_TIME  = "2026-09-21"
 
     # 版本(edition)：Engineer = 全功能；FAE / Customer = 閹割版
@@ -1452,12 +1451,6 @@ class HIDToolApp(tk.Tk):
             hover_tab = ttk.Frame(self._notebook, style="Surface.TFrame")
             self._notebook.add(hover_tab, text="調適")
             self._build_hover_palm_tab(hover_tab)
-
-        # 合Code 分頁：兩份原始碼資料夾比對＋左複製到右（開發用工具，僅 Engineer 版）
-        if self._is_engineer():
-            merge_tab = ttk.Frame(self._notebook, style="Surface.TFrame")
-            self._notebook.add(merge_tab, text="合Code")
-            self._build_code_merge_tab(merge_tab)
 
         self._notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed, add="+")
 
@@ -7025,236 +7018,6 @@ class HIDToolApp(tk.Tk):
             log_frame, height=14, state="disabled", font=("Consolas", 9))
         self._style_log_text(self._unplug_log)
         self._unplug_log.pack(fill=tk.BOTH, expand=True)
-
-    # ---- 合Code：兩份原始碼資料夾比對＋左複製到右 ----
-
-    _CM_STATUS_LABEL = {
-        code_merge.STATUS_SAME:       "相同",
-        code_merge.STATUS_DIFF:       "不同",
-        code_merge.STATUS_ONLY_LEFT:  "只有左邊",
-        code_merge.STATUS_ONLY_RIGHT: "只有右邊",
-    }
-
-    def _build_code_merge_tab(self, parent):
-        self._cm_entries: List[code_merge.DiffEntry] = []
-        self._cm_row_to_entry: Dict[str, code_merge.DiffEntry] = {}
-        self._cm_scanning = False
-
-        dirs_frame = ttk.LabelFrame(parent, text="資料夾", padding=8,
-                                    style="Section.TLabelframe")
-        dirs_frame.pack(fill=tk.X, padx=10, pady=(10, 6))
-        dirs_frame.columnconfigure(1, weight=1)
-
-        self._cm_left_var = tk.StringVar(value="")
-        self._cm_right_var = tk.StringVar(value="")
-        ttk.Label(dirs_frame, text="左（來源）:").grid(row=0, column=0, sticky="w", padx=(0, 6))
-        ttk.Entry(dirs_frame, textvariable=self._cm_left_var, state="readonly").grid(
-            row=0, column=1, sticky="ew")
-        ttk.Button(dirs_frame, text="選擇…", command=lambda: self._cm_choose_dir("left")).grid(
-            row=0, column=2, padx=(6, 0))
-
-        ttk.Label(dirs_frame, text="右（目標）:").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
-        ttk.Entry(dirs_frame, textvariable=self._cm_right_var, state="readonly").grid(
-            row=1, column=1, sticky="ew", pady=(6, 0))
-        ttk.Button(dirs_frame, text="選擇…", command=lambda: self._cm_choose_dir("right")).grid(
-            row=1, column=2, padx=(6, 0), pady=(6, 0))
-
-        act = ttk.Frame(parent, padding=(10, 0))
-        act.pack(fill=tk.X)
-        self._cm_scan_btn = ttk.Button(act, text="掃描比對", style="Accent.TButton",
-                                       command=self._cm_run_scan)
-        self._cm_scan_btn.pack(side=tk.LEFT)
-        self._cm_show_same_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(act, text="顯示相同檔案", variable=self._cm_show_same_var,
-                        command=self._cm_refresh_tree).pack(side=tk.LEFT, padx=(10, 0))
-        self._cm_status_var = tk.StringVar(value="選擇左右資料夾後按「掃描比對」。")
-        ttk.Label(act, textvariable=self._cm_status_var, style="Muted.TLabel").pack(
-            side=tk.LEFT, padx=12)
-
-        tree_frame = ttk.Frame(parent, padding=(10, 6, 10, 0))
-        tree_frame.pack(fill=tk.BOTH, expand=True)
-        self._cm_tree = ttk.Treeview(
-            tree_frame, columns=("status", "left_size", "right_size"),
-            show="tree headings", style="Mono.Treeview", selectmode="extended")
-        self._cm_tree.heading("#0", text="相對路徑")
-        self._cm_tree.heading("status", text="狀態")
-        self._cm_tree.heading("left_size", text="左邊大小")
-        self._cm_tree.heading("right_size", text="右邊大小")
-        self._cm_tree.column("#0", width=self._sx(420), stretch=True)
-        self._cm_tree.column("status", width=self._sx(90), stretch=False, anchor="center")
-        self._cm_tree.column("left_size", width=self._sx(90), stretch=False, anchor="e")
-        self._cm_tree.column("right_size", width=self._sx(90), stretch=False, anchor="e")
-        vs = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self._cm_tree.yview)
-        self._cm_tree.configure(yscrollcommand=vs.set)
-        vs.pack(side=tk.RIGHT, fill=tk.Y)
-        self._cm_tree.pack(fill=tk.BOTH, expand=True)
-        self._cm_tree.tag_configure("cm_same",       foreground=self._TEXT_MUTED)
-        self._cm_tree.tag_configure("cm_diff",       foreground="#b45309")
-        self._cm_tree.tag_configure("cm_only_left",  foreground=self._GREEN_DARK)
-        self._cm_tree.tag_configure("cm_only_right",  foreground=self._ACCENT_DARK)
-        self._cm_tree.bind("<Double-1>", self._cm_on_double_click)
-
-        btn_row = ttk.Frame(parent, padding=(10, 6, 10, 10))
-        btn_row.pack(fill=tk.X)
-        ttk.Button(btn_row, text="查看差異…", command=self._cm_show_diff).pack(side=tk.LEFT)
-        ttk.Button(btn_row, text="複製選取到右邊", command=self._cm_copy_selected).pack(
-            side=tk.LEFT, padx=(6, 0))
-        ttk.Button(btn_row, text="複製全部差異到右邊", command=self._cm_copy_all).pack(
-            side=tk.LEFT, padx=(6, 0))
-
-    def _cm_choose_dir(self, side: str):
-        var = self._cm_left_var if side == "left" else self._cm_right_var
-        path = filedialog.askdirectory(title="選擇左邊資料夾" if side == "left" else "選擇右邊資料夾",
-                                       initialdir=var.get() or None)
-        if path:
-            var.set(path)
-
-    def _cm_run_scan(self):
-        left_dir = self._cm_left_var.get().strip()
-        right_dir = self._cm_right_var.get().strip()
-        if not left_dir or not right_dir:
-            messagebox.showinfo("合Code", "請先選擇左右兩個資料夾。")
-            return
-        if not os.path.isdir(left_dir) or not os.path.isdir(right_dir):
-            messagebox.showerror("合Code", "左右資料夾必須都存在。")
-            return
-        if self._cm_scanning:
-            return
-        self._cm_scanning = True
-        self._cm_scan_btn.configure(state=tk.DISABLED)
-        self._cm_status_var.set("掃描中…")
-
-        def worker():
-            try:
-                entries = code_merge.scan_diff(left_dir, right_dir)
-                err = None
-            except OSError as e:
-                entries, err = [], str(e)
-            self.after(0, lambda: self._cm_scan_done(entries, err))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _cm_scan_done(self, entries: List["code_merge.DiffEntry"], err: Optional[str]):
-        self._cm_scanning = False
-        self._cm_scan_btn.configure(state=tk.NORMAL)
-        if err:
-            self._cm_status_var.set("掃描失敗")
-            messagebox.showerror("合Code", f"掃描失敗：{err}")
-            return
-        self._cm_entries = entries
-        self._cm_refresh_tree()
-
-    def _cm_refresh_tree(self):
-        tree = self._cm_tree
-        tree.delete(*tree.get_children())
-        self._cm_row_to_entry.clear()
-        show_same = self._cm_show_same_var.get()
-        n_diff = n_only_left = n_only_right = n_same = 0
-        for entry in self._cm_entries:
-            if entry.status == code_merge.STATUS_SAME:
-                n_same += 1
-                if not show_same:
-                    continue
-            elif entry.status == code_merge.STATUS_DIFF:
-                n_diff += 1
-            elif entry.status == code_merge.STATUS_ONLY_LEFT:
-                n_only_left += 1
-            else:
-                n_only_right += 1
-            row_id = tree.insert(
-                "", tk.END, text=entry.rel_path,
-                values=(self._CM_STATUS_LABEL[entry.status],
-                        "" if entry.left_size is None else str(entry.left_size),
-                        "" if entry.right_size is None else str(entry.right_size)),
-                tags=("cm_" + entry.status,))
-            self._cm_row_to_entry[row_id] = entry
-        self._cm_status_var.set(
-            f"不同 {n_diff}　只有左邊 {n_only_left}　只有右邊 {n_only_right}　相同 {n_same}")
-
-    def _cm_selected_entries(self) -> List["code_merge.DiffEntry"]:
-        return [self._cm_row_to_entry[r] for r in self._cm_tree.selection()
-                if r in self._cm_row_to_entry]
-
-    def _cm_on_double_click(self, _event):
-        entries = self._cm_selected_entries()
-        if len(entries) == 1 and entries[0].status == code_merge.STATUS_DIFF:
-            self._cm_show_diff()
-
-    def _cm_show_diff(self):
-        entries = self._cm_selected_entries()
-        entries = [e for e in entries if e.status == code_merge.STATUS_DIFF]
-        if len(entries) != 1:
-            messagebox.showinfo("查看差異", "請選取一個「不同」的檔案再查看差異。")
-            return
-        entry = entries[0]
-        try:
-            lines = code_merge.unified_diff_lines(entry)
-        except (OSError, ValueError) as e:
-            messagebox.showerror("查看差異", f"無法產生差異：{e}")
-            return
-
-        win = tk.Toplevel(self)
-        win.title(f"差異 - {entry.rel_path}")
-        self._set_window_icon(win)
-        win.geometry(f"{self._sx(900)}x{self._sx(600)}")
-        win.configure(bg=self._BG)
-        text = scrolledtext.ScrolledText(win, font=("Consolas", 10), wrap=tk.NONE, relief=tk.FLAT)
-        self._style_log_text(text)
-        text.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
-        text.tag_configure("add",    foreground=self._GREEN_DARK)
-        text.tag_configure("remove", foreground=self._RED)
-        text.tag_configure("hunk",   foreground=self._ACCENT_DARK, font=("Consolas", 10, "bold"))
-        for line in lines:
-            tag = None
-            if line.startswith("+") and not line.startswith("+++"):
-                tag = "add"
-            elif line.startswith("-") and not line.startswith("---"):
-                tag = "remove"
-            elif line.startswith("@@"):
-                tag = "hunk"
-            text.insert(tk.END, line if line.endswith("\n") else line + "\n",
-                       tag if tag else ())
-        text.config(state=tk.DISABLED)
-
-    def _cm_copy_entries(self, entries: List["code_merge.DiffEntry"]):
-        right_dir = self._cm_right_var.get().strip()
-        left_dir = self._cm_left_var.get().strip()
-        copyable = [e for e in entries
-                   if e.status in (code_merge.STATUS_DIFF, code_merge.STATUS_ONLY_LEFT)]
-        if not copyable:
-            messagebox.showinfo("合Code", "選取項目中沒有可從左邊複製到右邊的檔案。")
-            return
-        n_ok = 0
-        errors: List[str] = []
-        for entry in copyable:
-            try:
-                code_merge.copy_left_to_right(entry, right_dir)
-                n_ok += 1
-                idx = self._cm_entries.index(entry)
-                self._cm_entries[idx] = code_merge.rescan_entry(entry, left_dir, right_dir)
-            except (OSError, ValueError) as e:
-                errors.append(f"{entry.rel_path}: {e}")
-        self._cm_refresh_tree()
-        msg = f"已複製 {n_ok} 個檔案到右邊。"
-        if errors:
-            msg += "\n\n失敗：\n" + "\n".join(errors)
-            messagebox.showwarning("合Code", msg)
-        else:
-            self._cm_status_var.set(msg)
-
-    def _cm_copy_selected(self):
-        self._cm_copy_entries(self._cm_selected_entries())
-
-    def _cm_copy_all(self):
-        diffs = [e for e in self._cm_entries
-                if e.status in (code_merge.STATUS_DIFF, code_merge.STATUS_ONLY_LEFT)]
-        if not diffs:
-            messagebox.showinfo("合Code", "目前沒有左右不同或只有左邊的檔案。")
-            return
-        if not messagebox.askyesno(
-                "合Code", f"要把 {len(diffs)} 個檔案從左邊複製覆蓋到右邊嗎？"):
-            return
-        self._cm_copy_entries(diffs)
 
     def _update_canvas_range(self, path_str: str):
         """從 descriptor 取出 X/Y 的 logical 範圍並更新畫布標註。"""
