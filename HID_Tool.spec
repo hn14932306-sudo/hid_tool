@@ -122,8 +122,10 @@ def _assert_edition(analysis, edition, expect_dir):
     raise SystemExit(f"[build] {edition} 沒有把 _edition 打包進去")
 
 
-# sv_ttk 的主題 .tcl 檔必須一起打包，否則執行檔找不到主題
-datas = collect_data_files("sv_ttk") + [
+# sv_ttk 的主題 .tcl 檔、tkinterdnd2 的 tkdnd 擴充檔都必須一起打包，
+# 否則執行檔裡分別會找不到主題 / 拖放沒作用（tkdnd 沒作用時 hid_tool.py
+# 會靜靜退化成只能用「選擇…」按鈕，不會整個炸掉，但還是打包起來比較好）
+datas = collect_data_files("sv_ttk") + collect_data_files("tkinterdnd2") + [
     ("assets\\RE024_icon_heatmap.ico", "assets"),
     ("assets\\focaltech_customer_logo.png", "assets"),
     ("assets\\focaltech_official.ico", "assets"),
@@ -140,7 +142,7 @@ for _root, _dirs, _files in os.walk(os.path.join(SPECPATH, "bases")):
 _COMMON = dict(
     binaries=[],
     datas=datas,
-    hiddenimports=["sv_ttk", "truststore"],
+    hiddenimports=["sv_ttk", "truststore", "tkinterdnd2"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

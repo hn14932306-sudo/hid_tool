@@ -41,6 +41,12 @@ else:
 import sv_ttk
 from fast_table import FastTable
 import hid_desc_compare
+import code_merge
+try:
+    from tkinterdnd2 import TkinterDnD as _tkdnd, DND_FILES as _DND_FILES
+except ImportError:
+    _tkdnd = None
+    _DND_FILES = None
 import heatmap_frame
 import digiinfo_parse
 import la_saleae
@@ -625,6 +631,17 @@ class HIDToolApp(tk.Tk):
             pass
         super().__init__()
         self.withdraw()   # 立即隱藏，防止預設小視窗閃爍
+
+        # 拖曳資料夾支援（僅 Engineer 版的合Code 分頁用得到）：用 tkinterdnd2 的
+        # TkinterDnD.require() 把 tkdnd 掛到既有的 tk.Tk() root，不用把整個 app
+        # 的基底類別換成 TkinterDnD.Tk，出問題也只影響拖放本身、不影響其他分頁。
+        self._dnd_available = False
+        if _tkdnd is not None and self._is_engineer():
+            try:
+                _tkdnd.require(self)
+                self._dnd_available = True
+            except Exception:
+                self._dnd_available = False
         # 依螢幕 DPI 動態調整字體與視窗尺寸（4K/2K 高 DPI 自動放大）
         self._cur_dpi = 96
         dpi = self._apply_dpi_scaling()
@@ -851,6 +868,39 @@ class HIDToolApp(tk.Tk):
     # UI Construction
     # ------------------------------------------------------------------
 
+    def _make_treeitem_dot_image(self):
+        """留白圖示，取代 sv_ttk 那個壞掉的展開箭頭圖示（見 _setup_style 的
+        說明）。這台機器的 Tk 8.6.15 不會在展開/收合時自動更新 Treeview 指
+        示器該用哪張圖，乾脆別指望這個原生格子能顯示任何有意義的東西——
+        展開狀態改由 _cm_ 那邊自己在資料夾名稱前面加 ▸/▾ 文字表示（見
+        _cm_set_dir_prefix）。這裡刻意不 put() 任何顏色：剛建立的
+        tk.PhotoImage 預設整張透明，讓列自己的底色（選取灰、cm_diff 黃、
+        cm_only_left 綠…）透出來，不然固定填一個顏色在不同底色的列上會出
+        現一塊突兀的方塊（實測用白色底在藍色列上很明顯）。"""
+        size = 6
+        return tk.PhotoImage(width=size, height=size)
+
+    def _fix_treeview_indicator(self, style: ttk.Style):
+        """把 Treeview 項目的展開指示器換成留白圖示。
+
+        不能直接 style.element_create("Treeitem.indicator", ...) 蓋掉 sv_ttk
+        原本的定義——Tcl 這個版本 element create 對已存在的名稱會直接丟
+        "Duplicate element"，不像有些用法那樣允許重新定義。改成建立一個新
+        名稱的 element，再用 style.layout() 把 "Item" 這個通用列版面裡引用
+        的 Treeitem.indicator 換成我們的新元件；沒有另外對 Treeview 設
+        style= 的樹（App 裡目前都沒設）都是共用 "Item" 這個 layout，所以
+        全域都會套用到。"""
+        self._treeitem_dot_img = self._make_treeitem_dot_image()
+        style.element_create("CmDot.indicator", "image", self._treeitem_dot_img,
+                             width=8, sticky="")
+        style.layout("Item", [
+            ("Treeitem.padding", {"sticky": "nswe", "children": [
+                ("CmDot.indicator", {"side": "left", "sticky": ""}),
+                ("Treeitem.image", {"side": "left", "sticky": ""}),
+                ("Treeitem.text", {"sticky": "nswe"}),
+            ]}),
+        ])
+
     def _setup_style(self):
         # Windows 11 風主題；大部分元件外觀交給 sv-ttk
         sv_ttk.set_theme("light")
@@ -860,6 +910,16 @@ class HIDToolApp(tk.Tk):
 
         style = ttk.Style(self)
 
+        # sv_ttk 的 Treeview 展開箭頭圖示是用 user1/user2 這兩個 state 選
+        # 圖，指望 Tk 展開/收合時自動幫每個項目設這兩個 bit；但這台機器的
+        # Tk 8.6.15 不會做這件事（試過新的 open/leaf state 名稱，這個元件
+        # 直接回 Invalid state name，還沒被接受），造成資料夾展開後箭頭永
+        # 遠停在「>」——實測連完全沒有自訂邏輯、單純一棵 Treeview 點展開都
+        # 會重現，是 sv_ttk 在這個 Tk 版本上的相容性問題，不是我們自己邏輯
+        # 的錯。改成固定一張中性小圓點（不再假裝能反映展開狀態），展開狀態
+        # 由 _cm_ 那邊自己在資料夾名稱前面加 ▸/▾ 文字表示。
+        self._fix_treeview_indicator(style)
+
         # ---- 版面骨架：只給頂列 / 狀態列淺色底做出頁首頁尾層次；
         # 其餘 Frame 交給 sv-ttk 預設，避免與主題底色拼接出色差 ----
         style.configure("Top.TFrame",    background=self._SURFACE_ALT)
@@ -868,6 +928,11 @@ class HIDToolApp(tk.Tk):
         # 分頁：加大點擊區、粗體標籤
         style.configure("TNotebook", background=self._BG, borderwidth=0, tabmargins=(4, 6, 4, 0))
         style.configure("TNotebook.Tab", font=self._FONT_UI_BOLD, padding=(16, 8))
+
+        # 合Code 內層分頁（資料夾清單＋各個合併分頁）：分頁數量可能多，縮小一點
+        style.configure("CmInner.TNotebook", background=self._BG, borderwidth=0,
+                       tabmargins=(2, 4, 2, 0))
+        style.configure("CmInner.TNotebook.Tab", font=self._FONT_UI, padding=(8, 3))
 
         # 區塊標題：用主色粗體當視覺錨點（sv-ttk 的 LabelFrame 邊框吃不到自訂色，
         # 改以標題顏色 + 區塊間距做出分組感）
@@ -1452,7 +1517,22 @@ class HIDToolApp(tk.Tk):
             self._notebook.add(hover_tab, text="調適")
             self._build_hover_palm_tab(hover_tab)
 
+        # 工程分頁：開發用工具集中放這裡，內含子分頁（僅 Engineer 版）
+        if self._is_engineer():
+            eng_tab = ttk.Frame(self._notebook, style="Surface.TFrame")
+            self._notebook.add(eng_tab, text="工程")
+            self._build_engineering_tab(eng_tab)
+
         self._notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed, add="+")
+
+    def _build_engineering_tab(self, parent):
+        eng_nb = ttk.Notebook(parent)
+        eng_nb.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self._eng_nb = eng_nb
+
+        merge_sub = ttk.Frame(eng_nb, style="Surface.TFrame")
+        eng_nb.add(merge_sub, text="合Code")
+        self._build_code_merge_tab(merge_sub)
 
     def _build_hover_palm_tab(self, parent):
         self._hover_param_cells = {}
@@ -7019,6 +7099,585 @@ class HIDToolApp(tk.Tk):
         self._style_log_text(self._unplug_log)
         self._unplug_log.pack(fill=tk.BOTH, expand=True)
 
+    # ---- 合Code：兩份原始碼資料夾比對＋雙向合併 ----
+
+    def _build_code_merge_tab(self, parent):
+        self._cm_entries: List[code_merge.DiffEntry] = []
+        self._cm_row_to_entry: Dict[str, code_merge.DiffEntry] = {}
+        self._cm_scanning = False
+        self._cm_merge_tabs: Dict[str, "_CodeMergeTab"] = {}
+        self._cm_scroll_guard = False
+        self._cm_sel_guard = False
+        self._cm_render_gen = 0
+        self._cm_render_state = None
+        self._cm_sel_after_id = None
+        self._cm_sel_pending = None
+        self._cm_frame_to_tab: Dict[str, "_CodeMergeTab"] = {}
+        self._cm_dir_names: Dict[str, str] = {}  # 資料夾 iid -> 不含 ▸/▾ 前綴的原始名稱
+
+        # 分頁列本身不會捲動（ttk.Notebook 沒有這個機制，開很多個合併分頁時
+        # 標籤會被擠爆），加一排 ◀▶ 切換 + 下拉選單當作變通方案。
+        nav_row = ttk.Frame(parent, padding=(8, 8, 8, 0))
+        nav_row.pack(fill=tk.X)
+        ttk.Button(nav_row, text="◀", width=2,
+                  command=lambda: self._cm_step_tab(-1)).pack(side=tk.LEFT)
+        ttk.Button(nav_row, text="▶", width=2,
+                  command=lambda: self._cm_step_tab(1)).pack(side=tk.LEFT, padx=(2, 8))
+        self._cm_tabs_menu = tk.Menu(nav_row, tearoff=False)
+        ttk.Menubutton(nav_row, text="所有分頁 ▾", menu=self._cm_tabs_menu).pack(side=tk.LEFT)
+
+        inner_nb = ttk.Notebook(parent, style="CmInner.TNotebook")
+        inner_nb.pack(fill=tk.BOTH, expand=True, padx=8, pady=(4, 8))
+        inner_nb.bind("<ButtonPress-1>", self._cm_on_merge_tab_click)
+        self._cm_merge_nb = inner_nb
+
+        top = ttk.Frame(inner_nb, style="Surface.TFrame")
+        inner_nb.add(top, text="資料夾清單")
+
+        dirs_title = "資料夾（可直接把資料夾拖進欄位）" if self._dnd_available else "資料夾"
+        dirs_frame = ttk.LabelFrame(top, text=dirs_title, padding=8,
+                                    style="Section.TLabelframe")
+        dirs_frame.pack(fill=tk.X, padx=10, pady=(10, 6))
+        dirs_frame.columnconfigure(1, weight=1)
+
+        self._cm_left_var = tk.StringVar(value="")
+        self._cm_right_var = tk.StringVar(value="")
+        ttk.Label(dirs_frame, text="左（來源）:").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        cm_left_entry = ttk.Entry(dirs_frame, textvariable=self._cm_left_var, state="readonly")
+        cm_left_entry.grid(row=0, column=1, sticky="ew")
+        ttk.Button(dirs_frame, text="選擇…", command=lambda: self._cm_choose_dir("left")).grid(
+            row=0, column=2, padx=(6, 0))
+
+        ttk.Label(dirs_frame, text="右（目標）:").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
+        cm_right_entry = ttk.Entry(dirs_frame, textvariable=self._cm_right_var, state="readonly")
+        cm_right_entry.grid(row=1, column=1, sticky="ew", pady=(6, 0))
+        ttk.Button(dirs_frame, text="選擇…", command=lambda: self._cm_choose_dir("right")).grid(
+            row=1, column=2, padx=(6, 0), pady=(6, 0))
+
+        self._cm_hook_dropfiles(cm_left_entry, "left")
+        self._cm_hook_dropfiles(cm_right_entry, "right")
+        self._cm_hook_dropfiles(dirs_frame, "left")  # 整塊都能丟，方便一次拖兩個資料夾
+
+        act = ttk.Frame(top, padding=(10, 0))
+        act.pack(fill=tk.X)
+        self._cm_scan_btn = ttk.Button(act, text="掃描比對", style="Accent.TButton",
+                                       command=self._cm_run_scan)
+        self._cm_scan_btn.pack(side=tk.LEFT)
+        self._cm_show_same_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(act, text="顯示相同檔案", variable=self._cm_show_same_var,
+                        command=self._cm_refresh_tree).pack(side=tk.LEFT, padx=(10, 0))
+        self._cm_status_var = tk.StringVar(value="選擇左右資料夾後按「掃描比對」。")
+        ttk.Label(act, textvariable=self._cm_status_var, style="Muted.TLabel").pack(
+            side=tk.LEFT, padx=12)
+
+        tree_frame = ttk.Frame(top, padding=(10, 6, 10, 0))
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.columnconfigure(1, weight=1)
+        tree_frame.rowconfigure(1, weight=1)
+
+        ttk.Label(tree_frame, text="左", style="Muted.TLabel").grid(
+            row=0, column=0, sticky="w")
+        ttk.Label(tree_frame, text="右", style="Muted.TLabel").grid(
+            row=0, column=1, sticky="w")
+
+        self._cm_tree_l = self._cm_make_pane_tree(tree_frame, 0)
+        self._cm_tree_r = self._cm_make_pane_tree(tree_frame, 1)
+
+        for src, dst in ((self._cm_tree_l, self._cm_tree_r), (self._cm_tree_r, self._cm_tree_l)):
+            src.bind("<<TreeviewOpen>>", lambda e, s=src, d=dst: self._cm_mirror_open(s, d, True, e), add="+")
+            src.bind("<<TreeviewClose>>", lambda e, s=src, d=dst: self._cm_mirror_open(s, d, False, e), add="+")
+            src.bind("<<TreeviewSelect>>", lambda e, s=src, d=dst: self._cm_mirror_selection(s, d), add="+")
+            src.bind("<Double-1>", self._cm_on_double_click, add="+")
+
+        btn_row1 = ttk.Frame(top, padding=(10, 6, 10, 0))
+        btn_row1.pack(fill=tk.X)
+        ttk.Button(btn_row1, text="查看差異…", command=self._cm_show_diff).pack(side=tk.LEFT)
+        ttk.Button(btn_row1, text="開啟合併視窗…", command=self._cm_open_merge_window).pack(
+            side=tk.LEFT, padx=(6, 0))
+
+        btn_row2 = ttk.Frame(top, padding=(10, 6, 10, 10))
+        btn_row2.pack(fill=tk.X)
+        ttk.Button(btn_row2, text="複製選取到右邊 →",
+                  command=lambda: self._cm_copy_selected("r")).pack(side=tk.LEFT)
+        ttk.Button(btn_row2, text="← 複製選取到左邊",
+                  command=lambda: self._cm_copy_selected("l")).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(btn_row2, text="複製全部差異到右邊 →",
+                  command=lambda: self._cm_copy_all("r")).pack(side=tk.LEFT, padx=(18, 0))
+        ttk.Button(btn_row2, text="← 複製全部差異到左邊",
+                  command=lambda: self._cm_copy_all("l")).pack(side=tk.LEFT, padx=(6, 0))
+
+        self._cm_refresh_tab_menu()
+
+    def _cm_step_tab(self, delta: int):
+        tabs = self._cm_merge_nb.tabs()
+        if not tabs:
+            return
+        try:
+            cur = self._cm_merge_nb.index("current")
+        except tk.TclError:
+            return
+        self._cm_merge_nb.select(tabs[(cur + delta) % len(tabs)])
+
+    def _cm_refresh_tab_menu(self):
+        menu = self._cm_tabs_menu
+        menu.delete(0, tk.END)
+        for tab_id in self._cm_merge_nb.tabs():
+            title = self._cm_merge_nb.tab(tab_id, "text")
+            menu.add_command(label=title, command=lambda t=tab_id: self._cm_merge_nb.select(t))
+
+    def _cm_close_icon(self):
+        icon = getattr(self, "_cm_close_icon_img", None)
+        if icon is not None:
+            return icon
+        size = 12
+        img = tk.PhotoImage(width=size, height=size)
+        img.put(self._SURFACE, to=(0, 0, size, size))
+        fg = self._TEXT_MUTED
+        for i in range(size):
+            img.put(fg, (i, i))
+            img.put(fg, (size - 1 - i, i))
+            if i + 1 < size:
+                img.put(fg, (i + 1, i))
+                img.put(fg, (size - 1 - i, i + 1))
+        self._cm_close_icon_img = img
+        return img
+
+    _CM_CLOSE_HIT_PX = 18  # 分頁最右邊這麼多 px 算是點到關閉圖示
+
+    def _cm_on_merge_tab_click(self, event):
+        """判斷有沒有點到分頁上的 × 關閉圖示。sv_ttk 主題下 nb.identify() 不會
+        把 image 跟 label 分成不同元素（實測點了沒反應），改用分頁 bbox 自己
+        算：只要點在該分頁最右側一小段範圍內就當作點了關閉圖示，跟主題無關、
+        比較可靠。"""
+        nb = self._cm_merge_nb
+        try:
+            idx = nb.index(f"@{event.x},{event.y}")
+        except tk.TclError:
+            return
+        try:
+            bx, by, bw, bh = nb.bbox(idx)
+        except tk.TclError:
+            return
+        if event.x < bx + bw - self._CM_CLOSE_HIT_PX:
+            return
+        frame_path = nb.tabs()[idx]
+        tab = self._cm_frame_to_tab.get(frame_path)
+        if tab is not None:
+            tab._close()
+
+    def _cm_make_pane_tree(self, parent, column: int):
+        """建立一側的樹狀清單（資料夾可展開），回傳 Treeview。"""
+        frame = ttk.Frame(parent)
+        frame.grid(row=1, column=column, sticky="nsew",
+                  padx=(0 if column == 0 else 3, 3 if column == 0 else 0))
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        tree = ttk.Treeview(frame, columns=("size", "mtime"), show="tree headings",
+                            style="Mono.Treeview", selectmode="extended")
+        tree.heading("#0", text="名稱")
+        tree.heading("size", text="大小")
+        tree.heading("mtime", text="修改時間")
+        tree.column("#0", width=self._sx(260), stretch=True)
+        tree.column("size", width=self._sx(80), stretch=False, anchor="e")
+        tree.column("mtime", width=self._sx(110), stretch=False, anchor="e")
+        tree.grid(row=0, column=0, sticky="nsew")
+        vs = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self._cm_yview_both)
+        vs.grid(row=0, column=1, sticky="ns")
+        tree.configure(yscrollcommand=lambda a, b, t=tree, v=vs: self._cm_on_yscroll(t, v, a, b))
+        tree.tag_configure("cm_same",       foreground=self._TEXT_MUTED)
+        tree.tag_configure("cm_diff",       background="#fef3c7", foreground="#92400e")
+        tree.tag_configure("cm_only_left",  background="#dcfce7", foreground=self._GREEN_DARK)
+        tree.tag_configure("cm_only_right", background="#dbeafe", foreground=self._ACCENT_DARK)
+        tree.tag_configure("cm_ghost",      foreground=self._TEXT_MUTED)
+        tree.tag_configure("cm_dir",        foreground=self._TEXT_MUTED)
+        return tree
+
+    def _cm_yview_both(self, *args):
+        self._cm_tree_l.yview(*args)
+        self._cm_tree_r.yview(*args)
+
+    def _cm_on_yscroll(self, tree, scrollbar, first, last):
+        scrollbar.set(first, last)
+        if self._cm_scroll_guard:
+            return
+        other = self._cm_tree_r if tree is self._cm_tree_l else self._cm_tree_l
+        self._cm_scroll_guard = True
+        try:
+            other.yview_moveto(first)
+        finally:
+            self._cm_scroll_guard = False
+
+    def _cm_mirror_open(self, src, dst, opened: bool, event=None):
+        """展開/收合一個資料夾：同步兩邊的狀態，並且兩邊都自己更新 ▸/▾ 文字
+        前綴（Tk 這個版本不會自動更新原生箭頭圖示，見 _setup_style 的說
+        明，所以兩邊都要自己動手，不能只改沒被使用者直接點的那一邊）。用
+        點擊座標找是哪一列，比 src.focus() 可靠——focus 有時候還停在上一個
+        選取的列，不是真的點開的那一列。"""
+        iid = None
+        if event is not None:
+            try:
+                iid = event.widget.identify_row(event.y)
+            except tk.TclError:
+                iid = None
+        if not iid:
+            iid = src.focus()
+        if not iid:
+            return
+        for tree in (src, dst):
+            if tree.exists(iid):
+                tree.item(iid, open=opened)
+                self._cm_set_dir_prefix(tree, iid, opened)
+
+    def _cm_set_dir_prefix(self, tree, iid: str, opened: bool):
+        name = self._cm_dir_names.get(iid)
+        if name is None:
+            return
+        tree.item(iid, text=("▾ " if opened else "▸ ") + name)
+
+    def _cm_mirror_selection(self, src, dst):
+        """把選取同步到另一棵樹。多選（例如 Ctrl+A、拖曳框選幾千列）可能連續
+        觸發很多次 <<TreeviewSelect>>，若每次都立刻讀整包選取清單再寫回去，
+        會是 O(n²) 直接卡死（實測踩過）；改成 debounce，一串事件只在最後
+        處理一次。"""
+        if self._cm_sel_guard:
+            return
+        self._cm_sel_pending = (src, dst)
+        if self._cm_sel_after_id:
+            self.after_cancel(self._cm_sel_after_id)
+        self._cm_sel_after_id = self.after(1, self._cm_apply_selection_mirror)
+
+    def _cm_apply_selection_mirror(self):
+        self._cm_sel_after_id = None
+        if self._cm_sel_pending is None:
+            return
+        src, dst = self._cm_sel_pending
+        self._cm_sel_pending = None
+        self._cm_sel_guard = True
+        try:
+            # 左右兩棵樹的節點集合永遠一致（同一批 entries 建出來的），不用
+            # 再逐一 dst.exists(i) 檢查——那是每個 iid 一次 Tcl round-trip，
+            # 選取幾千列時光這個檢查就很慢。
+            dst.selection_set(src.selection())
+        finally:
+            self._cm_sel_guard = False
+
+    @staticmethod
+    def _cm_fmt_size(n) -> str:
+        if n is None:
+            return ""
+        size = float(n)
+        for unit in ("B", "KB", "MB", "GB"):
+            if size < 1024 or unit == "GB":
+                return f"{size:,.0f} {unit}" if unit == "B" else f"{size:,.1f} {unit}"
+            size /= 1024
+        return f"{size:,.1f} GB"
+
+    @staticmethod
+    def _cm_fmt_mtime(t) -> str:
+        if t is None:
+            return ""
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(t))
+
+    def _cm_hook_dropfiles(self, widget, side: str):
+        """讓 widget 可以接受從檔案總管拖進來的資料夾；tkdnd 不可用就靜靜跳過。"""
+        if not self._dnd_available:
+            return
+
+        def on_drop(event):
+            paths = [p for p in widget.tk.splitlist(event.data) if os.path.isdir(p)]
+            if not paths:
+                messagebox.showinfo("合Code", "拖進來的不是資料夾。")
+                return
+            if len(paths) >= 2:
+                # 一次拖兩個資料夾：第一個給左、第二個給右（不管拖到哪一個欄位上）
+                self._cm_left_var.set(paths[0])
+                self._cm_right_var.set(paths[1])
+                return
+            var = self._cm_left_var if side == "left" else self._cm_right_var
+            var.set(paths[0])
+
+        widget.drop_target_register(_DND_FILES)
+        widget.dnd_bind("<<Drop>>", on_drop)
+
+    def _cm_choose_dir(self, side: str):
+        var = self._cm_left_var if side == "left" else self._cm_right_var
+        path = filedialog.askdirectory(title="選擇左邊資料夾" if side == "left" else "選擇右邊資料夾",
+                                       initialdir=var.get() or None)
+        if path:
+            var.set(path)
+
+    def _cm_run_scan(self):
+        left_dir = self._cm_left_var.get().strip()
+        right_dir = self._cm_right_var.get().strip()
+        if not left_dir or not right_dir:
+            messagebox.showinfo("合Code", "請先選擇左右兩個資料夾。")
+            return
+        if not os.path.isdir(left_dir) or not os.path.isdir(right_dir):
+            messagebox.showerror("合Code", "左右資料夾必須都存在。")
+            return
+        if self._cm_scanning:
+            return
+        self._cm_scanning = True
+        self._cm_scan_btn.configure(state=tk.DISABLED)
+        self._cm_status_var.set("掃描中…")
+
+        def worker():
+            try:
+                entries = code_merge.scan_diff(left_dir, right_dir)
+                err = None
+            except OSError as e:
+                entries, err = [], str(e)
+            self.after(0, lambda: self._cm_scan_done(entries, err))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _cm_scan_done(self, entries: List["code_merge.DiffEntry"], err: Optional[str]):
+        self._cm_scanning = False
+        self._cm_scan_btn.configure(state=tk.NORMAL)
+        if err:
+            self._cm_status_var.set("掃描失敗")
+            messagebox.showerror("合Code", f"掃描失敗：{err}")
+            return
+        self._cm_entries = entries
+        self._cm_refresh_tree()
+
+    _CM_RENDER_CHUNK_SIZE = 400
+
+    _CM_MAX_RENDER_ROWS = 3000
+
+    def _cm_refresh_tree(self):
+        """把 self._cm_entries 塞進左右兩棵樹。檔案數可能上萬（真實 firmware
+        資料夾），一次同步塞完會鎖死主執行緒讓整個 app「沒有回應」（實測踩
+        過），所以分批用 after() 插入；另外硬性上限畫出的列數，避免資料夾
+        差異真的多到誇張（例如意外掃進了 build 產出或 symlink 循環）時，
+        分批也分不完、UI 實質上還是卡住不動。"""
+        tree_l, tree_r = self._cm_tree_l, self._cm_tree_r
+        tree_l.delete(*tree_l.get_children())
+        tree_r.delete(*tree_r.get_children())
+        self._cm_row_to_entry.clear()
+        self._cm_dir_names.clear()
+
+        show_same = self._cm_show_same_var.get()
+        n_diff = sum(1 for e in self._cm_entries if e.status == code_merge.STATUS_DIFF)
+        n_only_left = sum(1 for e in self._cm_entries if e.status == code_merge.STATUS_ONLY_LEFT)
+        n_only_right = sum(1 for e in self._cm_entries if e.status == code_merge.STATUS_ONLY_RIGHT)
+        n_same = sum(1 for e in self._cm_entries if e.status == code_merge.STATUS_SAME)
+
+        to_render = [e for e in self._cm_entries
+                    if show_same or e.status != code_merge.STATUS_SAME]
+        to_render.sort(key=lambda e: e.rel_path.lower())
+        truncated = len(to_render) > self._CM_MAX_RENDER_ROWS
+        if truncated:
+            to_render = to_render[:self._CM_MAX_RENDER_ROWS]
+
+        self._cm_render_gen += 1
+        gen = self._cm_render_gen
+        self._cm_render_state = {
+            "entries": to_render,
+            "idx": 0,
+            "dir_created": set(),
+            "totals": (n_diff, n_only_left, n_only_right, n_same),
+            "truncated": truncated,
+        }
+        total = len(to_render)
+        self._cm_status_var.set(f"建立清單中… 0/{total}" if total else "沒有檔案。")
+        self._cm_render_chunk(gen)
+
+    def _cm_render_chunk(self, gen: int):
+        if gen != self._cm_render_gen:
+            return  # 期間又重新掃描/重繪了，這批作廢
+        st = self._cm_render_state
+        tree_l, tree_r = self._cm_tree_l, self._cm_tree_r
+        entries = st["entries"]
+        total = len(entries)
+        end = min(st["idx"] + self._CM_RENDER_CHUNK_SIZE, total)
+
+        def ensure_dir(dir_rel: str):
+            if dir_rel == "" or dir_rel in st["dir_created"]:
+                return
+            parent_rel, _, name = dir_rel.rpartition("/")
+            ensure_dir(parent_rel)
+            # 資料夾預設收合：真實原始碼樹常有幾千個檔案，若每個資料夾都預設
+            # 展開，插入當下就要同步畫出全部可見列，量一大會直接卡死主執行緒
+            # （實測踩過）。收合後只有使用者實際點開的那一層才需要畫出來。
+            self._cm_dir_names[dir_rel] = name
+            for tree in (tree_l, tree_r):
+                tree.insert(parent_rel, tk.END, iid=dir_rel, text="▸ " + name, open=False,
+                           values=("", ""), tags=("cm_dir",))
+            st["dir_created"].add(dir_rel)
+
+        for entry in entries[st["idx"]:end]:
+            parent_rel, _, name = entry.rel_path.rpartition("/")
+            ensure_dir(parent_rel)
+            tag = "cm_" + entry.status
+
+            if entry.left_size is None:
+                tree_l.insert(parent_rel, tk.END, iid=entry.rel_path, text=name,
+                              values=("—", "—"), tags=("cm_ghost",))
+            else:
+                tree_l.insert(parent_rel, tk.END, iid=entry.rel_path, text=name,
+                              values=(self._cm_fmt_size(entry.left_size),
+                                      self._cm_fmt_mtime(entry.left_mtime)),
+                              tags=(tag,))
+            if entry.right_size is None:
+                tree_r.insert(parent_rel, tk.END, iid=entry.rel_path, text=name,
+                              values=("—", "—"), tags=("cm_ghost",))
+            else:
+                tree_r.insert(parent_rel, tk.END, iid=entry.rel_path, text=name,
+                              values=(self._cm_fmt_size(entry.right_size),
+                                      self._cm_fmt_mtime(entry.right_mtime)),
+                              tags=(tag,))
+            self._cm_row_to_entry[entry.rel_path] = entry
+
+        st["idx"] = end
+        if end < total:
+            self._cm_status_var.set(f"建立清單中… {end}/{total}")
+            self.after(1, lambda: self._cm_render_chunk(gen))
+        else:
+            n_diff, n_only_left, n_only_right, n_same = st["totals"]
+            msg = (f"不同 {n_diff}　只有左邊 {n_only_left}　"
+                  f"只有右邊 {n_only_right}　相同 {n_same}")
+            if st["truncated"]:
+                msg += f"　（清單只顯示前 {self._CM_MAX_RENDER_ROWS} 筆，差異太多沒有全部畫出來；" \
+                      "可以用下面「複製全部差異」直接整批處理，或縮小比對的資料夾範圍）"
+            self._cm_status_var.set(msg)
+
+    def _cm_selected_entries(self) -> List["code_merge.DiffEntry"]:
+        iids = set(self._cm_tree_l.selection()) | set(self._cm_tree_r.selection())
+        return [self._cm_row_to_entry[i] for i in iids if i in self._cm_row_to_entry]
+
+    def _cm_on_double_click(self, _event):
+        entries = self._cm_selected_entries()
+        if len(entries) == 1 and entries[0].status == code_merge.STATUS_DIFF:
+            self._cm_open_merge_window()
+
+    def _cm_show_diff(self):
+        entries = self._cm_selected_entries()
+        entries = [e for e in entries if e.status == code_merge.STATUS_DIFF]
+        if len(entries) != 1:
+            messagebox.showinfo("查看差異", "請選取一個「不同」的檔案再查看差異。")
+            return
+        entry = entries[0]
+        try:
+            lines = code_merge.unified_diff_lines(entry)
+        except (OSError, ValueError) as e:
+            messagebox.showerror("查看差異", f"無法產生差異：{e}")
+            return
+
+        win = tk.Toplevel(self)
+        win.title(f"差異 - {entry.rel_path}")
+        self._set_window_icon(win)
+        win.geometry(f"{self._sx(900)}x{self._sx(600)}")
+        win.configure(bg=self._BG)
+        text = scrolledtext.ScrolledText(win, font=("Consolas", 10), wrap=tk.NONE, relief=tk.FLAT)
+        self._style_log_text(text)
+        text.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        text.tag_configure("add",    foreground=self._GREEN_DARK)
+        text.tag_configure("remove", foreground=self._RED)
+        text.tag_configure("hunk",   foreground=self._ACCENT_DARK, font=("Consolas", 10, "bold"))
+        for line in lines:
+            tag = None
+            if line.startswith("+") and not line.startswith("+++"):
+                tag = "add"
+            elif line.startswith("-") and not line.startswith("---"):
+                tag = "remove"
+            elif line.startswith("@@"):
+                tag = "hunk"
+            text.insert(tk.END, line if line.endswith("\n") else line + "\n",
+                       tag if tag else ())
+        text.config(state=tk.DISABLED)
+
+    def _cm_open_merge_window(self):
+        entries = self._cm_selected_entries()
+        entries = [e for e in entries if e.status == code_merge.STATUS_DIFF]
+        if len(entries) != 1:
+            messagebox.showinfo("合併視窗", "請選取一個「不同」的檔案再開啟合併視窗。")
+            return
+        entry = entries[0]
+        existing = self._cm_merge_tabs.get(entry.rel_path)
+        if existing is not None:
+            self._cm_merge_nb.select(existing.frame)
+            return
+        if code_merge.looks_binary(entry.left_path) or code_merge.looks_binary(entry.right_path):
+            messagebox.showinfo("合併視窗", "二進位檔案無法逐行合併，請改用整檔複製。")
+            return
+        tab = _CodeMergeTab(self, self._cm_merge_nb, entry, self._cm_left_var.get().strip(),
+                            self._cm_right_var.get().strip(),
+                            on_saved=self._cm_on_merge_saved,
+                            on_closed=self._cm_on_merge_closed)
+        self._cm_merge_nb.tab(tab.frame, image=self._cm_close_icon(), compound=tk.RIGHT)
+        self._cm_merge_tabs[entry.rel_path] = tab
+        self._cm_frame_to_tab[str(tab.frame)] = tab
+        self._cm_refresh_tab_menu()
+
+    def _cm_on_merge_closed(self, rel_path: str):
+        tab = self._cm_merge_tabs.pop(rel_path, None)
+        if tab is not None:
+            self._cm_frame_to_tab.pop(str(tab.frame), None)
+        self._cm_refresh_tab_menu()
+
+    def _cm_on_merge_saved(self, entry: "code_merge.DiffEntry"):
+        """合併視窗存檔後，回頭刷新清單裡對應那一列的狀態。"""
+        left_dir = self._cm_left_var.get().strip()
+        right_dir = self._cm_right_var.get().strip()
+        for idx, e in enumerate(self._cm_entries):
+            if e.rel_path == entry.rel_path:
+                self._cm_entries[idx] = code_merge.rescan_entry(entry, left_dir, right_dir)
+                break
+        self._cm_refresh_tree()
+
+    def _cm_copy_entries(self, entries: List["code_merge.DiffEntry"], direction: str):
+        """direction: 'r' 複製到右邊（left_to_right）；'l' 複製到左邊（right_to_left）。"""
+        right_dir = self._cm_right_var.get().strip()
+        left_dir = self._cm_left_var.get().strip()
+        wanted_status = (code_merge.STATUS_DIFF,
+                         code_merge.STATUS_ONLY_LEFT if direction == "r" else code_merge.STATUS_ONLY_RIGHT)
+        copyable = [e for e in entries if e.status in wanted_status]
+        if not copyable:
+            where = "右邊" if direction == "r" else "左邊"
+            messagebox.showinfo("合Code", f"選取項目中沒有可複製到{where}的檔案。")
+            return
+        n_ok = 0
+        errors: List[str] = []
+        for entry in copyable:
+            try:
+                if direction == "r":
+                    code_merge.copy_left_to_right(entry, right_dir)
+                else:
+                    code_merge.copy_right_to_left(entry, left_dir)
+                n_ok += 1
+                idx = self._cm_entries.index(entry)
+                self._cm_entries[idx] = code_merge.rescan_entry(entry, left_dir, right_dir)
+            except (OSError, ValueError) as e:
+                errors.append(f"{entry.rel_path}: {e}")
+        self._cm_refresh_tree()
+        where = "右邊" if direction == "r" else "左邊"
+        msg = f"已複製 {n_ok} 個檔案到{where}。"
+        if errors:
+            msg += "\n\n失敗：\n" + "\n".join(errors)
+            messagebox.showwarning("合Code", msg)
+        else:
+            self._cm_status_var.set(msg)
+
+    def _cm_copy_selected(self, direction: str):
+        self._cm_copy_entries(self._cm_selected_entries(), direction)
+
+    def _cm_copy_all(self, direction: str):
+        wanted_status = (code_merge.STATUS_DIFF,
+                         code_merge.STATUS_ONLY_LEFT if direction == "r" else code_merge.STATUS_ONLY_RIGHT)
+        diffs = [e for e in self._cm_entries if e.status in wanted_status]
+        if not diffs:
+            where = "右邊" if direction == "r" else "左邊"
+            messagebox.showinfo("合Code", f"目前沒有可複製到{where}的檔案。")
+            return
+        where = "右邊" if direction == "r" else "左邊"
+        src = "左邊" if direction == "r" else "右邊"
+        if not messagebox.askyesno(
+                "合Code", f"要把 {len(diffs)} 個檔案從{src}複製覆蓋到{where}嗎？"):
+            return
+        self._cm_copy_entries(diffs, direction)
+
     def _update_canvas_range(self, path_str: str):
         """從 descriptor 取出 X/Y 的 logical 範圍並更新畫布標註。"""
         fields = self._descriptors.get(path_str, [])
@@ -9117,6 +9776,301 @@ class HIDToolApp(tk.Tk):
             except Exception:
                 pass
         super().destroy()
+
+
+# ---------------------------------------------------------------------------
+# 合Code：逐段(hunk)合併視窗
+# ---------------------------------------------------------------------------
+
+class _CodeMergeTab:
+    """單一檔案的合併畫面：以分頁形式加在「合Code」的內層分頁列（跟「資料夾
+    清單」平行），不彈新視窗，方便同時開好幾個檔案；左右可直接編輯，差異
+    段落可用按鈕互相搬移，分開存檔。"""
+
+    _TAG_DIFF       = "cmw_diff"
+    _TAG_ONLY_LEFT  = "cmw_only_left"
+    _TAG_ONLY_RIGHT = "cmw_only_right"
+
+    def __init__(self, app: "HIDToolApp", notebook: ttk.Notebook,
+                entry: "code_merge.DiffEntry", left_dir: str, right_dir: str,
+                on_saved, on_closed):
+        self.app = app
+        self.notebook = notebook
+        self.entry = entry
+        self.left_dir = left_dir
+        self.right_dir = right_dir
+        self.on_saved = on_saved
+        self.on_closed = on_closed
+        self._hunks: List[tuple] = []
+        self._embedded: List[tk.Widget] = []
+        self._recomputing = False
+        self._debounce_id = None
+        self._cur_hunk = -1
+        self._scroll_guard = False
+        self._scroll_after_id = None
+        self._scroll_pending = None
+        self._dirty_left = False
+        self._dirty_right = False
+
+        self.frame = ttk.Frame(notebook, style="Surface.TFrame")
+        tab_title = os.path.basename(entry.rel_path) or entry.rel_path
+        notebook.add(self.frame, text=f"合併: {tab_title}")
+        notebook.select(self.frame)
+
+        header = ttk.Frame(self.frame, padding=(8, 8, 8, 0))
+        header.pack(fill=tk.X)
+        header.columnconfigure(0, weight=1)
+        header.columnconfigure(1, weight=1)
+        ttk.Label(header, text=f"左：{entry.left_path}", style="Muted.TLabel").grid(
+            row=0, column=0, sticky="w")
+        ttk.Label(header, text=f"右：{entry.right_path}", style="Muted.TLabel").grid(
+            row=0, column=1, sticky="w", padx=(20, 0))
+
+        body = ttk.Frame(self.frame, padding=(8, 6, 8, 0))
+        body.pack(fill=tk.BOTH, expand=True)
+        body.columnconfigure(0, weight=1)
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(0, weight=1)
+
+        self.left_text = self._make_pane(body, 0)
+        self.right_text = self._make_pane(body, 1)
+
+        self.left_text.tag_configure(self._TAG_DIFF, background="#fef3c7")
+        self.left_text.tag_configure(self._TAG_ONLY_LEFT, background="#dcfce7")
+        self.right_text.tag_configure(self._TAG_DIFF, background="#fef3c7")
+        self.right_text.tag_configure(self._TAG_ONLY_RIGHT, background="#dbeafe")
+
+        self.left_text.insert("1.0", "".join(code_merge.read_text_lines(entry.left_path)))
+        self.right_text.insert("1.0", "".join(code_merge.read_text_lines(entry.right_path)))
+        self.left_text.edit_modified(False)
+        self.right_text.edit_modified(False)
+        self.left_text.bind("<<Modified>>", self._on_modified)
+        self.right_text.bind("<<Modified>>", self._on_modified)
+        self.left_text.bind("<Control-s>", lambda e: (self._save("left"), "break"))
+        self.right_text.bind("<Control-s>", lambda e: (self._save("right"), "break"))
+
+        btn_row = ttk.Frame(self.frame, padding=(8, 6, 8, 8))
+        btn_row.pack(fill=tk.X)
+        ttk.Button(btn_row, text="上一段", command=lambda: self._goto_hunk(-1)).pack(side=tk.LEFT)
+        ttk.Button(btn_row, text="下一段", command=lambda: self._goto_hunk(1)).pack(
+            side=tk.LEFT, padx=(6, 0))
+        ttk.Button(btn_row, text="重新比對", command=self._recompute).pack(
+            side=tk.LEFT, padx=(6, 0))
+        self.status_var = tk.StringVar(value="")
+        ttk.Label(btn_row, textvariable=self.status_var, style="Muted.TLabel").pack(
+            side=tk.LEFT, padx=12)
+
+        right_btns = ttk.Frame(btn_row)
+        right_btns.pack(side=tk.RIGHT)
+        ttk.Button(right_btns, text="儲存左邊", command=lambda: self._save("left")).pack(side=tk.LEFT)
+        ttk.Button(right_btns, text="儲存右邊", command=lambda: self._save("right")).pack(
+            side=tk.LEFT, padx=(6, 0))
+        ttk.Button(right_btns, text="兩邊都儲存並關閉", style="Accent.TButton",
+                  command=self._save_both_and_close).pack(side=tk.LEFT, padx=(6, 0))
+
+        self._recompute()
+        self._goto_hunk(1)  # 一開啟直接跳到第一段差異，不用自己找
+        # 初始 _recompute() 裡 window_create() 嵌入按鈕會觸發 <<Modified>>，
+        # 但這個事件是排隊處理、不是同步呼叫，常常會晚到 _recomputing 已經
+        # 變回 False 之後才真正送進 _on_modified，誤把「剛開視窗」標成
+        # 「有修改」。用 after_idle 在事件佇列跑完後再強制重設一次基準，
+        # 確保只是開開關關、沒真的改過內容時不會跳出存檔詢問。
+        self.app.after_idle(self._reset_dirty_baseline)
+
+    def _make_pane(self, parent, column):
+        frame = ttk.Frame(parent)
+        frame.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 3, 3 if column == 0 else 0))
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        text = tk.Text(frame, wrap=tk.NONE, font=("Consolas", 10), undo=True)
+        self.app._style_log_text(text)
+        text.grid(row=0, column=0, sticky="nsew")
+        vs = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self._yview_both)
+        vs.grid(row=0, column=1, sticky="ns")
+        hs = ttk.Scrollbar(frame, orient=tk.HORIZONTAL, command=text.xview)
+        hs.grid(row=1, column=0, sticky="ew")
+        text.configure(yscrollcommand=lambda a, b, t=text, v=vs: self._on_yscroll(t, v, a, b),
+                      xscrollcommand=hs.set)
+        return text
+
+    def _yview_both(self, *args):
+        self.left_text.yview(*args)
+        self.right_text.yview(*args)
+
+    def _on_yscroll(self, text, scrollbar, first, last):
+        """左右兩邊用捲動比例同步（不是逐行對齊——手動編輯後兩邊行數會不
+        一樣，行號同步捲動不可靠，比例同步簡單很多也夠用）。
+
+        對面那邊有一堆內嵌的 →/← 按鈕，捲動時重繪比純文字貴很多；滾輪/拖曳
+        捲軸一次會連續觸發很多次這個 callback，每次都立刻捲對面會疊加卡頓
+        （實測會卡），所以節流成最多約每 30ms 才真的去動對面一次。自己這邊
+        的捲動本身不受影響，還是即時的。"""
+        scrollbar.set(first, last)
+        if self._scroll_guard:
+            return
+        self._scroll_pending = (text, first)
+        if self._scroll_after_id is None:
+            self._scroll_after_id = self.app.after(30, self._apply_scroll_mirror)
+
+    def _apply_scroll_mirror(self):
+        self._scroll_after_id = None
+        if self._scroll_pending is None:
+            return
+        text, first = self._scroll_pending
+        self._scroll_pending = None
+        other = self.right_text if text is self.left_text else self.left_text
+        self._scroll_guard = True
+        try:
+            other.yview_moveto(first)
+        finally:
+            self._scroll_guard = False
+
+    # ---- diff / merge ----
+
+    def _reset_dirty_baseline(self):
+        self._dirty_left = False
+        self._dirty_right = False
+        for widget in (self.left_text, self.right_text):
+            try:
+                widget.edit_modified(False)
+            except tk.TclError:
+                pass
+
+    def _on_modified(self, event=None):
+        widget = event.widget if event is not None else None
+        try:
+            if widget is not None:
+                widget.edit_modified(False)
+        except tk.TclError:
+            pass
+        if self._recomputing:
+            return
+        if widget is self.left_text:
+            self._dirty_left = True
+        elif widget is self.right_text:
+            self._dirty_right = True
+        if self._debounce_id:
+            self.app.after_cancel(self._debounce_id)
+        self._debounce_id = self.app.after(500, self._recompute)
+
+    def _recompute(self):
+        self._debounce_id = None
+        self._recomputing = True
+        try:
+            for w in self._embedded:
+                try:
+                    w.destroy()
+                except tk.TclError:
+                    pass
+            self._embedded = []
+            for tag in (self._TAG_DIFF, self._TAG_ONLY_LEFT, self._TAG_ONLY_RIGHT):
+                self.left_text.tag_remove(tag, "1.0", "end")
+                self.right_text.tag_remove(tag, "1.0", "end")
+
+            left_lines = self.left_text.get("1.0", "end-1c").splitlines(keepends=True)
+            right_lines = self.right_text.get("1.0", "end-1c").splitlines(keepends=True)
+            self._hunks = [h for h in code_merge.get_opcodes(left_lines, right_lines)
+                          if h[0] != "equal"]
+
+            for tag, i1, i2, j1, j2 in self._hunks:
+                if tag == "replace":
+                    if i2 > i1:
+                        self.left_text.tag_add(self._TAG_DIFF, f"{i1+1}.0", f"{i2+1}.0")
+                    if j2 > j1:
+                        self.right_text.tag_add(self._TAG_DIFF, f"{j1+1}.0", f"{j2+1}.0")
+                elif tag == "delete":
+                    self.left_text.tag_add(self._TAG_ONLY_LEFT, f"{i1+1}.0", f"{i2+1}.0")
+                else:  # insert
+                    self.right_text.tag_add(self._TAG_ONLY_RIGHT, f"{j1+1}.0", f"{j2+1}.0")
+
+                if tag in ("replace", "delete"):
+                    btn = tk.Button(self.left_text, text="→", width=2, bd=1, relief=tk.FLAT,
+                                   font=("Consolas", 8), padx=1, pady=0,
+                                   command=lambda h=(tag, i1, i2, j1, j2): self._move("r", h))
+                    self.left_text.window_create(f"{i1+1}.0", window=btn)
+                    self._embedded.append(btn)
+                if tag in ("replace", "insert"):
+                    btn = tk.Button(self.right_text, text="←", width=2, bd=1, relief=tk.FLAT,
+                                   font=("Consolas", 8), padx=1, pady=0,
+                                   command=lambda h=(tag, i1, i2, j1, j2): self._move("l", h))
+                    self.right_text.window_create(f"{j1+1}.0", window=btn)
+                    self._embedded.append(btn)
+
+            self._cur_hunk = -1
+            n = len(self._hunks)
+            self.status_var.set(f"{n} 段差異" if n else "已無差異")
+        finally:
+            self._recomputing = False
+
+    def _move(self, direction: str, hunk: tuple):
+        _tag, i1, i2, j1, j2 = hunk
+        if direction == "r":
+            text_to_send = self.left_text.get(f"{i1+1}.0", f"{i2+1}.0")
+            self.right_text.delete(f"{j1+1}.0", f"{j2+1}.0")
+            self.right_text.insert(f"{j1+1}.0", text_to_send)
+        else:
+            text_to_send = self.right_text.get(f"{j1+1}.0", f"{j2+1}.0")
+            self.left_text.delete(f"{i1+1}.0", f"{i2+1}.0")
+            self.left_text.insert(f"{i1+1}.0", text_to_send)
+        self._recompute()
+
+    def _goto_hunk(self, delta: int):
+        if not self._hunks:
+            return
+        self._cur_hunk = (self._cur_hunk + delta) % len(self._hunks)
+        _tag, i1, _i2, j1, _j2 = self._hunks[self._cur_hunk]
+        self.left_text.see(f"{i1+1}.0")
+        self.right_text.see(f"{j1+1}.0")
+
+    # ---- save ----
+
+    def _save(self, side: str):
+        path = self.entry.left_path if side == "left" else self.entry.right_path
+        widget = self.left_text if side == "left" else self.right_text
+        content = widget.get("1.0", "end-1c")
+        try:
+            with open(path, "w", encoding="utf-8", newline="") as fh:
+                fh.write(content)
+        except OSError as e:
+            messagebox.showerror("合併視窗", f"儲存失敗：{e}")
+            return
+        label = "左邊" if side == "left" else "右邊"
+        self.status_var.set(f"已儲存{label}：{time.strftime('%H:%M:%S')}")
+        if side == "left":
+            self._dirty_left = False
+        else:
+            self._dirty_right = False
+        self.on_saved(self.entry)
+
+    def _save_both_and_close(self):
+        self._save("left")
+        self._save("right")
+        self._close()
+
+    def _close(self):
+        if self._dirty_left or self._dirty_right:
+            sides = "、".join(s for dirty, s in
+                             ((self._dirty_left, "左邊"), (self._dirty_right, "右邊")) if dirty)
+            ans = messagebox.askyesnocancel(
+                "合併視窗", f"{sides}有修改還沒存檔，要存檔後再關閉嗎？")
+            if ans is None:
+                return  # 取消，不關視窗
+            if ans:
+                if self._dirty_left:
+                    self._save("left")
+                if self._dirty_right:
+                    self._save("right")
+                if self._dirty_left or self._dirty_right:
+                    return  # 存檔失敗（_save 已經跳錯誤訊息），先別關視窗
+        for after_id in (self._debounce_id, self._scroll_after_id):
+            if after_id:
+                try:
+                    self.app.after_cancel(after_id)
+                except Exception:
+                    pass
+        self.notebook.forget(self.frame)
+        self.frame.destroy()
+        self.on_closed(self.entry.rel_path)
 
 
 # ---------------------------------------------------------------------------

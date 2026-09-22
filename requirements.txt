@@ -10,4 +10,5 @@
 hid            # hidapi 綁定；缺了 enumerate_hid_devices() 會永遠回空 list
 sv-ttk         # Sun Valley 主題
 truststore     # 走 Windows 系統信任庫；公司網路 TLS 攔截下自動更新必需
+tkinterdnd2    # 拖曳資料夾/檔案；工程/合Code 分頁選資料夾用，缺了就沒有拖放，退化成只能按「選擇…」
 pyinstaller
