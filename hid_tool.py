@@ -413,8 +413,8 @@ class _HangWatchdog:
 class HIDToolApp(tk.Tk):
     _APP_NAME          = "RE024 Touch Inspector"
     _APP_AUTHOR        = "Shane.Lin"
-    _APP_VERSION_LABEL = "v1.9.31"
-    _APP_VERSION_TIME  = "2026-09-22"
+    _APP_VERSION_LABEL = "v1.9.32"
+    _APP_VERSION_TIME  = "2026-09-23"
 
     # 版本(edition)：Engineer = 全功能；FAE / Customer = 閹割版
     # 由 build 時產生的 _edition.py 決定（見 .spec），開發/沒有該檔時預設 Engineer。
@@ -7185,8 +7185,8 @@ class HIDToolApp(tk.Tk):
         self._cm_tree_r = self._cm_make_pane_tree(tree_frame, 1)
 
         for src, dst in ((self._cm_tree_l, self._cm_tree_r), (self._cm_tree_r, self._cm_tree_l)):
-            src.bind("<<TreeviewOpen>>", lambda e, s=src, d=dst: self._cm_mirror_open(s, d, True, e), add="+")
-            src.bind("<<TreeviewClose>>", lambda e, s=src, d=dst: self._cm_mirror_open(s, d, False, e), add="+")
+            src.bind("<<TreeviewOpen>>", lambda e, s=src, d=dst: self._cm_mirror_open(s, d, True), add="+")
+            src.bind("<<TreeviewClose>>", lambda e, s=src, d=dst: self._cm_mirror_open(s, d, False), add="+")
             src.bind("<<TreeviewSelect>>", lambda e, s=src, d=dst: self._cm_mirror_selection(s, d), add="+")
             src.bind("<Double-1>", self._cm_on_double_click, add="+")
 
@@ -7308,20 +7308,16 @@ class HIDToolApp(tk.Tk):
         finally:
             self._cm_scroll_guard = False
 
-    def _cm_mirror_open(self, src, dst, opened: bool, event=None):
+    def _cm_mirror_open(self, src, dst, opened: bool):
         """展開/收合一個資料夾：同步兩邊的狀態，並且兩邊都自己更新 ▸/▾ 文字
         前綴（Tk 這個版本不會自動更新原生箭頭圖示，見 _setup_style 的說
-        明，所以兩邊都要自己動手，不能只改沒被使用者直接點的那一邊）。用
-        點擊座標找是哪一列，比 src.focus() 可靠——focus 有時候還停在上一個
-        選取的列，不是真的點開的那一列。"""
-        iid = None
-        if event is not None:
-            try:
-                iid = event.widget.identify_row(event.y)
-            except tk.TclError:
-                iid = None
-        if not iid:
-            iid = src.focus()
+        明，所以兩邊都要自己動手，不能只改沒被使用者直接點的那一邊）。
+
+        <<TreeviewOpen>>/<<TreeviewClose>> 是合成事件，event.x/event.y 不是
+        真的滑鼠點擊座標（實測用它找列會抓錯，抓到別的資料夾），Tk 官方
+        文件說這個事件觸發當下 [$w focus] 就是被展開/收合的那個項目，直接
+        用這個即可，不要用座標去猜。"""
+        iid = src.focus()
         if not iid:
             return
         for tree in (src, dst):
@@ -7444,7 +7440,7 @@ class HIDToolApp(tk.Tk):
 
     _CM_RENDER_CHUNK_SIZE = 400
 
-    _CM_MAX_RENDER_ROWS = 3000
+    _CM_MAX_RENDER_ROWS = 20000
 
     def _cm_refresh_tree(self):
         """把 self._cm_entries 塞進左右兩棵樹。檔案數可能上萬（真實 firmware
